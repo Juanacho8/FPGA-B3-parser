@@ -1,0 +1,39 @@
+# --- OS / editor ---
+.DS_Store
+
+# --- Vivado (non-project mode) ---
+*.jou
+*.log
+*.str
+.Xil/
+*.runs/
+*.cache/
+build/
+
+# --- xsim ---
+xsim.dir/
+*.wdb
+*.pb
+webtalk*
+
+# --- cocotb / Verilator ---
+sim_build/
+results.xml
+obj_dir/
+
+# --- Waveforms ---
+*.vcd
+*.fst
+*.ghw
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- C++ baseline ---
+cpp_baseline/build/
+
+# --- Captures (large) ---
+*.pcap
+*.pcapng
