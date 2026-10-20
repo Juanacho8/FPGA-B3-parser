@@ -689,7 +689,7 @@ TEMPLATES = {
             Field(name='mDEntryPx', tag=270, offset=12, size=8, primitive='int64', type_name='Price', presence='required', null=None, since_version=None, deprecated=None, exponent=-4, members=()),
             Field(name='mDEntryTimestamp', tag=37033, offset=20, size=8, primitive='uint64', type_name='UTCTimestampNanos', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
             Field(name='openCloseSettlFlag', tag=286, offset=28, size=1, primitive='uint8', type_name='OpenCloseSettlFlag', presence='optional', null=255, since_version=None, deprecated=17, exponent=None, members=()),
-            Field(name='priceType', tag=423, offset=29, size=1, primitive='uint8', type_name='PriceType', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
+            Field(name='priceType', tag=423, offset=29, size=1, primitive='uint8', type_name='PriceType', presence='optional', null=0, since_version=None, deprecated=None, exponent=None, members=()),
             Field(name='settlPriceType', tag=731, offset=30, size=1, primitive='uint8', type_name='SettlPriceType', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
             Field(name='rptSeq', tag=83, offset=31, size=4, primitive='uint32', type_name='RptSeq', presence='optional', null=0, since_version=None, deprecated=None, exponent=None, members=()),
             Field(name='settlDate', tag=64, offset=35, size=2, primitive='uint16', type_name='LocalMktDate', presence='optional', null=65535, since_version=17, deprecated=None, exponent=None, members=()),

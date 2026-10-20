@@ -985,6 +985,7 @@ The XML wins in every case below.
 | Document | Issue |
 |---|---|
 | Message Reference, LastTradePrice_27 | Lists an extra row `mDInsertTimestamp` at offset 68 (8), "since schema version 16", but states encoded length 68, and the schema 17 XML has no such field. If B3 ever adds it, it will show up as a larger blockLength in the header, which a decoder following section 5 handles automatically |
+| Message Reference 9.2.18 and Guidelines 13.11.3, SettlementPrice_28 | List `priceType` as R (required). In the XML the field has no presence attribute and its enum `PriceType` is encoded as `UInt8NULL` (optional, null 0), so the field is optional with null 0. B3 deliberately changed this enum's null to 0 (schema changelog 1.5.5). Decoders should treat 0 as null |
 | Message Reference, PriceBand_22 | Summary table names it "PriceBand_20" (template 20 was removed in schema 10). Template id 22 and length 48 are correct |
 | Message Reference, sample packet (6.3/6.5) | Table shows SchemaVersion hex as `10 00` while the hex dump and decoded value are `11 00` = 17. The dump is right |
 | Guidelines 6.5.5.4 and 6.5.5.5 | Example packets use schemaVersion 3, Order blockLength 60, Trade blockLength 52. These are from an old schema and do not match version 17 |
