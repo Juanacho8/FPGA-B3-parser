@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "b3gen"
+version = "0.0.0"
+description = "B3 Binary UMDF incremental feed generator (pcap + answer keys)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = ["b3gen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
