@@ -1,0 +1,60 @@
+{
+  "_source": "B3 Binary UMDF Message Reference v2.3.1, section 6 (pages 29-31). Values decoded from packet.hex. Where the PDF's tables differ from the hex dump, the hex dump wins (spec/LAYOUTS.md section 13: SchemaVersion is 0x0011 = 17, not '10 00').",
+  "_notes": [
+    "Every field the sample writes is listed, including zeros, so encoding these values reproduces the bytes exactly.",
+    "Order_MBO_50.mDEntryPrevSize is 0, not its null (int64 min): B3's sample writes 0 there.",
+    "Order_MBO_50.enteringFirm, rptSeq and Trade_53.rptSeq, trdSubType are 0, which is their schema null.",
+    "Trade_53.tradingSessionID is 0, which is not a defined TradingSessionID value. It is in range for uint8, so the encoder accepts it.",
+    "Prices are int64 mantissas (x10^-4): 12345678 = 1234.5678."
+  ],
+  "packet_header": {
+    "channelNumber": 55,
+    "reserved": 0,
+    "sequenceVersion": 1,
+    "sequenceNumber": 987654321,
+    "sendingTime": 1579546260000000000
+  },
+  "messages": [
+    {
+      "offset_in_packet": 16,
+      "framing_header": {"messageLength": 84, "encodingType": 60240},
+      "message_header": {"blockLength": 72, "templateId": 50, "schemaId": 2, "version": 17},
+      "template": "Order_MBO_50",
+      "fields": {
+        "securityID": 100000109220,
+        "matchEventIndicator": 128,
+        "mDUpdateAction": 1,
+        "mDEntryType": "1",
+        "mDEntryPx": 12345678,
+        "mDEntrySize": 10000,
+        "enteringFirm": 0,
+        "mDInsertTimestamp": 0,
+        "secondaryOrderID": 0,
+        "rptSeq": 0,
+        "transactTime": 1579546260000000000,
+        "mDEntryPrevSize": 0
+      }
+    },
+    {
+      "offset_in_packet": 100,
+      "framing_header": {"messageLength": 68, "encodingType": 60240},
+      "message_header": {"blockLength": 56, "templateId": 53, "schemaId": 2, "version": 17},
+      "template": "Trade_53",
+      "fields": {
+        "securityID": 100000109220,
+        "matchEventIndicator": 0,
+        "tradingSessionID": 0,
+        "tradeCondition": 0,
+        "mDEntryPx": 12345678,
+        "mDEntrySize": 10000,
+        "tradeID": 0,
+        "mDEntryBuyer": 1234,
+        "mDEntrySeller": 5678,
+        "tradeDate": 0,
+        "trdSubType": 0,
+        "transactTime": 1579546260000000000,
+        "rptSeq": 0
+      }
+    }
+  ]
+}
