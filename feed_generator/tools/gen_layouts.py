@@ -111,22 +111,22 @@ class Types:
         }
 
     def _encoding(self, encoding_type):
-        """Resolve an enum/set encodingType to (primitive, null). It is either
-        a primitive or a named simple type such as UInt8NULL, whose
-        nullValue then applies."""
+        """Resolve an enum/set encodingType to (primitive, presence, null).
+        It is either a primitive (required) or a named simple type such as
+        UInt8NULL, whose presence and nullValue then apply."""
         if encoding_type in PRIMITIVE_SIZES:
-            return encoding_type, default_null(encoding_type)
+            return encoding_type, "required", default_null(encoding_type)
         t = self.simple[encoding_type]
         null = t["null"] if t["null"] is not None else default_null(t["primitive"])
-        return t["primitive"], null
+        return t["primitive"], t["presence"], null
 
     def _enum(self, elem):
-        primitive, null = self._encoding(elem.get("encodingType"))
+        primitive, presence, null = self._encoding(elem.get("encodingType"))
         values = {v.get("name"): parse_value(v.text, primitive) for v in elem.findall("validValue")}
-        return {"primitive": primitive, "null": null, "values": values}
+        return {"primitive": primitive, "presence": presence, "null": null, "values": values}
 
     def _set(self, elem):
-        primitive, _ = self._encoding(elem.get("encodingType"))
+        primitive, _, _ = self._encoding(elem.get("encodingType"))
         bits = {int(c.text): c.get("name") for c in elem.findall("choice")}
         return {"primitive": primitive, "bits": bits}
 
@@ -208,7 +208,10 @@ def resolve_field(elem, types):
         t = types.enums[type_name] if is_enum else types.sets[type_name]
         if field_presence == "constant":
             return constant(types.value_ref(elem.get("valueRef")))
-        presence = field_presence or "required"
+        # Rule: presence on the field overrides presence on the type. An
+        # enum's own presence is that of its encodingType (e.g. PriceType is
+        # encoded as UInt8NULL, so it is optional with null 0).
+        presence = field_presence or (t["presence"] if is_enum else "required")
         null = t["null"] if (is_enum and presence == "optional") else None
         return "field", {"name": name, "tag": tag, "size": PRIMITIVE_SIZES[t["primitive"]],
                          "primitive": t["primitive"], "type_name": type_name,
