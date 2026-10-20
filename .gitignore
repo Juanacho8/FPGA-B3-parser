@@ -37,3 +37,7 @@ cpp_baseline/build/
 # --- Captures (large) ---
 *.pcap
 *.pcapng
+
+# --- Python tooling ---
+.pytest_cache/
+*.egg-info/
