@@ -313,6 +313,7 @@ def layout_group(elem, types, where):
         "tag": int(elem.get("id")),
         "dimension_type": dimension_type,
         "dimension_size": sum(m["size"] for m in dimension),
+        "dimension": dimension,
         "block_length": forced_block_length(elem, end, gwhere),
         "fields": fields,
         "constants": constants,
@@ -462,6 +463,7 @@ class Group:
     tag: int
     dimension_type: str
     dimension_size: int
+    dimension: tuple          # Members of the dimension header
     block_length: int
     fields: tuple
     constants: tuple
@@ -571,8 +573,11 @@ def render(xml_path=XML_PATH):
             lines.append("        groups=(")
             for g in t["groups"]:
                 lines.append("            Group(")
-                for k in ("name", "tag", "dimension_type", "dimension_size", "block_length"):
+                for k in ("name", "tag", "dimension_type", "dimension_size"):
                     lines.append(f"                {k}={g[k]!r},")
+                render_items(lines, "dimension",
+                             [call("Member", m, MEMBER_KEYS) for m in g["dimension"]], 16)
+                lines.append(f"                block_length={g['block_length']!r},")
                 render_items(lines, "fields",
                              [render_field(f) for f in g["fields"]], 16)
                 render_items(lines, "constants",

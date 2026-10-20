@@ -69,6 +69,7 @@ class Group:
     tag: int
     dimension_type: str
     dimension_size: int
+    dimension: tuple          # Members of the dimension header
     block_length: int
     fields: tuple
     constants: tuple
@@ -387,6 +388,10 @@ TEMPLATES = {
                 tag=711,
                 dimension_type='GroupSizeEncoding',
                 dimension_size=3,
+                dimension=(
+                    Member(name='blockLength', offset=0, size=2, primitive='uint16', null=None),
+                    Member(name='numInGroup', offset=2, size=1, primitive='uint8', null=None),
+                ),
                 block_length=28,
                 fields=(
                     Field(name='underlyingSecurityID', tag=309, offset=0, size=8, primitive='uint64', type_name='SecurityID', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
@@ -402,6 +407,10 @@ TEMPLATES = {
                 tag=555,
                 dimension_type='GroupSizeEncoding',
                 dimension_size=3,
+                dimension=(
+                    Member(name='blockLength', offset=0, size=2, primitive='uint16', null=None),
+                    Member(name='numInGroup', offset=2, size=1, primitive='uint8', null=None),
+                ),
                 block_length=38,
                 fields=(
                     Field(name='legSecurityID', tag=602, offset=0, size=8, primitive='uint64', type_name='SecurityID', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
@@ -420,6 +429,10 @@ TEMPLATES = {
                 tag=870,
                 dimension_type='GroupSizeEncoding',
                 dimension_size=3,
+                dimension=(
+                    Member(name='blockLength', offset=0, size=2, primitive='uint16', null=None),
+                    Member(name='numInGroup', offset=2, size=1, primitive='uint8', null=None),
+                ),
                 block_length=2,
                 fields=(
                     Field(name='instrAttribType', tag=871, offset=0, size=1, primitive='uint8', type_name='InstrAttribType', presence='required', null=None, since_version=None, deprecated=None, exponent=None, members=()),
@@ -1005,6 +1018,10 @@ TEMPLATES = {
                 tag=268,
                 dimension_type='GroupSizeEncoding',
                 dimension_size=3,
+                dimension=(
+                    Member(name='blockLength', offset=0, size=2, primitive='uint16', null=None),
+                    Member(name='numInGroup', offset=2, size=1, primitive='uint8', null=None),
+                ),
                 block_length=42,
                 fields=(
                     Field(name='mDEntryPx', tag=270, offset=0, size=8, primitive='int64', type_name='PriceOptional', presence='optional', null=-9223372036854775808, since_version=None, deprecated=None, exponent=-4, members=()),
