@@ -50,3 +50,35 @@ def replay(pcap_path, book_key_path, security_ids, unreliable=None):
     assert all(name not in checks or not trusted(name, key)
                for key, books in expect.items() for name, _ in books), "as_of never reached"
     return checks, len(rows)
+
+
+CHANNEL_WIDE = {1, 10, 11}         # SequenceReset, SecurityGroupPhase, ChannelReset
+BOOK_TEMPLATES = {9, 50, 51, 52}   # EmptyBook, Order_MBO, DeleteOrder_MBO, MassDeleteOrders_MBO
+
+
+def check_unreliable(unreliable, lost_rows, channel_of):
+    """Check a manifest's unreliable_books against what a client really
+    lost: lost_rows are the intent rows of messages it never saw (missing
+    packets, or the rest of a faulty one), in wire order.
+
+    * Necessary: an instrument is marked from a packet where it lost a
+      message, its own or a channel-wide one on its channel. Marking an
+      instrument that lost nothing, or marking it earlier, fails.
+    * Sufficient: an instrument that lost a book message is marked from that
+      packet or an earlier one."""
+    def packet(row):
+        return (row["channel"], row["sequenceVersion"], row["sequenceNumber"])
+
+    lost_at = {}
+    for row in lost_rows:
+        lost_at.setdefault(packet(row), []).append(row)
+    for name, at in unreliable.items():
+        rows = lost_at.get(tuple(at), [])
+        assert any(r["instrument"] == name or
+                   (r["instrument"] is None and r["templateId"] in CHANNEL_WIDE and
+                    r["channel"] == channel_of[name]) for r in rows), \
+            (name, at, "marked where it lost nothing")
+    for row in lost_rows:
+        if row["templateId"] in BOOK_TEMPLATES:
+            at = unreliable.get(row["instrument"])
+            assert at is not None and tuple(at) <= packet(row), (row["instrument"], packet(row), at)
