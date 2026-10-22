@@ -13,15 +13,22 @@ Instruction tuples:
     ("cancel", book, time, handle)
     ("size", book, time, handle, new_qty)
     ("price", book, time, handle, new_price)
-    ("mass", book, time, side)
+    ("delete_thru", book, time, side)
 """
+
+
+SOID_SPAN = 10 ** 12  # IDs per market segment
 
 
 class ReferenceEngine:
     def __init__(self, books):
-        """books: {name: segment}. Books in one segment share soids."""
+        """books: {name: segment}. Books in one segment share soids. Each
+        segment counts in its own block of SOID_SPAN IDs, in order of first
+        appearance (unique across segments, Guidelines p.68)."""
         self.segment_of = dict(books)
-        self.next_soid = {seg: 1 for seg in self.segment_of.values()}
+        self.next_soid = {}
+        for seg in self.segment_of.values():
+            self.next_soid.setdefault(seg, len(self.next_soid) * SOID_SPAN + 1)
         self.next_handle = 1
         self.orders = []  # dicts: book, handle, soid, side, price, qty, firm, insert
 
@@ -85,12 +92,12 @@ class ReferenceEngine:
         if kind == "market":
             _, _, _, side, qty, firm = instr
             return self._enter(book, time, "market", side, None, qty, firm)
-        if kind == "mass":
+        if kind == "delete_thru":
             side = instr[3]
             removed = self._sorted(book, side)
             for o in removed:
                 self.orders.remove(o)
-            return "MassCancelled", {"instrument": book, "time_ns": time, "side": side,
+            return "SupervisorDeletedThru", {"instrument": book, "time_ns": time, "side": side,
                                      "orders": tuple(self._view(o) for o in removed)}
 
         handle = instr[3]

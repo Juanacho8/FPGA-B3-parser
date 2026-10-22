@@ -162,7 +162,7 @@ Parsers must not depend on this order.
 | Item | Default |
 |---|---|
 | Clock | Simulated nanosecond clock. sendingTime, transactTime and mDInsertTimestamp derived in a consistent order |
-| IDs | secondaryOrderID from one increasing counter (shared per market segment), tradeID per instrument per day, rptSeq per instrument |
+| IDs | secondaryOrderID unique across all market segments and incremental per segment (Guidelines p.68): one counter per segment, each in its own range. tradeID per instrument per day, rptSeq per instrument |
 | pcap | Nanosecond-resolution pcap |
 | Determinism | Seeded random number generator. Same seed and config gives byte-identical output |
 | File sizes | Small (~20k messages) for RTL simulation, large (~1M+) for C++ runs, plus a burst-heavy file |

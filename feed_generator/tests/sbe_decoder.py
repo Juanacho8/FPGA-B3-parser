@@ -120,12 +120,27 @@ LAYOUTS = {
 # (News: headline, text, uRLLink are VarString).
 VAR_DATA = {5: ["headline", "text", "uRLLink"]}
 
+# sinceVersion of the fields that came after the first version, from the
+# Notes column of spec/LAYOUTS.md section 7 ("since vN"), for the templates
+# above. A message whose header version is older does not have them.
+SINCE = {
+    28: {"settlDate": 17},
+    50: {"transactTime": 15, "mDEntryPrevSize": 16},
+    51: {"transactTime": 15, "mDEntryPx": 15},
+    52: {"transactTime": 15},
+    53: {"trdSubType": 7, "transactTime": 15},
+    55: {"transactTime": 15},
+    57: {"transactTime": 15},
+}
+
 
 def decode(message):
     """Decode one message. Returns (header dict, fields dict).
 
-    Chars come back as str with trailing NULs stripped. Var data comes back
-    as bytes."""
+    Trusts the header (LAYOUTS.md section 5): a field newer than the
+    header's version, or not inside its blockLength, is absent from the
+    returned dict; bytes past the known fields are skipped. Chars come back
+    as str with trailing NULs stripped. Var data comes back as bytes."""
     message_length, encoding_type, block_length, template_id, schema_id, version = \
         struct.unpack_from("<HHHHHH", message, 0)
     header = {
@@ -138,7 +153,10 @@ def decode(message):
     _, fields_layout = LAYOUTS[template_id]
     body = 12
     fields = {}
+    since = SINCE.get(template_id, {})
     for offset, code, name in fields_layout:
+        if since.get(name, 0) > version or offset + struct.calcsize(code) > block_length:
+            continue  # not in this version's root block
         (value,) = struct.unpack_from("<" + code, message, body + offset)
         if isinstance(value, bytes):
             value = value.rstrip(b"\x00").decode("ascii")

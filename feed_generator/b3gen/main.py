@@ -109,9 +109,15 @@ class RunResult:
     injections: list = field(default_factory=list)  # one dict per injection (tags, not placements)
 
 
-def _band(price, bps):
-    """PriceBand: +-bps basis points around the previous close."""
-    return price * (10_000 - bps) // 10_000, price * (10_000 + bps) // 10_000
+def _band(price, bps, tick):
+    """PriceBand: +-bps basis points around the previous close, each limit
+    snapped inward to the instrument's tick, so both limits are prices an
+    order can have (inference, open item O)."""
+    low = -(-price * (10_000 - bps) // (10_000 * tick)) * tick   # ceiling
+    high = price * (10_000 + bps) // (10_000 * tick) * tick       # floor
+    if low > high:
+        raise ValueError(f"band of {bps} bps around {price} holds no tick of {tick}")
+    return low, high
 
 
 def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overrides):
@@ -123,7 +129,7 @@ def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overr
 
     def inst(name, sid, channel, segment, group, tick, lot, future, close, adtv, maxvol,
              settle=None, oi=None):
-        low, high = _band(close, band_bps)
+        low, high = _band(close, band_bps, tick)
         return InstrumentConfig(name, sid, channel, segment, group, tick, lot, future, close,
                                 low, high, adtv, maxvol, settle, oi, band_bps)
 
@@ -168,6 +174,9 @@ SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS 
 MALFORMED_MESSAGES = 1500         # the malformed file is small
 EXTENDED_BLOCK = 8                # schema evolution: bytes added to the root block
 EXTENDED_VERSION = 18
+# Order_MBO at version 15 lacks mDEntryPrevSize (since v16), block 64; at
+# version 14 it also lacks transactTime (since v15), block 56.
+OLDER_VERSIONS = (15, 15, 14, 14)
 UNKNOWN_TEMPLATE = 999
 DAY_NS = 86_400 * 1_000_000_000
 START_OF_DAY_HEARTBEATS = 2.5     # stream up this many heartbeat intervals early: 3 heartbeats
@@ -306,16 +315,21 @@ def _injections(name, config):
     """The one-off actions of the 7c scenarios, at half the target. Targets
     come from the config's instruments: the first one (WIN by default) for
     the sweep, TradeBust and News, the first one on another channel (PETR4)
-    for the mass cancels, the last channel (70) for market-wide News."""
+    for the supervisor DELETE_THRUs, the channel with the most instruments
+    (68) for the firm mass cancel, the last channel (70) for market-wide
+    News."""
     half = config.target_messages // 2
     insts = config.instruments
     first = insts[0]
     other = next((i for i in insts if i.channel != first.channel), insts[-1])
     last_channel = max(i.channel for i in insts)
+    per_channel = [i.channel for i in insts]
+    busiest_channel = max(per_channel, key=lambda c: (per_channel.count(c), -c))
     inject = scenarios.Inject
     if name == "edge":
-        return (inject("mass_cancel", half, (("instrument", other.name), ("side", eng.BUY))),
-                inject("mass_cancel", half, (("instrument", other.name), ("side", eng.SELL))),
+        return (inject("supervisor_delete_thru", half, (("instrument", other.name), ("side", eng.BUY))),
+                inject("supervisor_delete_thru", half, (("instrument", other.name), ("side", eng.SELL))),
+                inject("firm_mass_cancel", half, (("channel", busiest_channel),)),
                 inject("sweep", half, (("instrument", first.name), ("side", eng.BUY),
                                        ("orders", 30))))
     if name == "rare":
@@ -328,6 +342,7 @@ def _injections(name, config):
                                            ("spread", 40))))
     if name == "schema":
         return (inject("extend", half, (("count", 3),)),
+                inject("older_version", half, (("versions", OLDER_VERSIONS),)),
                 inject("news", half, (("channel", first.channel),
                                       ("instrument", first.name), ("text_bytes", 200),
                                       ("part_size", 1000), ("spread", 0),
@@ -487,7 +502,7 @@ def _generate(config, stream=False):
         new_values = {}
         for i in insts:
             close = publisher.closing_price(i.name)
-            low, high = _band(close, i.band_bps)
+            low, high = _band(close, i.band_bps, i.tick)
             new_values[i.name] = dataclasses.replace(
                 values[i.name], prev_close=close, low_limit=low, high_limit=high,
                 settlement_price=close if i.is_future else None,
@@ -546,7 +561,7 @@ def _generate(config, stream=False):
     order = itertools.count()
     for item in (*config.resets, *config.injections):
         heapq.heappush(pending, (item.after_messages, next(order), item))
-    modify = {"extend": 0, "unknown": None}  # applied to the next live events
+    modify = {"extend": 0, "older": [], "unknown": None}  # applied to the next live events
     news_rng = random.Random(f"{config.seed}:news")
 
     def submit(name, instruction):
@@ -560,12 +575,36 @@ def _generate(config, stream=False):
         args = item.params
         log = {"kind": item.kind, "time_ns": t, **{k: v for k, v in args.items()}}
         first = len(published)
-        if item.kind == "mass_cancel":
-            outcome = submit(args["instrument"], eng.MassCancel(t, args["side"]))
+        if item.kind == "supervisor_delete_thru":
+            outcome = submit(args["instrument"], eng.SupervisorDeleteThru(t, args["side"]))
             if not outcome.orders:
                 raise scenarios.ScenarioError(
-                    f"mass_cancel: {args['instrument']} has no {args['side']} orders at "
+                    f"supervisor_delete_thru: {args['instrument']} has no {args['side']} orders at "
                     f"message {len(published)}; raise the message target")
+            emit(publisher.publish(outcome))
+        elif item.kind == "firm_mass_cancel":
+            names = [i.name for i in insts if i.channel == args["channel"]]
+            orders = {}  # firm -> {instrument: resting orders}
+            for name in names:
+                for o in engine.books[name].resting_orders():
+                    orders.setdefault(o.firm, {}).setdefault(name, 0)
+                    orders[o.firm][name] += 1
+            # Across 2+ instruments when the channel has them (one if not).
+            need = min(2, len(names))
+            spanning = [(sum(per.values()), -firm) for firm, per in orders.items()
+                        if len(per) >= need and sum(per.values()) >= 2]
+            if not spanning:
+                raise scenarios.ScenarioError(
+                    f"firm_mass_cancel: no firm has orders on {need}+ instruments of channel "
+                    f"{args['channel']} at message {len(published)}; raise the message target")
+            firm = -max(spanning)[1]
+            instruction = eng.FirmMassCancel(t, firm, tuple(names))
+            instructions[type(instruction).__name__] += 1
+            outcome = engine.firm_mass_cancel(instruction)
+            outcomes[type(outcome).__name__] += 1
+            flow.on_outcome(outcome)
+            log.update(firm=firm, instruments=names,
+                       orders_cancelled={n: orders[firm].get(n, 0) for n in names})
             emit(publisher.publish(outcome))
         elif item.kind == "sweep":
             opposite = eng.SELL if args["side"] == eng.BUY else eng.BUY
@@ -588,13 +627,13 @@ def _generate(config, stream=False):
             log["trade_tags"] = [tag]
             emit(publisher.trade_bust(t, trade))
         elif item.kind == "news":
-            news_id = len(injection_log) + 1
+            number = len(injection_log) + 1  # ours, for the headline and manifest; not on the wire
             parts = publisher.news_parts(
-                t, args["channel"], args["instrument"], news_id,
-                f"Aviso {news_id}", _news_text(news_rng, args["text_bytes"]),
+                t, args["channel"], args["instrument"],
+                f"Aviso {number}", _news_text(news_rng, args["text_bytes"]),
                 args["part_size"], block_extra=args.get("block_extra", 0),
                 version=args.get("version"))
-            log.update(newsID=news_id, part_count=len(parts), part_tags=[])
+            log.update(news_number=number, part_count=len(parts), part_tags=[])
             for k, part in enumerate(parts):
                 if k and args["spread"]:
                     # Later parts go out after live traffic, at their own time.
@@ -606,10 +645,15 @@ def _generate(config, stream=False):
         elif item.kind == "extend":
             modify["extend"] = args["count"]
             log["event_tags"] = []
+        elif item.kind == "older_version":
+            modify["older"] = list(args["versions"])
+            modify["older_log"] = log
+            log["versions"] = list(args["versions"])  # JSON in the manifest
+            log["event_tags"] = []
         elif item.kind == "unknown":
             body = bytes(news_rng.randrange(256) for _ in range(args["body_bytes"]))
             modify["unknown"] = (args["template_id"], body, log)
-        if item.kind not in ("extend", "unknown", "news"):
+        if item.kind not in ("extend", "older_version", "unknown", "news"):
             log["event_tags"] = list(range(first, len(published)))
         if item.kind == "extend":
             modify["extend_log"] = log
@@ -628,6 +672,9 @@ def _generate(config, stream=False):
             modify["extend_log"]["event_tags"].append(len(published))
             return publisher.publish(outcome, block_extra=EXTENDED_BLOCK,
                                      version=EXTENDED_VERSION)
+        if modify["older"] and kind is eng.Rested:
+            modify["older_log"]["event_tags"].append(len(published))
+            return publisher.publish(outcome, version=modify["older"].pop(0))
         messages = publisher.publish(outcome)
         if modify["unknown"] and len(messages) >= 2:
             template_id, body, log = modify["unknown"]
@@ -680,9 +727,9 @@ def _generate(config, stream=False):
         raise scenarios.ScenarioError(
             f"{kind} due at message {pending[0][0]} never placed: the target is "
             f"{config.target_messages} messages; raise it")
-    if modify["extend"] or modify["unknown"]:
+    if modify["extend"] or modify["older"] or modify["unknown"]:
         raise scenarios.ScenarioError(
-            "extend/unknown: no suitable live event after the injection point; "
+            "extend/older_version/unknown: no suitable live event after the injection point; "
             "raise the message target")
 
     packetized = packetizer.finish(t)

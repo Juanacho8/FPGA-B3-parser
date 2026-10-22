@@ -73,13 +73,17 @@ def independent_rows(folder, securities):
             yield {"templateId": header["templateId"], "sequenceNumber": seq, "index": index}
             continue
         optional = MESSAGE_LAYOUTS[header["templateId"]]["optional_nulls"]
+        # Fields an older version's message does not have (decoder trusts the header).
+        absent = [name for _, _, name in sbe_decoder.LAYOUTS[header["templateId"]][1]
+                  if name not in fields]
         yield {"channel": channel, "sequenceVersion": version, "sequenceNumber": seq,
                "index": index, "sendingTime": sending, "templateId": header["templateId"],
                "blockLength": header["blockLength"], "version": header["version"],
                "instrument": securities.get(fields.get("securityID")),
                "fields": {k: (v.decode() if isinstance(v, bytes) else v) for k, v in fields.items()},
                "null": [k for k in fields if k in optional and
-                        (fields[k] == optional[k] or (isinstance(fields[k], str) and fields[k] == ""))]}
+                        (fields[k] == optional[k] or (isinstance(fields[k], str) and fields[k] == ""))],
+               **({"absent": absent} if absent else {})}
 
 
 def test_every_pcap_decodes_to_its_intent_log(built):
@@ -123,9 +127,10 @@ def test_every_manifest_lists_what_its_scenario_promises(built):
             (reset,) = m["resets"]
             assert reset["trade_date_after"] == reset["trade_date_before"] + 1
         elif name in ("edge", "rare", "schema"):
-            kinds = {"edge": ["mass_cancel", "mass_cancel", "sweep"],
+            kinds = {"edge": ["supervisor_delete_thru", "supervisor_delete_thru",
+                              "firm_mass_cancel", "sweep"],
                      "rare": ["trade_bust", "news", "news"],
-                     "schema": ["extend", "news", "unknown"]}[name]
+                     "schema": ["extend", "older_version", "news", "unknown"]}[name]
             assert [i["kind"] for i in m["injections"]] == kinds
             for inj in m["injections"]:
                 placed = [v for k, v in inj.items() if k.endswith("placements")]

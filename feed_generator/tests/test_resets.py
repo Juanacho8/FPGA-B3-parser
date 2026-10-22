@@ -7,6 +7,8 @@ is checked from the wire.
 """
 
 import json
+import math
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -416,14 +418,22 @@ def tight_session_change(tmp_path_factory):
 def test_new_session_bands_follow_the_close_and_bind_new_orders(runs, tight_session_change,
                                                                   name):
     # Each session's PriceBand is +-band_bps of the previous close (the
-    # ClosingPrice DAILY just before it, 8 decimals), and every new live
+    # file's configured close, then the ClosingPrice DAILY just before it,
+    # 8 decimals), each limit snapped inward to the tick; every new live
     # order after it stays inside it.
     result = tight_session_change if name == "tight" else runs[name]
     bps = 20 if name == "tight" else main.InstrumentConfig.band_bps
+    insts = {i.security_id: i for i in main.default_config().instruments}
+
+    def snapped(close, tick):
+        low, high = Fraction(close * (10_000 - bps), 10_000), Fraction(close * (10_000 + bps), 10_000)
+        return math.ceil(low / tick) * tick, math.floor(high / tick) * tick
+
     at_edge = 0
     band = {}
     last_close = {}
     new_bands = 0
+    off_tick_raw = 0
     checked = 0
     for p in read_packets(result.run.pcap_path):
         for data in p["messages"]:
@@ -433,11 +443,12 @@ def test_new_session_bands_follow_the_close_and_bind_new_orders(runs, tight_sess
                 last_close[sid] = f["mDEntryPx"] // 10_000
             elif h["templateId"] == 22:
                 band[sid] = (f["lowLimitPrice"], f["highLimitPrice"])
-                if sid in last_close:
-                    close = last_close[sid]
-                    assert band[sid] == (close * (10_000 - bps) // 10_000,
-                                         close * (10_000 + bps) // 10_000), sid
-                    new_bands += 1
+                tick = insts[sid].tick
+                close = last_close.get(sid, insts[sid].prev_close)
+                assert band[sid] == snapped(close, tick), sid
+                assert band[sid][0] % tick == band[sid][1] % tick == 0, sid
+                off_tick_raw += close * (10_000 - bps) % (10_000 * tick) != 0
+                new_bands += sid in last_close
             elif h["templateId"] == ORDER and f["mDUpdateAction"] == 0 \
                     and not f["matchEventIndicator"] & RECOVERY:
                 low, high = band[sid]
@@ -446,5 +457,6 @@ def test_new_session_bands_follow_the_close_and_bind_new_orders(runs, tight_sess
                 at_edge += high - f["mDEntryPx"] < 0.2 * (high - low) or \
                     f["mDEntryPx"] - low < 0.2 * (high - low)
     assert new_bands == 4 and checked > 1000
+    assert off_tick_raw  # some unsnapped limit fell between ticks, so snapping was exercised
     if name == "tight":
         assert at_edge > 100  # the band really binds

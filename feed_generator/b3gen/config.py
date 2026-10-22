@@ -300,7 +300,7 @@ def _run_config(c):
         tzinfo=datetime.timezone.utc)
     instruments = []
     for i in c["instruments"]:
-        low, high = _band(i["prev_close"], i["band_bps"])
+        low, high = _band(i["prev_close"], i["band_bps"], i["tick"])
         instruments.append(InstrumentConfig(
             i["name"], i["security_id"], i["channel"], i["segment"], i["security_group"],
             i["tick"], i["lot"], i["is_future"], i["prev_close"], low, high,

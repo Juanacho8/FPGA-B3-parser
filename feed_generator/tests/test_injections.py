@@ -13,9 +13,11 @@ from b3gen import engine, main
 from b3gen.flow import FlowInstrument, FlowParams, OrderFlow
 from conftest import scenario_config
 import sbe_decoder
+from book_builder import BookBuilder
 from replay import replay
 from wire import read_packets, split_messages
 
+DELETE = 51
 NEWS, ORDER, MASS_DELETE, TRADE, EXEC_SUMMARY, EXEC_STATS, TRADE_BUST = 5, 50, 52, 53, 55, 56, 57
 EOE = 0x80
 
@@ -71,11 +73,11 @@ def test_malformed_books_match_where_reliable(runs):
 # Edge orders
 # ---------------------------------------------------------------------------
 
-def test_mass_cancel_of_each_side(runs):
+def test_supervisor_delete_thru_of_each_side(runs):
     result = runs["edge"]
     wire = wire_at(result)
     sides = []
-    for inj in injections(result, "mass_cancel"):
+    for inj in injections(result, "supervisor_delete_thru"):
         (where,) = inj["event_placements"]
         header, f, _, _ = wire[tuple(where)]
         assert header["templateId"] == MASS_DELETE and f["mDUpdateAction"] == 3  # DELETE_THRU
@@ -83,11 +85,51 @@ def test_mass_cancel_of_each_side(runs):
         sides.append(f["mDEntryType"])
     assert sorted(sides) == ["0", "1"]
     # The flow forgot the cancelled handles: nothing it sent was rejected.
-    assert result.run.outcomes["MassCancelled"] == 2
+    assert result.run.outcomes["SupervisorDeletedThru"] == 2
     assert result.run.outcomes["Rejected"] == 0
 
 
-def test_mass_cancelled_handles_leave_the_flow():
+def test_firm_mass_cancel_is_one_event_across_instruments(runs):
+    # A participant's mass cancel (Guidelines p.15, LAYOUTS.md 12.2): one
+    # event of DeleteOrder_MBO for every resting order of the firm, across
+    # several instruments of one channel, only the last with EndOfEvent.
+    result = runs["edge"]
+    (inj,) = injections(result, "firm_mass_cancel")
+    places = [tuple(p) for p in inj["event_placements"]]
+    wire = wire_at(result)
+    msgs = [wire[p] for p in places]
+    assert all(h["templateId"] == DELETE for h, _, _, _ in msgs)
+    assert [f["matchEventIndicator"] for _, f, _, _ in msgs] == [0] * (len(msgs) - 1) + [EOE]
+    assert len({f["securityID"] for _, f, _, _ in msgs}) >= 2
+    assert {p[0] for p in places} == {inj["channel"]}
+    assert len({f["transactTime"] for _, f, _, _ in msgs}) == 1
+    channel = places[0][0]
+    on_channel = sorted(k for k in wire if k[0] == channel)
+    start = on_channel.index(places[0])
+    assert on_channel[start:start + len(places)] == places  # nothing in between
+    # Exactly the firm's resting orders when the event began, from the wire:
+    # enteringFirm comes from each order's Order_MBO.
+    builder, firm_of, held = BookBuilder(), {}, None
+    sids = {ids()[n] for n in inj["instruments"]}
+    for p in read_packets(result.run.pcap_path):
+        def before(index, p=p):
+            nonlocal held
+            if (p["channel"], p["version"], p["seq"], index) == places[0]:
+                held = {(sid, soid) for sid in sids for _, _, _, soid in builder.resting(sid)
+                        if firm_of[(sid, soid)] == inj["firm"]}
+
+        def after(index, p=p):
+            header, f = sbe_decoder.decode(p["messages"][index])
+            if header["templateId"] == ORDER:
+                firm_of[(f["securityID"], f["secondaryOrderID"])] = f["enteringFirm"]
+        builder.apply_packet(p["channel"], p["version"], p["seq"], p["messages"],
+                             before=before, after=after)
+    assert held == {(f["securityID"], f["secondaryOrderID"]) for _, f, _, _ in msgs}
+    assert sum(inj["orders_cancelled"].values()) == len(msgs)
+    assert result.run.outcomes["FirmMassCancelled"] == 1 and result.run.outcomes["Rejected"] == 0
+
+
+def test_delete_thru_handles_leave_the_flow():
     inst = FlowInstrument("X", tick=100, lot=100, low_limit=1_000, high_limit=1_000_000,
                           reference_price=50_000)
     flow = OrderFlow([inst], FlowParams(rates={"X": (10, 100, 1000)}), seed=3, start_ns=0)
@@ -95,7 +137,7 @@ def test_mass_cancelled_handles_leave_the_flow():
     for handle, side in ((1, engine.BUY), (2, engine.BUY), (3, engine.SELL)):
         flow.on_outcome(engine.Rested("X", 0, handle, handle, side, 50_000, 100, 1, 0))
     views = tuple(engine.OrderView(h, h, engine.BUY, 50_000, 100, 1, 0) for h in (1, 2))
-    flow.on_outcome(engine.MassCancelled("X", 1, engine.BUY, views))
+    flow.on_outcome(engine.SupervisorDeletedThru("X", 1, engine.BUY, views))
     assert set(live.orders) == {3}
 
 
@@ -157,34 +199,46 @@ def test_trade_bust_leaves_statistics_alone(runs):
 
 
 def news_from_wire(result):
-    """newsID -> [(packet key, header, fields)] in wire order."""
-    out = {}
-    for key, (header, fields, _, _) in sorted(wire_at(result).items(),
-                                              key=lambda kv: kv[1][3]["time"]):
-        if header["templateId"] == NEWS:
-            out.setdefault(fields["newsID"], []).append((key, header, fields))
+    """Every News reassembled the way a client must, since newsID is null on
+    trading channels: per channel in sequence order, partNumber 1 opens a
+    News and partNumber == partCount closes it. Returns {placement of the
+    last part: [(placement, header, fields)]}."""
+    out, open_news = {}, {}
+    for key, (header, fields, _, _) in sorted(wire_at(result).items()):
+        if header["templateId"] != NEWS:
+            continue
+        parts = open_news.setdefault(key[0], [])
+        assert fields["partNumber"] == len(parts) + 1, (key, fields["partNumber"], len(parts))
+        parts.append((key, header, fields))
+        if fields["partNumber"] == fields["partCount"]:
+            out[key] = open_news.pop(key[0])
+    assert not open_news, "a News never got its last part"
     return out
 
 
 @pytest.mark.parametrize("name", ["rare", "schema"])
 def test_news_reassembly_matches_intent(runs, name):
     result = runs[name]
-    by_id = news_from_wire(result)
-    expected = {r["news"]["newsID"]: r["news"] for r in intent(result) if "news" in r}
-    assert set(by_id) == set(expected) == {i["newsID"] for i in injections(result, "news")}
-    for news_id, parts in by_id.items():
-        parts.sort(key=lambda p: (p[0][0], p[0][1], p[0][2], p[0][3]))
+    by_last = news_from_wire(result)
+    rows = intent_at(result)
+    expected = {k: r["news"] for k, r in rows.items() if "news" in r}
+    assert set(by_last) == set(expected) == \
+        {tuple(i["part_placements"][-1]) for i in injections(result, "news")}
+    for last, parts in by_last.items():
         fields = [f for _, _, f in parts]
         count = fields[0]["partCount"]
         assert [f["partNumber"] for f in fields] == list(range(1, count + 1))
         assert all(f["partCount"] == count for f in fields)
+        # Trading-channel News: newsID null (Unified News Channel only), "en".
+        assert all(f["newsID"] == 0 and f["languageCode"] == "en" for f in fields)
+        assert all("newsID" in rows[k]["null"] for k, _, _ in parts)
         text = b"".join(f["text"] for f in fields)
         assert all(f["totalTextLength"] == len(text) for f in fields)
         # Headline in part 1 only (inference).
         assert fields[0]["headline"] and all(f["headline"] == b"" for f in fields[1:])
         assert all(f["matchEventIndicator"] == EOE for f in fields)
         assert (fields[0]["headline"].decode(), text.decode()) == \
-            (expected[news_id]["headline"], expected[news_id]["text"])
+            (expected[last]["headline"], expected[last]["text"])
 
 
 def test_multi_part_news_interleaved_and_split(runs):
@@ -229,6 +283,30 @@ def test_extended_messages_decode_known_fields_and_skip_the_rest(runs):
     assert templates == {ORDER, NEWS}
 
 
+def test_older_version_messages_lack_the_later_fields(runs):
+    # LAYOUTS.md section 5: fields whose sinceVersion is above the header's
+    # version are not there. Order_MBO v15: no mDEntryPrevSize (since v16),
+    # blockLength 64; v14: no transactTime either (since v15), blockLength 56.
+    result = runs["schema"]
+    wire = wire_at(result)
+    rows = intent_at(result)
+    (inj,) = injections(result, "older_version")
+    places = [tuple(p) for p in inj["event_placements"]]
+    want = {15: (64, ["mDEntryPrevSize"]), 14: (56, ["transactTime", "mDEntryPrevSize"])}
+    assert inj["versions"] == [15, 15, 14, 14] and len(places) == 4
+    for p, version in zip(places, inj["versions"]):
+        header, fields, data, _ = wire[p]
+        block, missing = want[version]
+        assert header["templateId"] == ORDER and fields["mDUpdateAction"] == 0
+        assert (header["version"], header["blockLength"], header["messageLength"]) == \
+            (version, block, 12 + block) == (version, block, len(data))
+        assert not set(missing) & set(fields)
+        row = rows[p]
+        assert (row["version"], row["blockLength"], row["absent"]) == (version, block, missing)
+        assert not set(missing) & (set(row["fields"]) | set(row["null"]))
+        assert fields == row["fields"]
+
+
 def test_unknown_template_is_skipped_by_message_length(runs):
     result = runs["schema"]
     (inj,) = injections(result, "unknown")
@@ -245,7 +323,7 @@ def test_unknown_template_is_skipped_by_message_length(runs):
 def test_every_other_intent_row_has_schema_header_values(runs):
     rows = intent(runs["schema"])
     odd = [r for r in rows if r["version"] != 17]
-    assert len(odd) == 5  # 3 Order_MBO + 1 News + 1 unknown
+    assert len(odd) == 9  # 3 extended Order_MBO + 1 News + 1 unknown + 4 older Order_MBO
     for r in rows:
         if r["version"] == 17:
             assert r["blockLength"] == sbe_decoder.LAYOUTS[r["templateId"]][0]

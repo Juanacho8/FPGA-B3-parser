@@ -346,7 +346,7 @@ class _InstrumentFlow:
             self.live.orders[outcome.handle][2] = outcome.new_qty
         elif kind is engine.Requeued:
             self.live.orders[outcome.handle][1:] = [outcome.new_price, outcome.new_qty]
-        elif kind is engine.MassCancelled:
+        elif kind is engine.SupervisorDeletedThru:
             for o in outcome.orders:
                 self.live.remove(o.handle)
         elif kind is engine.Rejected:
@@ -396,5 +396,9 @@ class OrderFlow:
         return self.flows[arrival.instrument].decide(arrival.time_ns, top)
 
     def on_outcome(self, outcome):
+        if type(outcome) is engine.FirmMassCancelled:
+            for name, view in outcome.cancelled:
+                self.flows[name].live.remove(view.handle)
+            return
         self.flows[outcome.instrument].on_outcome(outcome)
 

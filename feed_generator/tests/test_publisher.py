@@ -13,7 +13,7 @@ import pytest
 
 from b3gen import encode
 from b3gen.engine import (
-    BUY, SELL, Cancel, Engine, IocOrder, MarketOrder, MassCancel, NewOrder, PriceChange,
+    BUY, SELL, Cancel, Engine, IocOrder, MarketOrder, SupervisorDeleteThru, NewOrder, PriceChange,
     SizeChange,
 )
 from b3gen.publisher import Instrument, PublishError, Publisher, SessionValues, round_half_even
@@ -115,13 +115,13 @@ def test_requeue_is_delete_then_new_with_new_soid():
     assert nxt["mDInsertTimestamp"] == r.t and nxt["mDUpdateAction"] == 0
 
 
-def test_mass_cancel():
+def test_supervisor_delete_thru():
     r = Run()
     r(NewOrder, BUY, 1000, 300, 7)
     r(NewOrder, BUY, 900, 300, 7)
-    (m,) = r(MassCancel, BUY)
+    (m,) = r(SupervisorDeleteThru, BUY)
     assert m.template_id == MASS and (m.fields["mDUpdateAction"], m.fields["mDEntryType"]) == (3, "0")
-    assert r(MassCancel, BUY) == []  # empty side: nothing
+    assert r(SupervisorDeleteThru, BUY) == []  # empty side: nothing
 
 
 def test_unfilled_and_rejected_publish_nothing():
@@ -143,7 +143,8 @@ def test_sweep_with_partial_fill_of_last_level_and_remainder_resting():
     assert eoe(msgs) == [0] * 11 + [EOE]
     summary = msgs[0].fields
     assert (summary["aggressorSide"], summary["lastPx"], summary["fillQty"]) == (1, 1100, 500)
-    assert summary["aggressorTime"] == r.t and "cxlQty" not in summary
+    assert summary["aggressorTime"] == r.t
+    assert (summary["tradedHiddenQty"], summary["cxlQty"]) == (0, 0)  # limit: remainder rests
     trades = [m.fields for m in msgs if m.template_id == TRADE]
     assert [(t["mDEntryPx"], t["mDEntrySize"], t["tradeID"]) for t in trades] == \
         [(1000, 100, 1), (1000, 100, 2), (1100, 300, 3)]
@@ -219,9 +220,10 @@ def test_crossing_price_change():
 def test_market_order_execution():
     r = Run()
     r(NewOrder, BUY, 1000, 100, 1)
-    msgs = r(MarketOrder, SELL, 300, 2)  # remainder 200 discarded, not published
+    msgs = r(MarketOrder, SELL, 300, 2)  # remainder 200 discarded: cxlQty
     assert templates(msgs) == [SUMMARY, TRADE, DELETE, OPENING, HIGH, LOW, STATS]
     assert msgs[0].fields["aggressorSide"] == 2
+    assert (msgs[0].fields["cxlQty"], msgs[0].fields["tradedHiddenQty"]) == (200, 0)
     assert (msgs[1].fields["mDEntryBuyer"], msgs[1].fields["mDEntrySeller"]) == (1, 2)
 
 
@@ -321,9 +323,9 @@ def run_stream(seed, steps):
     recompute = Recompute()
     recompute.reset()
     rpt = {}
-    counts = {"events": 0, "matching": 0, "high": 0, "low": 0}
+    counts = {"events": 0, "matching": 0, "high": 0, "low": 0, "cancelled": 0}
 
-    def check_event(msgs, time_ns):
+    def check_event(msgs, time_ns, expected=None):
         if not msgs:
             return
         counts["events"] += 1
@@ -357,6 +359,11 @@ def run_stream(seed, steps):
                 recompute.add(sid, f["mDEntryPx"], f["mDEntrySize"])
             assert decoded[0][1]["fillQty"] == sum(f["mDEntrySize"] for f in trades)
             assert decoded[0][1]["lastPx"] == trades[-1]["mDEntryPx"]
+            # The reference engine's discarded remainder (market/IOC), else 0.
+            assert decoded[0][1]["tradedHiddenQty"] == 0
+            assert decoded[0][1]["cxlQty"] == expected[1]["discarded_qty"]
+            if expected[1]["discarded_qty"]:
+                counts["cancelled"] += 1
             stats = decoded[-1][1]
             assert {k: stats[k] for k in recompute.stats(sid)} == recompute.stats(sid)
             assert stats["tradeVolume"] == sum(q for _, q in recompute.trades[sid])
@@ -382,7 +389,7 @@ def run_stream(seed, steps):
     for m in start:
         check_event([m], 0)
     half = steps // 2
-    for i, (instr, _, _) in enumerate(random_stream(seed, steps)):
+    for i, (instr, expected, _) in enumerate(random_stream(seed, steps)):
         if i == half:
             # A new trading session halfway through: statistics reset.
             t = instr[2]
@@ -392,7 +399,7 @@ def run_stream(seed, steps):
                 check_event([m], t)
             recompute.reset()
         outcome = engine.submit(instr[1], to_engine_instruction(instr))
-        check_event(pub.publish(outcome), instr[2])
+        check_event(pub.publish(outcome), instr[2], expected)
         check_books()
     return counts
 
@@ -403,6 +410,7 @@ def test_random_stream_book_replay_and_event_rules(seed):
     # About half of what the seeds produce (~650 matching events, ~30 new
     # highs and ~35 new lows each), so a weaker stream fails.
     assert counts["matching"] > 300 and counts["high"] > 14 and counts["low"] > 14
+    assert counts["cancelled"] > 20
 
 
 def test_publishing_is_deterministic():

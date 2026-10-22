@@ -8,7 +8,7 @@ changes are always valid, or hit gone handles on purpose.
 import random
 
 from b3gen.engine import (
-    Cancel, IocOrder, MarketOrder, MassCancel, NewOrder, PriceChange, SizeChange,
+    Cancel, IocOrder, MarketOrder, SupervisorDeleteThru, NewOrder, PriceChange, SizeChange,
 )
 from reference_engine import ReferenceEngine
 
@@ -49,7 +49,7 @@ def random_stream(seed, steps):
         elif r < 0.50:    # small market order
             instr = ("market", book, t, side, lot * rng.randint(1, 6), rng.randint(1, 5))
         elif r < 0.505:   # mass cancel one side
-            instr = ("mass", book, t, side)
+            instr = ("delete_thru", book, t, side)
         else:
             # Mostly live orders, sometimes any handle ever issued (often gone),
             # occasionally one never issued.
@@ -91,4 +91,4 @@ def to_engine_instruction(instr):
     kind, _, t = instr[:3]
     args = instr[3:]
     return {"new": NewOrder, "ioc": IocOrder, "market": MarketOrder, "cancel": Cancel,
-            "size": SizeChange, "price": PriceChange, "mass": MassCancel}[kind](t, *args)
+            "size": SizeChange, "price": PriceChange, "delete_thru": SupervisorDeleteThru}[kind](t, *args)

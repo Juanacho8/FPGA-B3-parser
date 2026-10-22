@@ -62,7 +62,7 @@ The original skeleton named the order flow and engine together as `sim.py`. Spli
 ### Engine
 
 * Book per instrument and side. Bids by price high to low, offers low to high. Within a price, by **secondaryOrderID ascending** (smaller is first in line).
-* **secondaryOrderID** comes from one increasing counter per market segment (equities and derivatives each have their own). It changes whenever an order loses priority: size increase or price change.
+* **secondaryOrderID** is unique across all market segments and incremental per segment (Guidelines p.68). Each segment has its own counter inside its own range of 10¹² IDs: the first segment in the config counts from 1, the second from 10¹² + 1, so IDs never repeat across segments. It changes whenever an order loses priority: size increase or price change.
 * An aggressive order matches against the opposite side best price first, then by priority, until filled or no longer crossing. Any remainder of a limit order rests at its limit price. Any remainder of a market or immediate-or-cancel order is discarded, and that produces no message.
 
 ### Publisher: outcome to B3 messages
@@ -76,11 +76,12 @@ Every row below is **one event**. Only the **last message of the event** gets En
 | Size reduction (keeps priority) | Order_MBO CHANGE (same secondaryOrderID, new size, mDEntryPrevSize = old size) |
 | Size increase or price change (loses priority) | DeleteOrder_MBO for the old order, then Order_MBO NEW with a new secondaryOrderID |
 | Aggressive order with fills | 1. ExecutionSummary. 2. Trade, one per fill. 3. Per resting order hit: DeleteOrder_MBO if fully filled, Order_MBO CHANGE (with prevSize) if partially filled. 4. Order_MBO NEW for the aggressor's remainder if it rests. 5. OpeningPrice if this is the session's first trade, HighPrice / LowPrice if a new session extreme. 6. ExecutionStatistics |
-| Mass cancel of one side (scenario) | MassDeleteOrders_MBO, DELETE_THRU |
+| Market supervision deletes one side (scenario, Guidelines p.71) | MassDeleteOrders_MBO, DELETE_THRU |
+| A firm's mass cancel (scenario, Guidelines p.15) | One DeleteOrder_MBO per resting order of the firm, across the instruments of one channel, as one event (open item P) |
 
 Field rules:
 
-* **ExecutionSummary**: aggressorSide, lastPx = price of the last fill, fillQty = total filled, cxlQty and tradedHiddenQty null, aggressorTime and transactTime. It has no matchEventIndicator field.
+* **ExecutionSummary**: aggressorSide, lastPx = price of the last fill, fillQty = total filled, tradedHiddenQty = 0 (no hidden orders in v1), cxlQty = the market/IOC remainder discarded at the end of matching, 0 when nothing is cancelled (open item N), aggressorTime and transactTime. B3's examples show 0, not null, for these quantities. It has no matchEventIndicator field.
 * **Trade**: price, size, tradeID (counter per instrument per trading day), mDEntryBuyer and mDEntrySeller firms, tradingSessionID = 1 (regular). tradeCondition: RegularTrade (bit 13) always. OpeningPrice (bit 0) on the session's first trade. LastTradeAtTheSamePrice (bit 2) when equal to the previous trade price.
 * **Order_MBO**: mDInsertTimestamp = when the order entered or re-entered the book. transactTime = when this event happened. enteringFirm set. mDEntryPrevSize null except on CHANGE.
 * **DeleteOrder_MBO**: mDEntrySize = remaining size just before deletion. mDEntryPx = the order's price.
@@ -196,10 +197,10 @@ Step 7b decisions (restart and reset scenarios, `run_scenario` kinds `failover`,
 
 Step 7c decisions (`edge`, `rare`, `schema`, `malformed`; injections at half the target message count):
 
-* **edge:** MassCancel of each side of PETR4 (MassDeleteOrders_MBO DELETE_THRU, each its own 0x80 event), and a market order for the best 30 offers on WIN, whose event spans 3+ packets. The flow drops the handles a MassCancel removed; the run has no Rejected outcomes.
+* **edge:** a market-supervision SupervisorDeleteThru of each side of PETR4 (MassDeleteOrders_MBO DELETE_THRU, each its own 0x80 event); a firm mass cancel on channel 68 (every resting WIN and DOL order of the firm with the most orders there, one event of DeleteOrder_MBO, open item P); and a market order for the best 30 offers on WIN, whose event spans 3+ packets. The flow drops the handles these removed; the run has no Rejected outcomes.
 * **rare:** a TradeBust copying WIN's latest Trade (open item L); a single-part News for WIN and a 3-part market-wide News on channel 70 (open item M). Each part is over 700 B so no two share a packet, and live traffic goes out between parts (40 messages apart).
 * **Gap rule narrowed:** only SecurityGroupPhase, ChannelReset and SequenceReset make a whole channel unreliable; News and unknown templates never make a book unreliable.
-* **schema:** three live Order_MBO NEW and one News with blockLength = schema + 8 (zero bytes, var data after the larger block) and header version 18, and a templateId 999 message with a 20-byte random body inside a live event (a real message before and after it in the packet). Clients decode the known fields with the header's blockLength, skip the rest, and skip unknown templates by messageLength.
+* **schema:** three live Order_MBO NEW and one News with blockLength = schema + 8 (zero bytes, var data after the larger block) and header version 18; four live Order_MBO NEW of older versions (two at version 15: no mDEntryPrevSize, blockLength 64; two at version 14: no transactTime either, blockLength 56), whose intent rows list those fields as "absent"; and a templateId 999 message with a 20-byte random body inside a live event (a real message before and after it in the packet). Clients decode the known fields with the header's blockLength, skip the rest, and skip unknown templates by messageLength.
 * **malformed:** a 1,500-message run with one fault in each of five packets (messageLength past the end, 0, under 12, a wrong encodingType, the datagram cut inside the last message's header) and a stray 10-byte datagram that uses up no sequence number. The manifest lists each fault's packet, kind, byte offset and messages before it. Clients process the complete messages before the fault, discard the rest of the packet and carry on with sequencing; instruments whose book messages were discarded are listed as unreliable from that packet.
 | Edge orders | Null-price (market-on-auction style) orders, MassDelete, aggressions sweeping several levels, events spanning packets |
 | Schema evolution | A message with a larger blockLength than the schema (extra zero bytes appended), and an unknown templateId |
@@ -230,7 +231,7 @@ Step 7c decisions (`edge`, `rare`, `schema`, `malformed`; injections at half the
 | File | Content |
 |---|---|
 | `feedA.pcap`, `feedB.pcap` | Nanosecond-resolution pcap. Ethernet + IPv4 + UDP to the channel's multicast group. IP/UDP headers big-endian, B3 payload little-endian |
-| Intent log | One row per message: feed packet sequenceNumber, message index within the packet, templateId, the header's blockLength and version (decided in step 7c, on every row), and every field value as the publisher intended. JSON Lines. An unknown template's row has fields {"body": hex}; the last part of a News also carries "news": {newsID, headline, text} with the reassembled text |
+| Intent log | One row per message: feed packet sequenceNumber, message index within the packet, templateId, the header's blockLength and version (decided in step 7c, on every row), and every field value as the publisher intended. JSON Lines. An unknown template's row has fields {"body": hex}; the last part of a News also carries "news": {headline, text} with the reassembled text |
 | Book key | The book a correct client holds (not the engine's book), top 5 levels per side per instrument, at checkpoints (e.g. every 1,000 events, and after every rebuild). The two differ between a ChannelReset and an instrument's rebuild, where the client holds an empty book. With gaps, books listed as unreliable in the manifest diverge from the key from their first missing packet |
 
 The parser output format (decision A) is deferred to the C++/RTL phase. A small script will convert the intent log into it later.
@@ -271,4 +272,7 @@ Standard runs: small (~20k messages) for RTL simulation, large (~1M+) for C++ ru
 | J | Rebuild interleaving and resent statistics | v1 rebuilds every instrument of a reset, then resumes live flow. B3 can interleave live updates of an instrument already rebuilt with other instruments' recovery (LAYOUTS.md 12.9, Guidelines p.46 item 6). B3 may also re-send group phases, statuses, statistics and bands after a ChannelReset or EmptyBook (Guidelines pp.47-48); v1 does not |
 | K | Null-price (market-on-auction/close) orders | Out of v1: they only exist in auctions, which v1 does not model. LAYOUTS.md 12.3: they form the best level on either side |
 | L | TradeBust and statistics | Inferred: a TradeBust leaves statistics (ExecutionStatistics counts and volume, High/Low, last price) unchanged. B3 does not say whether it republishes them |
-| M | News details | Inferred: the headline is in part 1 only; each part is a standalone message with EndOfEvent (0x80); market-wide News (null securityID) goes on one channel (70 in the default config); text is ASCII so byte splits never cut a character |
+| M | News details | Inferred: the headline is in part 1 only; each part is a standalone message with EndOfEvent (0x80); market-wide News (null securityID) goes on one channel (70 in the default config); text is ASCII so byte splits never cut a character. B3: newsID is sent only on the Unified News Channel ("not sent for trading engine News messages", XML), so News on trading channels has a null newsID and a client groups the parts by channel and order; inferred: the parts of one News are never interleaved with another News on the same channel |
+| N | ExecutionSummary cxlQty | Inferred: cxlQty ("total quantity canceled during matching process", XML) is the market or IOC remainder discarded when matching stops, 0 otherwise. B3's own example is self-trade prevention, which v1 does not model |
+| O | Price bands on tick | Inferred: PriceBand limits are ±band_bps of the previous close snapped inward to the tick (low up, high down), so both are prices an order can have. B3 does not say how its bands are rounded |
+| P | Firm mass cancel | B3: one event across all affected orders, even across instruments, only the last DeleteOrder with EndOfEvent (Guidelines p.15). Inferred: it covers both sides of every instrument of one channel (an event cannot span channels), deletes go per instrument in config order and within one in priority order (bids, then offers) |
