@@ -362,6 +362,15 @@ class OrderFlow:
         self._order = {i.name: n for n, i in enumerate(instruments)}
         self._heap = [(f.next_time, self._order[name], name) for name, f in self.flows.items()]
         heapq.heapify(self._heap)
+        self._offset_ns = 0  # total pause so far
+
+    def pause(self, duration_ns):
+        """Nobody trades for duration_ns: every later arrival comes that much
+        later. Regimes and the instruments' own arrival processes run on
+        unpaused time, so a pause only moves when things happen."""
+        if duration_ns < 0:
+            raise ValueError("pause must be >= 0")
+        self._offset_ns += duration_ns
 
     def next_arrival(self):
         """The next (time_ns, instrument) across all instruments."""
@@ -369,7 +378,7 @@ class OrderFlow:
         flow = self.flows[name]
         assert flow.advance() == t
         heapq.heappush(self._heap, (flow.next_time, order, name))
-        return Arrival(t, name, self.clock.at(t)[0])
+        return Arrival(t + self._offset_ns, name, self.clock.at(t)[0])
 
     def decide(self, arrival, top):
         return self.flows[arrival.instrument].decide(arrival.time_ns, top)

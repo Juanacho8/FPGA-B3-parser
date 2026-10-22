@@ -1,6 +1,8 @@
 """Support: wiring the layers together (the CLI arrives in step 8).
 
-run(config) drives one trading session for Feed A:
+run(config) drives one trading session for Feed A, and run_scenario(config,
+name) writes one scenario (clean, loss, gap, idle) with both feeds and a
+manifest into out_dir/name:
 
     flow -> engine -> publisher -> packetizer -> pcap
                           |             |
@@ -19,12 +21,14 @@ Must not: contain generation logic; it only wires the layers together.
 See docs/FEED_GENERATOR_CONTEXT.md sections 4 and 11.
 """
 
+import dataclasses
 import datetime
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from b3gen import golden, pcap
+from b3gen import golden, pcap, scenarios
 from b3gen.engine import Engine
 from b3gen.flow import FlowInstrument, FlowParams, OrderFlow
 from b3gen.packet import Packetizer
@@ -65,6 +69,11 @@ class RunConfig:
     window_ns: int | None = 5000
     book_key_every: int = 1000    # events between book key checkpoints
     record: bool = False          # keep per-arrival records (tests)
+    channel_map_b: dict = None    # Feed B: channel -> (multicast group, port)
+    feed_b: scenarios.FeedBParams = scenarios.FeedBParams()
+    loss: scenarios.BurstParams = scenarios.BurstParams(0.01, 3)
+    gap: scenarios.BurstParams = scenarios.BurstParams(0.001, 2)
+    idle: scenarios.IdleParams | None = None  # pause the flow once (idle scenario)
 
 
 @dataclass
@@ -82,6 +91,7 @@ class RunResult:
     final_resting: dict           # instrument -> resting orders at the end of the run
     arrivals: list = field(default_factory=list)  # (Arrival, instruction) when record=True
     regimes: list = field(default_factory=list)   # (start, end, regime) when record=True
+    # Flow time: regimes do not move with an idle pause.
     message_times: list = field(default_factory=list)  # (channel, time_ns) per published message, when record=True
 
 
@@ -120,12 +130,70 @@ def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overr
         instruments=instruments, flow=flow, start_ns=int(start.timestamp()) * 1_000_000_000,
         trade_date=trade_date,
         channel_map={68: ("233.252.8.68", 30068), 70: ("233.252.8.70", 30070)},
+        channel_map_b={68: ("233.252.9.68", 31068), 70: ("233.252.9.70", 31070)},
     )
     config.update(overrides)
     return RunConfig(**config)
 
 
+@dataclass
+class ScenarioResult:
+    run: RunResult                # pcap_path is Feed A
+    feed_b_path: Path
+    manifest_path: Path
+    manifest: dict
+
+
+SCENARIOS = ("clean", "loss", "gap", "idle")
+
+
 def run(config):
+    """Feed A, intent log and book key in out_dir."""
+    result, published, packetized, checkpoints = _generate(config)
+    _write(config, result, published, packetized, checkpoints, packetized.packets)
+    return result
+
+
+def run_scenario(config, name):
+    """Both feeds, intent log, book key and manifest in out_dir/name."""
+    if name not in SCENARIOS:
+        raise ValueError(f"unknown scenario {name!r}; one of {SCENARIOS}")
+    if name == "idle" and config.idle is None:
+        config = dataclasses.replace(
+            config, idle=scenarios.IdleParams(after_messages=config.target_messages // 2))
+    elif name != "idle":
+        config = dataclasses.replace(config, idle=None)
+    config = dataclasses.replace(config, out_dir=Path(config.out_dir) / name)
+    loss = config.loss if name == "loss" else None
+    gap = config.gap if name == "gap" else None
+
+    result, published, packetized, checkpoints = _generate(config)
+    feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b,
+                                  loss=loss, gap=gap)
+    _write(config, result, published, packetized, checkpoints, feeds.a)
+    out = Path(config.out_dir)
+    feed_b_path = out / "feedB.pcap"
+    pcap.write_pcap(feed_b_path, feeds.b, channel_map=config.channel_map_b,
+                    src_ip=config.src_ip, src_port=config.src_port)
+    on_channel = {}
+    for i in config.instruments:
+        on_channel.setdefault(i.channel, []).append(i.name)
+    unreliable = scenarios.unreliable_books(feeds.gap_positions, packetized, published,
+                                            on_channel)
+    params = {"feed_b": dataclasses.asdict(config.feed_b),
+              "loss": dataclasses.asdict(loss) if loss else None,
+              "gap": dataclasses.asdict(gap) if gap else None,
+              "idle": dataclasses.asdict(config.idle) if config.idle else None}
+    manifest = {"scenario": name, "seed": config.seed, "params": params,
+                "missing": {"A": [list(k) for k in feeds.missing_a],
+                            "B": [list(k) for k in feeds.missing_b]},
+                "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())}}
+    manifest_path = out / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+    return ScenarioResult(result, feed_b_path, manifest_path, manifest)
+
+
+def _generate(config):
     insts = config.instruments
     engine = Engine([(i.name, i.tick, i.lot, i.segment) for i in insts])
     publisher = Publisher([Instrument(i.name, i.security_id, i.channel, i.segment,
@@ -169,7 +237,13 @@ def run(config):
     max_streak = {i.name: 0 for i in insts}
     arrivals = []
     t = config.start_ns
+    paused = config.idle is None
     while len(published) < config.target_messages:
+        if not paused and len(published) >= config.idle.after_messages:
+            # Shift the arrival clock before the engine, so every time on
+            # the wire (transactTime, insert times, sendingTime) moves together.
+            flow.pause(config.idle.duration_ns)
+            paused = True
         arrival = flow.next_arrival()
         t = arrival.time_ns
         name = arrival.instrument
@@ -191,7 +265,6 @@ def run(config):
 
     packetized = packetizer.finish(t)
     out = Path(config.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
     result = RunResult(
         pcap_path=out / "feedA.pcap", intent_path=out / "intent.jsonl",
         book_key_path=out / "book_key.jsonl", messages=len(published),
@@ -202,8 +275,14 @@ def run(config):
         arrivals=arrivals,
         regimes=list(flow.clock.segments) if config.record else [],
         message_times=[(m.channel, m.time_ns) for m in published] if config.record else [])
-    pcap.write_pcap(result.pcap_path, packetized.packets, channel_map=config.channel_map,
+    return result, published, packetized, checkpoints
+
+
+def _write(config, result, published, packetized, checkpoints, feed_a):
+    """Feed A (as given), intent log and book key: the key files always
+    describe everything published, whatever a feed lost."""
+    Path(config.out_dir).mkdir(parents=True, exist_ok=True)
+    pcap.write_pcap(result.pcap_path, feed_a, channel_map=config.channel_map,
                     src_ip=config.src_ip, src_port=config.src_port)
     golden.write_jsonl(result.intent_path, golden.intent_rows(published, packetized))
     golden.write_jsonl(result.book_key_path, golden.book_key_rows(checkpoints, packetized))
-    return result

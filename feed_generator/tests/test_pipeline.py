@@ -7,7 +7,6 @@ checkpoint.
 """
 
 import json
-import struct
 import time
 from pathlib import Path
 
@@ -18,8 +17,8 @@ from b3gen.encode import MAX_PACKET_SIZE
 from b3gen.flow import BUSY, CALM, REGIMES, SPIKE, FlowParams
 from book_builder import BookBuilder
 from layouts_md import MESSAGE_LAYOUTS
-import pcap_reader
 import sbe_decoder
+from wire import decode_wire, top5
 
 
 @pytest.fixture(scope="module")
@@ -48,24 +47,6 @@ def read_jsonl(path):
     return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
 
 
-def decode_wire(pcap_path):
-    """Every message in the pcap, decoded independently, in wire order."""
-    _, records = pcap_reader.read_pcap(Path(pcap_path).read_bytes())
-    out = []
-    for rec in records:
-        payload = rec["payload"]
-        channel, _, version, seq, sending = struct.unpack_from("<BBHIQ", payload, 0)
-        pos, index = 16, 0
-        while pos < len(payload):
-            (length,) = struct.unpack_from("<H", payload, pos)
-            data = payload[pos:pos + length]
-            out.append(((channel, version, seq, index, sending), data))
-            pos += length
-            index += 1
-        assert pos == len(payload)
-    return out
-
-
 def security_map(config):
     return {i.security_id: i.name for i in config.instruments}
 
@@ -81,18 +62,6 @@ def independent_row(placement, data, securities):
             "index": index, "sendingTime": sending, "templateId": template,
             "instrument": securities.get(fields.get("securityID")),
             "fields": fields, "null": nulls}
-
-
-def top5(builder, security_id):
-    levels = {"BUY": [], "SELL": []}
-    for side, price, qty, _ in builder.resting(security_id):
-        side_levels = levels[side]
-        if side_levels and side_levels[-1][0] == price:
-            side_levels[-1][1] += qty
-            side_levels[-1][2] += 1
-        else:
-            side_levels.append([price, qty, 1])
-    return levels["BUY"][:5], levels["SELL"][:5]
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +245,9 @@ def wire_packets(pcap_path):
     return out
 
 
+EXECUTION_SUMMARY = 55
+
+
 def test_packets_close_by_size_and_events_span_packets(big_run):
     # Spikes put many arrivals in one 5 us window, so some packets fill up
     # before their window expires, and an event split by the size limit
@@ -301,7 +273,11 @@ def test_packets_close_by_size_and_events_span_packets(big_run):
                     sending < t0 + config.window_ns:
                 by_size += 1
             header, fields = sbe_decoder.decode(messages[-1])
-            if not fields.get("matchEventIndicator", 0x80) & 0x80:
+            # ExecutionSummary has no matchEventIndicator and is always
+            # followed by its trades, so ending a packet with one splits
+            # the event too.
+            if header["templateId"] == EXECUTION_SUMMARY or \
+                    not fields["matchEventIndicator"] & 0x80:
                 spanning += 1
                 assert size + len(packets[following][3][0]) > MAX_PACKET_SIZE
     print(f"closed by size: {by_size}, events spanning packets: {spanning}")

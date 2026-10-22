@@ -140,6 +140,7 @@ Not emitted for now: LastTradePrice (mostly a snapshot message), TheoreticalOpen
 * Two separate pcaps: `feedA.pcap`, `feedB.pcap`.
 * Feed B carries the same packets, byte for byte, with a small extra delay. Per B3 circular OC 131/2023, Feed A is the faster one.
 * In loss scenarios, Feed A drops some packets that Feed B still carries.
+* **Feed B timing** (decided in step 7a): B time = A time + base delay (default 20 µs) + uniform jitter in [0, 10 µs] from `random.Random(f"{seed}:feedB")`, clamped so B never reorders a channel. Only the pcap timestamp moves: the header sendingTime stays Feed A's, byte for byte. B has its own multicast groups (`channel_map_b`).
 
 ## 8. Order flow and timing
 
@@ -147,7 +148,7 @@ Not emitted for now: LastTradePrice (mostly a snapshot message), TheoreticalOpen
 * **Bursty timing (decided, build now):** arrivals follow a Poisson process whose rate switches between a calm regime and a busy regime, with random regime durations. Uniform timing would understate parser stress.
 * Keep the book populated: if a side gets thin, bias new orders toward it.
 * **Regimes are market-wide** (decided in step 6): one `random.Random(f"{seed}:regime")` decides only the calm/busy switches. Each instrument keeps its own `random.Random(f"{seed}:{name}")` for arrivals and decisions, and its own arrival rate in each regime.
-* **Spike regime** (decided as a fix to step 6): a third, short regime (mean 1 ms) arriving as its own Poisson process (mean one per second of calm/busy time) that interrupts either regime, which then resumes. Spike rates are ~1.6M arrivals/s per channel, because filling 1400 B inside the 5 µs window takes ~15 messages; at ~200k/s per channel only 2 packets in the default 20k file closed by size. In that file (seed 1) the spike lasts 0.84 ms and gives 84 packets closed by the size limit and 42 events spanning two packets. Spikes carry ~20% of its arrivals.
+* **Spike regime** (decided as a fix to step 6; **a stress setting, not B3's real rate**): a third, short regime (mean 1 ms) arriving as its own Poisson process (mean one per second of calm/busy time) that interrupts either regime, which then resumes. Spike rates are ~1.6M arrivals/s per channel, because filling 1400 B inside the 5 µs window takes ~15 messages; at ~200k/s per channel only 2 packets in the default 20k file closed by size. In that file (seed 1) the spike lasts 0.84 ms and gives 84 packets closed by the size limit and 50 events spanning two packets (counting packets that end in an ExecutionSummary, which has no matchEventIndicator and is always followed by its trades). Spikes carry ~23% of its arrivals.
 * **Cancels scale with the book** (decided in step 6): the cancel weight is `p_cancel × live orders / target_live_orders` (default 200 per instrument), so each order has a roughly constant chance of being cancelled and the book settles at a stable size. With a flat cancel rate the book grew for the whole run, which was unrealistic and made run time superlinear.
 * A midpoint between two ticks rounds up or down using the instrument's RNG, so prices do not drift one way.
 * Fancier models are deferred. The layer separation is what makes that a later drop-in change.
@@ -171,6 +172,14 @@ Other scenarios, each in its own file, separate from the clean main file:
 | Loss | Feed A drops packets that Feed B carries |
 | Gaps | Packets missing from both feeds |
 | Idle | Quiet periods with heartbeats |
+
+Step 7a decisions (loss, gaps, idle):
+
+* `main.run_scenario(config, name)` writes `out_dir/<name>/` with `feedA.pcap`, `feedB.pcap`, `intent.jsonl`, `book_key.jsonl` and `manifest.json`, for `clean`, `loss`, `gap` and `idle`. All four run the same session, so the clean Feed A is the full feed.
+* **Burst model** for loss (Feed A only) and gaps (both feeds): at each sequenced packet of a channel a burst starts with probability `burst_rate`, length geometric with mean `mean_burst`. Defaults: loss 1% / 3, gaps 0.1% / 2. Own RNGs `f"{seed}:loss"` and `f"{seed}:gap"`. Heartbeats are never dropped (sequenceNumber 0 cannot be named in a manifest).
+* **Idle:** the flow's arrival clock is paused (`OrderFlow.pause`) before the engine, so transactTime, insert times and sendingTime all move together; nothing already encoded is shifted. Default: once half the target messages are published, 3.5 s, giving 3 heartbeats per channel on both feeds.
+* **Manifest:** `missing` lists `[channel, sequenceVersion, sequenceNumber]` missing from each feed; `unreliable_books` maps each instrument to the first packet missing from both feeds that held one of its messages. A message with no instrument (SecurityGroupPhase) makes every instrument on its channel unreliable from that packet. A book stays unreliable until a snapshot (v2).
+* The intent log and book key always describe everything published, whatever a feed lost.
 | Edge orders | Null-price (market-on-auction style) orders, MassDelete, aggressions sweeping several levels, events spanning packets |
 | Schema evolution | A message with a larger blockLength than the schema (extra zero bytes appended), and an unknown templateId |
 | Rare messages | TradeBust, multi-part News |
