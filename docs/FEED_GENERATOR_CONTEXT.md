@@ -109,7 +109,7 @@ Field rules:
 | 17 ClosingPrice | Session start (previous close) and session end |
 | 22 PriceBand, 21 QuantityBand | Session start |
 | 28 SettlementPrice, 29 OpenInterest | Session start, futures only |
-| 10 SecurityGroupPhase, 3 SecurityStatus | Session start and status changes |
+| 10 SecurityGroupPhase | Session start (TRADING_SESSION_CHANGE) |
 | 2 Sequence | Heartbeat (section 7) |
 | 1 SequenceReset, 9 EmptyBook, 11 ChannelReset | Restart and reset scenarios |
 | 57 TradeBust | Scenario |
@@ -117,7 +117,7 @@ Field rules:
 
 Statistics and status messages outside a matching event (session start, session end) **each carry EndOfEvent on their own**, as B3 specifies.
 
-Not emitted for now: LastTradePrice (mostly a snapshot message), TheoreticalOpeningPrice and AuctionImbalance (auctions), ForwardTrade, SecurityDefinition on the incremental stream.
+Not emitted for now: SecurityStatus (v1 has no per-instrument status changes: every instrument follows its group's phase), LastTradePrice (mostly a snapshot message), TheoreticalOpeningPrice and AuctionImbalance (auctions), ForwardTrade, SecurityDefinition on the incremental stream.
 
 **Session start sequence (our inference, B3 does not specify it):** SecurityGroupPhase OPEN for each security group, then per instrument ClosingPrice (previous close), PriceBand, QuantityBand, and SettlementPrice + OpenInterest for futures. Then continuous trading begins.
 
@@ -173,6 +173,10 @@ Other scenarios, each in its own file, separate from the clean main file:
 | Loss | Feed A drops packets that Feed B carries |
 | Gaps | Packets missing from both feeds |
 | Idle | Quiet periods with heartbeats |
+| Edge orders | Market supervision deleting a side (DELETE_THRU), a firm's mass cancel across instruments, a sweep across several levels, events spanning packets. Null-price orders are out of v1 (open item K) |
+| Schema evolution | Messages with a larger blockLength than the schema (extra zero bytes appended) and of older versions (shorter block, later fields absent), and an unknown templateId |
+| Rare messages | TradeBust, multi-part News |
+| Malformed | Truncated packets, bad messageLength. Small separate file |
 
 Step 7a decisions (loss, gaps, idle):
 
@@ -202,10 +206,6 @@ Step 7c decisions (`edge`, `rare`, `schema`, `malformed`; injections at half the
 * **Gap rule narrowed:** only SecurityGroupPhase, ChannelReset and SequenceReset make a whole channel unreliable; News and unknown templates never make a book unreliable.
 * **schema:** three live Order_MBO NEW and one News with blockLength = schema + 8 (zero bytes, var data after the larger block) and header version 18; four live Order_MBO NEW of older versions (two at version 15: no mDEntryPrevSize, blockLength 64; two at version 14: no transactTime either, blockLength 56), whose intent rows list those fields as "absent"; and a templateId 999 message with a 20-byte random body inside a live event (a real message before and after it in the packet). Clients decode the known fields with the header's blockLength, skip the rest, and skip unknown templates by messageLength.
 * **malformed:** a 1,500-message run with one fault in each of five packets (messageLength past the end, 0, under 12, a wrong encodingType, the datagram cut inside the last message's header) and a stray 10-byte datagram that uses up no sequence number. The manifest lists each fault's packet, kind, byte offset and messages before it. Clients process the complete messages before the fault, discard the rest of the packet and carry on with sequencing; instruments whose book messages were discarded are listed as unreliable from that packet.
-| Edge orders | Null-price (market-on-auction style) orders, MassDelete, aggressions sweeping several levels, events spanning packets |
-| Schema evolution | A message with a larger blockLength than the schema (extra zero bytes appended), and an unknown templateId |
-| Rare messages | TradeBust, multi-part News |
-| Malformed | Truncated packets, bad messageLength. Small separate file |
 
 ## 10. Config and outputs
 
@@ -276,3 +276,13 @@ Standard runs: small (~20k messages) for RTL simulation, large (~1M+) for C++ ru
 | N | ExecutionSummary cxlQty | Inferred: cxlQty ("total quantity canceled during matching process", XML) is the market or IOC remainder discarded when matching stops, 0 otherwise. B3's own example is self-trade prevention, which v1 does not model |
 | O | Price bands on tick | Inferred: PriceBand limits are ±band_bps of the previous close snapped inward to the tick (low up, high down), so both are prices an order can have. B3 does not say how its bands are rounded |
 | P | Firm mass cancel | B3: one event across all affected orders, even across instruments, only the last DeleteOrder with EndOfEvent (Guidelines p.15). Inferred: it covers both sides of every instrument of one channel (an event cannot span channels), deletes go per instrument in config order and within one in priority order (bids, then offers) |
+| Q | Stream timing around sessions | Inferred: the incremental stream is down overnight and over the weekend (no heartbeats), and comes up 2.5 heartbeat intervals before the session, so exactly 3 start-of-day heartbeats go out (Guidelines p.43 describes start-of-day heartbeats, not how many). The weekly SequenceReset and ChannelReset go out at Monday's start, right before the session, not at system start-up on Sunday |
+| R | Orders across sessions | Inferred: every resting order survives the night and the weekend (all behave as good-till-cancelled); no day orders expire at session end |
+| S | Next session's values | Inferred/invented: the previous close is the day's ClosingPrice; futures' settlement price equals it; the PriceBand is ±band_bps around it, snapped to tick (item O); QuantityBand and OpenInterest repeat the configured values |
+| T | OpeningPrice, HighPrice, LowPrice fields | Inferred: OpeningPrice carries netChgPrevDay = opening price − previous close (8 decimals); HighPrice and LowPrice always use mDUpdateAction NEW (B3 allows NEW or DELETE; DELETE is never sent) |
+| U | Statistics fields left null | Inferred: PriceBand tradingReferencePrice and priceBandMidpointPriceType, ClosingPrice lastTradeDate, Trade trdSubType and SecurityGroupPhase tradSesOpenTime are null; QuantityBand avgDailyTradedQty is the configured value (0 for futures) |
+| V | TradeBust event shape | Inferred: a TradeBust is its own event (EndOfEvent 0x80) with its own transactTime, copying the busted Trade's securityID, session, price, size, tradeID and tradeDate; no other message goes with it (statistics: item L) |
+| W | News field choices | Inferred/invented: newsSource OTHER, languageCode "en", origTime = when the generator publishes it, uRLLink empty, ASCII text; newsID null on trading channels (B3, item M) |
+| X | Malformed and schema-evolution handling | Project policy, not B3: B3 says nothing about malformed packets. The expected client behaviour in the malformed manifest (keep the complete messages before a fault, discard the rest of the packet, carry on with sequencing; a datagram shorter than the packet header uses no sequence number) is ours. So is mixing schema versions 14, 15, 17 and 18 on one channel and putting an unknown template inside a live event (B3 only says channels may differ during a rollout) |
+| Y | Heartbeat timing | Inferred: a heartbeat goes out when a channel has been idle for exactly heartbeat_ns (1 s), then every 1 s; B3 says "more than 1 second". The difference is below anything a client measures |
+| Z | sendingTime precision | B3: sendingTime is in nanoseconds "accurate to microseconds" (Message Reference 5.1). The generator writes the packet's close time to the nanosecond, so values are not multiples of 1,000 ns. Accurate to microseconds does not require that, but a real capture may show it |
