@@ -146,6 +146,9 @@ Not emitted for now: LastTradePrice (mostly a snapshot message), TheoreticalOpen
 * **Zero-intelligence model:** random limit orders placed near the mid price (a few ticks either side), random cancels, size changes and price changes of resting orders, occasional aggressive orders that cross the spread. Order sizes from a simple distribution in lot multiples.
 * **Bursty timing (decided, build now):** arrivals follow a Poisson process whose rate switches between a calm regime and a busy regime, with random regime durations. Uniform timing would understate parser stress.
 * Keep the book populated: if a side gets thin, bias new orders toward it.
+* **Regimes are market-wide** (decided in step 6): one `random.Random(f"{seed}:regime")` decides only the calm/busy switches. Each instrument keeps its own `random.Random(f"{seed}:{name}")` for arrivals and decisions, and its own arrival rate in each regime.
+* **Cancels scale with the book** (decided in step 6): the cancel weight is `p_cancel × live orders / target_live_orders` (default 200 per instrument), so each order has a roughly constant chance of being cancelled and the book settles at a stable size. With a flat cancel rate the book grew for the whole run, which was unrealistic and made run time superlinear.
+* A midpoint between two ticks rounds up or down using the instrument's RNG, so prices do not drift one way.
 * Fancier models are deferred. The layer separation is what makes that a later drop-in change.
 
 ## 9. Restart and reset scenarios

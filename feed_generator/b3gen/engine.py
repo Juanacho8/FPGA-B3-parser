@@ -270,6 +270,7 @@ class _Side:
     side: str
     levels: dict = field(default_factory=dict)
     prices: list = field(default_factory=list)  # ascending
+    level_qty: dict = field(default_factory=dict)  # price -> total qty, kept up to date
 
     def best(self):
         if not self.prices:
@@ -283,17 +284,26 @@ class _Side:
         level = self.levels.get(order.price)
         if level is None:
             level = self.levels[order.price] = {}
+            self.level_qty[order.price] = 0
             bisect.insort(self.prices, order.price)
         # New and requeued orders always carry the newest soid, so
         # appending keeps the level in soid order.
         level[order.handle] = order
+        self.level_qty[order.price] += order.qty
 
     def remove(self, order):
         level = self.levels[order.price]
         del level[order.handle]
+        self.level_qty[order.price] -= order.qty
         if not level:
             del self.levels[order.price]
+            del self.level_qty[order.price]
             self.prices.pop(bisect.bisect_left(self.prices, order.price))
+
+    def change_qty(self, order, new_qty):
+        """Change a resting order's qty in place (keeps its priority)."""
+        self.level_qty[order.price] += new_qty - order.qty
+        order.qty = new_qty
 
 
 class Book:
@@ -340,9 +350,9 @@ class Book:
         for side in SIDES:
             s = self._sides[side]
             levels = []
-            for price in s.prices_in_priority()[:n]:
-                level = s.levels[price]
-                levels.append((price, sum(o.qty for o in level.values()), len(level)))
+            best_n = s.prices[:-n - 1:-1] if side == BUY else s.prices[:n]
+            for price in best_n:
+                levels.append((price, s.level_qty[price], len(s.levels[price])))
             result.append(levels)
         return tuple(result)
 
@@ -364,8 +374,11 @@ class Book:
             assert s.prices == sorted(s.prices), "price list not sorted"
             assert len(set(s.prices)) == len(s.prices), "duplicate price"
             assert set(s.prices) == set(s.levels), "price list and levels disagree"
+            assert set(s.level_qty) == set(s.levels), "level totals and levels disagree"
             for price, level in s.levels.items():
                 assert level, f"empty level {price}"
+                assert s.level_qty[price] == sum(o.qty for o in level.values()), \
+                    f"level total out of sync at {price}"
                 assert price % self.tick == 0, f"off-tick price {price}"
                 soids = [o.soid for o in level.values()]
                 assert soids == sorted(soids), f"priority broken at {price}"
@@ -433,7 +446,7 @@ class Book:
             resting = next(iter(level.values()))  # first in priority
             traded = min(remaining, resting.qty)
             before = resting.qty
-            resting.qty -= traded
+            opposite.change_qty(resting, resting.qty - traded)
             remaining -= traded
             fills.append(Fill(resting.handle, resting.soid, resting.firm,
                               resting.insert_time_ns, best, traded, before, resting.qty))
@@ -486,7 +499,7 @@ class Book:
         if new_qty < order.qty:
             # Reduction keeps priority, soid and insert time.
             old_qty = order.qty
-            order.qty = new_qty
+            self._sides[order.side].change_qty(order, new_qty)
             return SizeReduced(self.instrument, instruction.time_ns, order.handle,
                                order.soid, order.side, order.price, old_qty, new_qty,
                                order.firm, order.insert_time_ns)

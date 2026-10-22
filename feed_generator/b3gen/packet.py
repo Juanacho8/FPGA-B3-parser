@@ -31,6 +31,8 @@ Must not: change message content.
 See docs/FEED_GENERATOR_CONTEXT.md section 7 and spec/LAYOUTS.md sections 3 and 12.1.
 """
 
+from dataclasses import dataclass
+
 from b3gen import encode, layouts
 
 MAX_PACKET_SIZE = encode.MAX_PACKET_SIZE
@@ -43,6 +45,32 @@ class PacketError(ValueError):
     """Input the packetizer cannot accept."""
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Where a message landed on the wire. packet_position is the packet's
+    index in Packetized.packets (wire order across channels)."""
+    channel: int
+    sequence_version: int
+    sequence_number: int
+    index: int               # message index within the packet, from 0
+    sending_time: int
+    packet_position: int
+
+
+@dataclass(frozen=True)
+class Heartbeat:
+    """A heartbeat packet's single Sequence message."""
+    placement: Placement
+    next_seq_no: int
+
+
+@dataclass(frozen=True)
+class Packetized:
+    packets: list            # (time_ns, channel, packet bytes), wire order
+    placements: dict         # tag -> Placement, for every tagged message
+    heartbeats: list         # Heartbeat, in wire order
+
+
 class _Channel:
     def __init__(self, number, start_ns, initial_sequence_number):
         self.number = number
@@ -52,6 +80,7 @@ class _Channel:
         self.last_message_ns = start_ns
         self.open_t0 = None            # first message time of the open packet
         self.open_messages = []
+        self.open_tags = []
         self.open_size = PACKET_HEADER_SIZE
 
 
@@ -67,12 +96,14 @@ class Packetizer:
         self.start_ns = start_ns
         self.channels = {c: _Channel(c, start_ns, initial_sequence_number) for c in channels}
         self._packets = []    # (time_ns, channel, emit order, bytes)
+        self._contents = []   # per emitted packet: (sequence_version, seq, tags or next_seq_no)
         self._finished = False
 
     # -- public -------------------------------------------------------------
 
-    def add(self, time_ns, channel, message):
-        """Queue one encoded message published at time_ns on channel."""
+    def add(self, time_ns, channel, message, tag=None):
+        """Queue one encoded message published at time_ns on channel. A tag
+        (any hashable, unique) gets the message's Placement in finish()."""
         ch = self._channel(channel)
         if not isinstance(message, (bytes, bytearray)):
             raise PacketError("message must be bytes")
@@ -95,6 +126,7 @@ class Packetizer:
             self._heartbeats(ch, until_ns=time_ns, inclusive=False)
             ch.open_t0 = time_ns
         ch.open_messages.append(bytes(message))
+        ch.open_tags.append(tag)
         ch.open_size += len(message)
 
     def bump_version(self, time_ns, channel):
@@ -111,7 +143,8 @@ class Packetizer:
 
     def finish(self, end_ns):
         """Close every open packet, emit trailing heartbeats up to end_ns and
-        return all packets as (time_ns, channel, packet bytes) in time order."""
+        return Packetized: packets (time_ns, channel, bytes) in wire order,
+        placements for tagged messages, and heartbeats."""
         latest = max(ch.last_message_ns for ch in self.channels.values())
         if end_ns < latest:
             raise PacketError(f"end_ns {end_ns} is before the last message time {latest}")
@@ -119,7 +152,18 @@ class Packetizer:
             self._close_by(ch, end_ns)
             self._heartbeats(ch, until_ns=end_ns, inclusive=True)
         self._finished = True
-        return [(t, c, data) for t, c, _, data in sorted(self._packets)]
+        order = sorted(self._packets)
+        packets, placements, heartbeats = [], {}, []
+        for position, (t, c, emit, data) in enumerate(order):
+            packets.append((t, c, data))
+            version, seq, contents = self._contents[emit]
+            if seq == HEARTBEAT_SEQUENCE_NUMBER:
+                heartbeats.append(Heartbeat(Placement(c, version, seq, 0, t, position), contents))
+                continue
+            for index, tag in enumerate(contents):
+                if tag is not None:
+                    placements[tag] = Placement(c, version, seq, index, t, position)
+        return Packetized(packets, placements, heartbeats)
 
     # -- internals ----------------------------------------------------------
 
@@ -141,10 +185,11 @@ class Packetizer:
 
     def _close(self, ch, sending_time):
         payload = b"".join(ch.open_messages)
-        self._emit(ch, sending_time, ch.next_sequence_number, payload)
+        self._emit(ch, sending_time, ch.next_sequence_number, payload, list(ch.open_tags))
         ch.next_sequence_number += 1
         ch.open_t0 = None
         ch.open_messages = []
+        ch.open_tags = []
         ch.open_size = PACKET_HEADER_SIZE
 
     def _heartbeats(self, ch, until_ns, inclusive):
@@ -153,10 +198,10 @@ class Packetizer:
         t = ch.last_send_ns + self.heartbeat_ns
         while t < until_ns or (inclusive and t == until_ns):
             message = encode.sequence(nextSeqNo=ch.next_sequence_number)
-            self._emit(ch, t, HEARTBEAT_SEQUENCE_NUMBER, message)
+            self._emit(ch, t, HEARTBEAT_SEQUENCE_NUMBER, message, ch.next_sequence_number)
             t += self.heartbeat_ns
 
-    def _emit(self, ch, sending_time, sequence_number, payload):
+    def _emit(self, ch, sending_time, sequence_number, payload, contents):
         header = bytearray(PACKET_HEADER_SIZE)
         encode.write_members(header, 0, layouts.PACKET_HEADER, {
             "channelNumber": ch.number,
@@ -166,4 +211,5 @@ class Packetizer:
             "sendingTime": sending_time,
         }, f"channel {ch.number} packet header", use_nulls=False)
         ch.last_send_ns = sending_time
+        self._contents.append((ch.sequence_version, sequence_number, contents))
         self._packets.append((sending_time, ch.number, len(self._packets), bytes(header) + payload))

@@ -69,7 +69,7 @@ def test_rebuilds_b3_sample_packet():
     for msg in decoded["messages"]:
         p.add(t, ph["channelNumber"], encode.encode(msg["message_header"]["templateId"],
                                                     msg["fields"]))
-    packets = p.finish(end_ns=t)
+    packets = p.finish(end_ns=t).packets
 
     assert len(packets) == 1
     time_ns, channel, packet = packets[0]
@@ -95,7 +95,7 @@ def random_run(window_ns, seed=7, n=3000):
         message = blob(rng.choice([20, 56, 72, 200, 600, 1384]), rng)
         p.add(t, channel, message)
         inputs[channel].append((t, message))
-    return p.finish(end_ns=t + 3 * SECOND), inputs
+    return p.finish(end_ns=t + 3 * SECOND).packets, inputs
 
 
 @pytest.mark.parametrize("window_ns", [0, 5000, None])
@@ -147,7 +147,7 @@ def test_window_bounds_message_spread():
     p = Packetizer([68], start_ns=0, window_ns=5000)
     for i in range(200):
         p.add(i * 1700, 68, blob(30, rng))
-    real = real_packets(p.finish(end_ns=200 * 1700))
+    real = real_packets(p.finish(end_ns=200 * 1700).packets)
     # 1700 ns apart, window 5000: messages at t0, +1700, +3400 share a packet.
     assert [len(split_messages(pk)) for _, _, pk in real[:-1]] == [3] * (len(real) - 1)
     for time_ns, _, pk in real[:-1]:
@@ -158,7 +158,7 @@ def test_message_at_window_boundary_starts_new_packet():
     p = Packetizer([68], start_ns=0, window_ns=5000)
     p.add(0, 68, b"\x04\x00\x00\x00")
     p.add(5000, 68, b"\x04\x00\x00\x00")
-    real = real_packets(p.finish(end_ns=5000))
+    real = real_packets(p.finish(end_ns=5000).packets)
     assert [header(pk)["sending"] for _, _, pk in real] == [5000, 5000]
     assert len(real) == 2
 
@@ -167,7 +167,7 @@ def test_finish_before_last_message_raises():
     p = Packetizer([68], start_ns=0)
     p.add(100, 68, b"\x04\x00\x00\x00")
     with pytest.raises(PacketError, match="before the last message"):
-        p.finish(end_ns=99)
+        p.finish(end_ns=99).packets
 
 
 def test_time_going_backwards_raises():
@@ -199,7 +199,7 @@ def test_stale_packet_closes_before_heartbeats():
     p = Packetizer([68], start_ns=0, window_ns=5000)
     p.add(0, 68, encode.sequence_reset())
     p.add(3_500_000_000, 68, encode.sequence_reset())
-    packets = p.finish(end_ns=3_500_000_000)
+    packets = p.finish(end_ns=3_500_000_000).packets
 
     real = real_packets(packets)
     assert [t for t, _, _ in real] == [5000, 3_500_000_000]
@@ -214,7 +214,7 @@ def test_heartbeats_from_start_and_until_end():
     # A channel with no traffic heartbeats from start_ns, up to end_ns.
     p = Packetizer([68, 70], start_ns=0)
     p.add(0, 70, encode.sequence_reset())
-    packets = p.finish(end_ns=3 * SECOND)
+    packets = p.finish(end_ns=3 * SECOND).packets
     assert [t for t, _, _ in heartbeats(packets, 68)] == [SECOND, 2 * SECOND, 3 * SECOND]
     assert all(sequence_next_seq_no(pk) == 1 for _, _, pk in heartbeats(packets, 68))
     # Channel 70: packet at 5000 ns, then heartbeats 1 s apart until the end.
@@ -225,14 +225,14 @@ def test_no_heartbeats_while_traffic_flows():
     p = Packetizer([68], start_ns=0)
     for i in range(21):
         p.add(i * SECOND // 2, 68, encode.sequence_reset())
-    assert heartbeats(p.finish(end_ns=10 * SECOND)) == []
+    assert heartbeats(p.finish(end_ns=10 * SECOND).packets) == []
 
 
 def test_heartbeat_does_not_consume_sequence_number():
     p = Packetizer([68], start_ns=0)
     p.add(0, 68, encode.sequence_reset())
     p.add(5 * SECOND, 68, encode.sequence_reset())
-    real = real_packets(p.finish(end_ns=5 * SECOND))
+    real = real_packets(p.finish(end_ns=5 * SECOND).packets)
     assert [header(pk)["seq"] for _, _, pk in real] == [1, 2]
 
 
@@ -248,7 +248,7 @@ def test_version_bump_restarts_sequence_number():
     p.bump_version(12_000, 68)
     p.add(20_000, 68, encode.sequence_reset())
     p.add(30_000, 68, encode.sequence_reset())
-    real = real_packets(p.finish(end_ns=30_000))
+    real = real_packets(p.finish(end_ns=30_000).packets)
     assert [(header(pk)["version"], header(pk)["seq"]) for _, _, pk in real] == \
         [(1, 1), (1, 2), (2, 1), (2, 2)]
     # The open packet closed at the bump time, with both its messages.
@@ -259,7 +259,7 @@ def test_heartbeat_after_bump_points_at_sequence_one():
     p = Packetizer([68], start_ns=0)
     p.add(0, 68, encode.sequence_reset())
     p.bump_version(10_000, 68)
-    hb = heartbeats(p.finish(end_ns=2 * SECOND))
+    hb = heartbeats(p.finish(end_ns=2 * SECOND).packets)
     assert hb and all(header(pk)["version"] == 2 and sequence_next_seq_no(pk) == 1
                       for _, _, pk in hb)
 
@@ -269,5 +269,5 @@ def test_version_rolls_back_to_one_after_65534():
     p.channels[68].sequence_version = 65534
     p.bump_version(0, 68)
     p.add(1, 68, encode.sequence_reset())
-    (_, _, pk), = real_packets(p.finish(end_ns=1))
+    (_, _, pk), = real_packets(p.finish(end_ns=1).packets)
     assert header(pk)["version"] == 1

@@ -21,7 +21,7 @@ def sample_packets(seed=3):
               encode.order_mbo(securityID=1000 + i, matchEventIndicator=0x80,
                                mDUpdateAction=0, mDEntryType="0", mDEntrySize=100,
                                mDInsertTimestamp=t, secondaryOrderID=i, transactTime=t))
-    return p.finish(end_ns=t + 2_000_000_000)
+    return p.finish(end_ns=t + 2_000_000_000).packets
 
 
 def write_and_read(tmp_path, packets):
