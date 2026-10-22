@@ -69,6 +69,7 @@ class Packetized:
     packets: list            # (time_ns, channel, packet bytes), wire order
     placements: dict         # tag -> Placement, for every tagged message
     heartbeats: list         # Heartbeat, in wire order
+    headers: list = None     # (sequence_version, sequence_number) per packet
 
 
 class _Channel:
@@ -153,17 +154,18 @@ class Packetizer:
             self._heartbeats(ch, until_ns=end_ns, inclusive=True)
         self._finished = True
         order = sorted(self._packets)
-        packets, placements, heartbeats = [], {}, []
+        packets, placements, heartbeats, headers = [], {}, [], []
         for position, (t, c, emit, data) in enumerate(order):
             packets.append((t, c, data))
             version, seq, contents = self._contents[emit]
+            headers.append((version, seq))
             if seq == HEARTBEAT_SEQUENCE_NUMBER:
                 heartbeats.append(Heartbeat(Placement(c, version, seq, 0, t, position), contents))
                 continue
             for index, tag in enumerate(contents):
                 if tag is not None:
                     placements[tag] = Placement(c, version, seq, index, t, position)
-        return Packetized(packets, placements, heartbeats)
+        return Packetized(packets, placements, heartbeats, headers)
 
     # -- internals ----------------------------------------------------------
 
