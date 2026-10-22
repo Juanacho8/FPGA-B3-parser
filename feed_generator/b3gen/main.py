@@ -82,6 +82,7 @@ class RunResult:
     final_resting: dict           # instrument -> resting orders at the end of the run
     arrivals: list = field(default_factory=list)  # (Arrival, instruction) when record=True
     regimes: list = field(default_factory=list)   # (start, end, regime) when record=True
+    message_times: list = field(default_factory=list)  # (channel, time_ns) per published message, when record=True
 
 
 def _band(price, pct):
@@ -109,8 +110,11 @@ def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overr
         inst("VALE3", 100_000_002, 70, "EQT", "EQ1", 100, 100, False, 612_000,
              20_000_000, 5_000_000),
     )
-    flow = FlowParams(rates={"WIN": (400, 4000), "DOL": (150, 1500),
-                             "PETR4": (250, 2500), "VALE3": (150, 1500)})
+    # Spikes run ~1.6M arrivals/s per channel: filling 1400 B inside the 5 us
+    # window takes ~15 messages, so slower spikes (~200k/s) almost never do.
+    flow = FlowParams(rates={"WIN": (400, 4000, 960_000), "DOL": (150, 1500, 640_000),
+                             "PETR4": (250, 2500, 960_000), "VALE3": (150, 1500, 640_000)},
+                      calm_mean_ns=1_000_000_000)
     config = dict(
         seed=seed, out_dir=Path(out_dir), target_messages=target_messages,
         instruments=instruments, flow=flow, start_ns=int(start.timestamp()) * 1_000_000_000,
@@ -196,7 +200,8 @@ def run(config):
         max_empty_side_streak=max_streak,
         final_resting={i.name: len(engine.books[i.name].resting_orders()) for i in insts},
         arrivals=arrivals,
-        regimes=list(flow.clock.segments) if config.record else [])
+        regimes=list(flow.clock.segments) if config.record else [],
+        message_times=[(m.channel, m.time_ns) for m in published] if config.record else [])
     pcap.write_pcap(result.pcap_path, packetized.packets, channel_map=config.channel_map,
                     src_ip=config.src_ip, src_port=config.src_port)
     golden.write_jsonl(result.intent_path, golden.intent_rows(published, packetized))

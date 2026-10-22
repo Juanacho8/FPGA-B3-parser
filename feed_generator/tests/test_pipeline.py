@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from b3gen import main
-from b3gen.flow import BUSY, CALM, FlowParams
+from b3gen.encode import MAX_PACKET_SIZE
+from b3gen.flow import BUSY, CALM, REGIMES, SPIKE, FlowParams
 from book_builder import BookBuilder
 from layouts_md import MESSAGE_LAYOUTS
 import pcap_reader
@@ -36,7 +37,7 @@ def sparse_run(tmp_path_factory):
     """Low arrival rates, so channels go idle and heartbeats appear."""
     base = main.default_config(seed=4, target_messages=600,
                                out_dir=tmp_path_factory.mktemp("sparse"), book_key_every=25)
-    flow = FlowParams(rates={name: (0.4, 4.0) for name in base.flow.rates},
+    flow = FlowParams(rates={name: (0.4, 4.0, 40.0) for name in base.flow.rates},
                       calm_mean_ns=8_000_000_000, busy_mean_ns=2_000_000_000)
     config = main.default_config(seed=4, target_messages=600, out_dir=base.out_dir,
                                  book_key_every=25, flow=flow)
@@ -159,20 +160,22 @@ def test_same_seed_gives_identical_files(tmp_path):
 # Order flow sanity
 # ---------------------------------------------------------------------------
 
-def test_both_regimes_and_their_rates(big_run):
+def test_every_regime_and_its_rates(big_run):
     config, result, _ = big_run
     first, last = result.arrivals[0][0].time_ns, result.arrivals[-1][0].time_ns
-    time_in = {CALM: 0, BUSY: 0}
+    time_in = {regime: 0 for regime in REGIMES}
     for start, end, regime in result.regimes:
         overlap = min(end, last) - max(start, first)
         if overlap > 0:
             time_in[regime] += overlap
-    assert time_in[CALM] > 0 and time_in[BUSY] > 0
+    assert all(time_in.values()), time_in
+    spikes = [end - start for start, end, regime in result.regimes if regime == SPIKE]
+    assert spikes and sum(spikes) / len(spikes) < 10_000_000, spikes
     counts = {}
     for arrival, _ in result.arrivals:
         counts[(arrival.instrument, arrival.regime)] = counts.get((arrival.instrument, arrival.regime), 0) + 1
-    for name, (calm_rate, busy_rate) in config.flow.rates.items():
-        for regime, rate in ((CALM, calm_rate), (BUSY, busy_rate)):
+    for name, rates in config.flow.rates.items():
+        for regime, rate in zip(REGIMES, rates):
             observed = counts[(name, regime)] / (time_in[regime] / 1e9)
             assert abs(observed - rate) / rate < 0.15, (name, regime, observed, rate)
 
@@ -244,7 +247,7 @@ def test_mid_between_ticks_rounds_both_ways():
     from b3gen.flow import OrderFlow, FlowInstrument
     inst = FlowInstrument("X", tick=100, lot=100, low_limit=1_000, high_limit=1_000_000,
                           reference_price=50_000)
-    flow = OrderFlow([inst], FlowParams(rates={"X": (10, 100)}), seed=3, start_ns=0).flows["X"]
+    flow = OrderFlow([inst], FlowParams(rates={"X": (10, 100, 1000)}), seed=3, start_ns=0).flows["X"]
     # Bid 50_000, ask 50_100: the midpoint 50_050 falls between ticks.
     draws = [flow._mid([(50_000, 1, 1)], [(50_100, 1, 1)]) for _ in range(2000)]
     assert set(draws) == {50_000, 50_100}
@@ -257,3 +260,50 @@ def test_twenty_thousand_messages_run_quickly(big_run):
     _, result, seconds = big_run
     assert result.messages >= 20_000
     assert seconds < 30, f"{seconds:.1f} s"
+
+
+# ---------------------------------------------------------------------------
+# Packet limits are exercised
+# ---------------------------------------------------------------------------
+
+def wire_packets(pcap_path):
+    """[(channel, sendingTime, [message bytes])] in wire order, decoded independently."""
+    out = []
+    for (channel, _, seq, index, sending), data in decode_wire(pcap_path):
+        if index == 0:
+            out.append((channel, sending, seq, []))
+        out[-1][3].append(data)
+    return out
+
+
+def test_packets_close_by_size_and_events_span_packets(big_run):
+    # Spikes put many arrivals in one 5 us window, so some packets fill up
+    # before their window expires, and an event split by the size limit
+    # continues in the next packet (its EndOfEvent comes later).
+    config, result, _ = big_run
+    packets = [p for p in wire_packets(result.pcap_path) if p[2] != 0]  # no heartbeats
+    times = {}  # channel -> message times in wire order
+    for channel, t in result.message_times:
+        times.setdefault(channel, []).append(t)
+    position = {channel: 0 for channel in times}
+    by_size = spanning = 0
+    next_on_channel = {}
+    for i, (channel, _, _, messages) in enumerate(packets):
+        next_on_channel.setdefault(channel, []).append(i)
+    for channel, indices in next_on_channel.items():
+        for this, following in zip(indices, indices[1:]):
+            _, sending, _, messages = packets[this]
+            t0 = times[channel][position[channel]]
+            position[channel] += len(messages)
+            size = 16 + sum(map(len, messages))
+            assert size <= MAX_PACKET_SIZE
+            if size + len(packets[following][3][0]) > MAX_PACKET_SIZE and \
+                    sending < t0 + config.window_ns:
+                by_size += 1
+            header, fields = sbe_decoder.decode(messages[-1])
+            if not fields.get("matchEventIndicator", 0x80) & 0x80:
+                spanning += 1
+                assert size + len(packets[following][3][0]) > MAX_PACKET_SIZE
+    print(f"closed by size: {by_size}, events spanning packets: {spanning}")
+    assert by_size >= 50, by_size
+    assert spanning >= 10, spanning
