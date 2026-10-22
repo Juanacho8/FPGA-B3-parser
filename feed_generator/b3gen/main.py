@@ -67,6 +67,7 @@ class RunConfig:
     src_ip: str = "10.0.0.1"
     src_port: int = 50000
     window_ns: int | None = 5000
+    band_bps: int = 800           # PriceBand half-width around the previous close
     book_key_every: int = 1000    # events between book key checkpoints
     record: bool = False          # keep per-arrival records (tests)
     channel_map_b: dict = None    # Feed B: channel -> (multicast group, port)
@@ -97,17 +98,19 @@ class RunResult:
     resets: list = field(default_factory=list)    # one dict per reset applied (tags, not placements)
 
 
-def _band(price, pct):
-    return price * (100 - pct) // 100, price * (100 + pct) // 100
+def _band(price, bps):
+    """PriceBand: +-bps basis points around the previous close."""
+    return price * (10_000 - bps) // 10_000, price * (10_000 + bps) // 10_000
 
 
 def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overrides):
+    band_bps = overrides.get("band_bps", RunConfig.band_bps)
     start = datetime.datetime(2026, 10, 19, 13, 0, tzinfo=datetime.timezone.utc)  # 10:00 BRT
     trade_date = (start.date() - datetime.date(1970, 1, 1)).days
 
     def inst(name, sid, channel, segment, group, tick, lot, future, close, adtv, maxvol,
              settle=None, oi=None):
-        low, high = _band(close, 8)
+        low, high = _band(close, band_bps)
         return InstrumentConfig(name, sid, channel, segment, group, tick, lot, future, close,
                                 low, high, adtv, maxvol, settle, oi)
 
@@ -303,10 +306,18 @@ def _generate(config):
         if at_start:
             at_start(start)
         new_date = log["trade_date_before"] + days
-        new_values = {i.name: dataclasses.replace(
-            values[i.name], prev_close=publisher.closing_price(i.name),
-            settlement_price=publisher.closing_price(i.name) if i.is_future else None,
-            settl_date=log["trade_date_before"] if i.is_future else None) for i in insts}
+        new_values = {}
+        for i in insts:
+            close = publisher.closing_price(i.name)
+            low, high = _band(close, config.band_bps)
+            new_values[i.name] = dataclasses.replace(
+                values[i.name], prev_close=close, low_limit=low, high_limit=high,
+                settlement_price=close if i.is_future else None,
+                settl_date=log["trade_date_before"] if i.is_future else None)
+            flow.set_band(i.name, low, high)
+        values.update(new_values)
+        log.setdefault("bands", {}).update({n: [v.low_limit, v.high_limit]
+                                            for n, v in new_values.items()})
         session = publisher.start_session(start, new_date, new_values)
         for k, m in enumerate(session):
             emit([m], checkpoint=k == len(session) - 1)

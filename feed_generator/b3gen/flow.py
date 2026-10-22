@@ -299,6 +299,11 @@ class _InstrumentFlow:
     def _size_change(self, t):
         handle = self.live.choice(self.rng)
         current = self.live.orders[handle][2] // self.inst.lot
+        if not self.low <= self.live.orders[handle][1] <= self.high:
+            # Rested before a new session's band: an increase would requeue
+            # it outside the band, so only reduce it.
+            return engine.SizeChange(t, handle, self.rng.randint(1, current - 1) * self.inst.lot) \
+                if current > 1 else None
         # Half reductions (keep priority), half increases (requeue).
         if current > 1 and self.rng.random() < 0.5:
             lots = self.rng.randint(1, current - 1)
@@ -379,6 +384,13 @@ class OrderFlow:
         assert flow.advance() == t
         heapq.heappush(self._heap, (flow.next_time, order, name))
         return Arrival(t + self._offset_ns, name, self.clock.at(t)[0])
+
+    def set_band(self, name, low_limit, high_limit):
+        """A new session's PriceBand: later prices stay inside it."""
+        flow = self.flows[name]
+        tick = flow.inst.tick
+        flow.low = -(-low_limit // tick) * tick
+        flow.high = high_limit // tick * tick
 
     def decide(self, arrival, top):
         return self.flows[arrival.instrument].decide(arrival.time_ns, top)

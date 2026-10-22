@@ -190,7 +190,7 @@ Step 7b decisions (restart and reset scenarios, `run_scenario` kinds `failover`,
 * **Book key:** between a ChannelReset and an instrument's own rebuild, the key shows an empty book for it, which is what a correct client holds. A checkpoint is taken after every rebuild and after each new session's start.
 * **Failover:** SequenceReset on every channel, then rebuilds; no ChannelReset.
 * **channel_reset:** one channel, no version change.
-* **session_change:** end of session, stream down overnight (no heartbeats), 3 start-of-day heartbeats, next day's session (TRADING_SESSION_CHANGE first). Orders carry over; bands are kept; the new prev_close (and futures' settlement) is the day's close.
+* **session_change:** end of session, stream down overnight (no heartbeats), 3 start-of-day heartbeats, next day's session (TRADING_SESSION_CHANGE first). Orders carry over. The new prev_close (and futures' settlement) is the day's close, and the PriceBand is recomputed around it (`band_bps`, default ±8%). The flow then keeps new prices inside the new band; an order resting outside it can only be reduced or cancelled, since an increase would requeue it outside the band.
 * **weekly_start:** the file opens on Friday. End of session, stream down over the weekend, 3 start-of-day heartbeats (nextSeqNo = the SequenceReset packet's number), SequenceReset and version +1 per channel, ChannelReset per channel, rebuilds of the orders carried over, then Monday's session. No SecurityDefinition resend (v2).
 * The manifest's `resets` entry gives kind, time, target, trade dates, the first and last placements, each channel's SequenceReset placement and each instrument's rebuild span.
 | Edge orders | Null-price (market-on-auction style) orders, MassDelete, aggressions sweeping several levels, events spanning packets |
@@ -219,7 +219,7 @@ Step 7b decisions (restart and reset scenarios, `run_scenario` kinds `failover`,
 |---|---|
 | `feedA.pcap`, `feedB.pcap` | Nanosecond-resolution pcap. Ethernet + IPv4 + UDP to the channel's multicast group. IP/UDP headers big-endian, B3 payload little-endian |
 | Intent log | One row per message: feed packet sequenceNumber, message index within the packet, templateId, and every field value as the publisher intended. JSON Lines is suggested |
-| Book key | True book, top 5 levels per side per instrument, at checkpoints (e.g. every 1,000 events) |
+| Book key | The book a correct client holds (not the engine's book), top 5 levels per side per instrument, at checkpoints (e.g. every 1,000 events, and after every rebuild). The two differ between a ChannelReset and an instrument's rebuild, where the client holds an empty book. With gaps, books listed as unreliable in the manifest diverge from the key from their first missing packet |
 
 The parser output format (decision A) is deferred to the C++/RTL phase. A small script will convert the intent log into it later.
 

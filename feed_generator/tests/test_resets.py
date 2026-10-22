@@ -403,3 +403,48 @@ def test_reset_scenarios_are_deterministic(tmp_path, runs):
             assert Path(getattr(again.run, attr)).read_bytes() == \
                 Path(getattr(runs[name].run, attr)).read_bytes(), (name, attr)
         assert again.manifest == runs[name].manifest
+
+
+@pytest.fixture(scope="module")
+def tight_session_change(tmp_path_factory):
+    # A 0.2% band, so the flow presses on it and a stale band would show.
+    return main.run_scenario(scenario_config(tmp_path_factory.mktemp("tight"), band_bps=20),
+                             "session_change")
+
+
+@pytest.mark.parametrize("name", NEW_SESSION + ("tight",))
+def test_new_session_bands_follow_the_close_and_bind_new_orders(runs, tight_session_change,
+                                                                  name):
+    # Each session's PriceBand is +-band_bps of the previous close (the
+    # ClosingPrice DAILY just before it, 8 decimals), and every new live
+    # order after it stays inside it.
+    result = tight_session_change if name == "tight" else runs[name]
+    bps = 20 if name == "tight" else main.RunConfig.band_bps
+    at_edge = 0
+    band = {}
+    last_close = {}
+    new_bands = 0
+    checked = 0
+    for p in read_packets(result.run.pcap_path):
+        for data in p["messages"]:
+            h, f = sbe_decoder.decode(data)
+            sid = f.get("securityID")
+            if h["templateId"] == 17 and f["openCloseSettlFlag"] == 0:  # DAILY
+                last_close[sid] = f["mDEntryPx"] // 10_000
+            elif h["templateId"] == 22:
+                band[sid] = (f["lowLimitPrice"], f["highLimitPrice"])
+                if sid in last_close:
+                    close = last_close[sid]
+                    assert band[sid] == (close * (10_000 - bps) // 10_000,
+                                         close * (10_000 + bps) // 10_000), sid
+                    new_bands += 1
+            elif h["templateId"] == ORDER and f["mDUpdateAction"] == 0 \
+                    and not f["matchEventIndicator"] & RECOVERY:
+                low, high = band[sid]
+                assert low <= f["mDEntryPx"] <= high, (sid, f["mDEntryPx"], band[sid])
+                checked += 1
+                at_edge += high - f["mDEntryPx"] < 0.2 * (high - low) or \
+                    f["mDEntryPx"] - low < 0.2 * (high - low)
+    assert new_bands == 4 and checked > 1000
+    if name == "tight":
+        assert at_edge > 100  # the band really binds
