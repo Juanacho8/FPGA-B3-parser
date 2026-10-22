@@ -1,7 +1,7 @@
 """Support: wiring the layers together (the CLI arrives in step 8).
 
 run(config) drives one trading session for Feed A, and run_scenario(config,
-name) writes one scenario (clean, loss, gap, idle) with both feeds and a
+name) writes one scenario (clean, loss, gap, gap_one, idle) with both feeds and a
 manifest into out_dir/name:
 
     flow -> engine -> publisher -> packetizer -> pcap
@@ -144,7 +144,7 @@ class ScenarioResult:
     manifest: dict
 
 
-SCENARIOS = ("clean", "loss", "gap", "idle")
+SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle")
 
 
 def run(config):
@@ -168,8 +168,10 @@ def run_scenario(config, name):
     gap = config.gap if name == "gap" else None
 
     result, published, packetized, checkpoints = _generate(config)
+    chosen = [scenarios.single_instrument_packet(packetized, published)] \
+        if name == "gap_one" else []
     feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b,
-                                  loss=loss, gap=gap)
+                                  loss=loss, gap=gap, gap_positions=chosen)
     _write(config, result, published, packetized, checkpoints, feeds.a)
     out = Path(config.out_dir)
     feed_b_path = out / "feedB.pcap"
@@ -183,7 +185,8 @@ def run_scenario(config, name):
     params = {"feed_b": dataclasses.asdict(config.feed_b),
               "loss": dataclasses.asdict(loss) if loss else None,
               "gap": dataclasses.asdict(gap) if gap else None,
-              "idle": dataclasses.asdict(config.idle) if config.idle else None}
+              "idle": dataclasses.asdict(config.idle) if config.idle else None,
+              "gap_packets": [list(k) for k in feeds.missing_b] if chosen else None}
     manifest = {"scenario": name, "seed": config.seed, "params": params,
                 "missing": {"A": [list(k) for k in feeds.missing_a],
                             "B": [list(k) for k in feeds.missing_b]},
