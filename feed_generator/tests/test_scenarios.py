@@ -14,6 +14,7 @@ import pytest
 from b3gen import main, scenarios
 from b3gen.packet import Packetizer
 from book_builder import BookBuilder
+from replay import check_unreliable
 from layouts_md import MESSAGE_LAYOUTS
 import sbe_decoder
 from wire import read_packets, top5
@@ -115,15 +116,33 @@ def test_feed_b_jitter_is_spread_and_bounded(runs):
 # ---------------------------------------------------------------------------
 
 def missing(full, feed):
-    """Sequenced keys of full absent from feed, in full's wire order."""
+    """Keys of full (sequenced packet keys, wire order) absent from feed."""
     present = sequenced(feed).keys()
-    return [list(k) for k in sequenced(full) if k not in present]
+    return [list(k) for k in full if k not in present]
+
+
+def published_packets(result):
+    """Every sequenced packet the run published, in wire order, from its
+    intent log (which describes everything published, whatever a feed lost)."""
+    keys = []
+    for line in Path(result.run.intent_path).read_text().splitlines():
+        row = json.loads(line)
+        key = (row["channel"], row["sequenceVersion"], row["sequenceNumber"])
+        if row["sequenceNumber"] and (not keys or keys[-1] != key):
+            keys.append(key)
+    return keys
 
 
 @pytest.mark.parametrize("name", main.SCENARIOS)
 def test_missing_packets_match_the_manifest(runs, name):
+    # The full feed is never the feed under test: the clean run's Feed A for
+    # the scenarios that run the clean session, and for every scenario the
+    # packets its intent log says were published.
     a, b = feeds(runs[name])
-    full = read_packets(runs["clean"].run.pcap_path) if name in FEED_SCENARIOS else a
+    full = published_packets(runs[name])
+    if name in FEED_SCENARIOS:
+        clean = list(sequenced(read_packets(runs["clean"].run.pcap_path)))
+        assert clean == full  # same session as clean
     manifest = json.loads(Path(runs[name].manifest_path).read_text())
     assert manifest == runs[name].manifest
     assert missing(full, a) == manifest["missing"]["A"]
@@ -243,26 +262,17 @@ def test_book_from_feed_a_alone_breaks_under_loss(runs):
 
 @pytest.mark.parametrize("name", ["gap", "gap_one"])
 def test_unreliable_books_are_the_instruments_in_the_gaps(runs, name):
+    # From the intent rows of the packets missing from both feeds: every
+    # marked instrument lost a message there, and every lost book message
+    # marks its instrument (tests/replay.py check_unreliable).
     result = runs[name]
     gaps = {tuple(k) for k in result.manifest["missing"]["B"]}
-    cfg = main.default_config()
-    on_channel = {}
-    for i in cfg.instruments:
-        on_channel.setdefault(i.channel, []).append(i.name)
-    want = {}
-    for row in [json.loads(line) for line in Path(result.run.intent_path).read_text().splitlines()]:
-        key = (row["channel"], row["sequenceVersion"], row["sequenceNumber"])
-        if key in gaps:
-            if row["templateId"] in CHANNEL_WIDE:
-                names = on_channel[row["channel"]]
-            elif row["instrument"] is None or row["templateId"] == NEWS:
-                names = []  # News and unknown templates never touch a book
-            else:
-                names = [row["instrument"]]
-            for name in names:
-                want.setdefault(name, list(key))
-    assert result.manifest["unreliable_books"] == want
-    assert want
+    lost = [row for row in (json.loads(line) for line in
+                            Path(result.run.intent_path).read_text().splitlines())
+            if (row["channel"], row["sequenceVersion"], row["sequenceNumber"]) in gaps]
+    channel_of = {i.name: i.channel for i in main.default_config().instruments}
+    assert result.manifest["unreliable_books"] and lost
+    check_unreliable(result.manifest["unreliable_books"], lost, channel_of)
 
 
 @pytest.mark.parametrize("name", ["gap", "gap_one"])

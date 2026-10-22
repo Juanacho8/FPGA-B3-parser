@@ -421,3 +421,43 @@ def test_publishing_is_deterministic():
             out += [m.data for m in pub.publish(engine.submit(instr[1], to_engine_instruction(instr)))]
         return out
     assert run() == run()
+
+
+def half_even(value):
+    """Independent rounding of a Fraction to an integer, ties to even."""
+    floor = value.numerator // value.denominator
+    rest = value - floor
+    if rest > Fraction(1, 2):
+        return floor + 1
+    if rest == Fraction(1, 2):
+        return floor + floor % 2
+    return floor
+
+
+def test_vwap_exact_ties_round_half_to_even_end_to_end():
+    # Tick 1 and lot 1, so VWAPs land on exact .5 ties: 3/2 = 1.5 (half-even
+    # 2, half-down 1) and then 15/6 = 2.5 (half-even 2, half-up 3). Engine ->
+    # publisher -> bytes -> independent decoder, recomputed from the Trades.
+    inst = Instrument("T", 3001, 70, "EQT", "EQ1", 1, False)
+    engine = Engine([("T", 1, 1, "EQT")])
+    pub = Publisher([inst])
+    pub.start_session(0, 20_381, {"T": SessionValues(prev_close=2, low_limit=1, high_limit=10,
+                                                     avg_daily_traded_qty=0, max_trade_vol=100)})
+    trades, vwaps = [], []
+
+    def submit(t, instruction):
+        for m in pub.publish(engine.submit("T", instruction)):
+            header, fields = sbe_decoder.decode(m.data)
+            if header["templateId"] == TRADE:
+                trades.append((fields["mDEntryPx"], fields["mDEntrySize"]))
+            elif header["templateId"] == STATS:
+                exact = Fraction(sum(p * q for p, q in trades), sum(q for _, q in trades))
+                vwaps.append((exact, fields["vwapPx"]))
+
+    submit(1, NewOrder(1, SELL, 1, 1, 1))
+    submit(2, NewOrder(2, SELL, 2, 1, 1))
+    submit(3, NewOrder(3, BUY, 2, 2, 2))   # 1@1 + 1@2: VWAP 1.5
+    submit(4, NewOrder(4, SELL, 3, 4, 1))
+    submit(5, NewOrder(5, BUY, 3, 4, 2))   # + 4@3: VWAP 15/6 = 2.5
+    assert [exact for exact, _ in vwaps] == [Fraction(3, 2), Fraction(5, 2)]  # both ties
+    assert [wire for _, wire in vwaps] == [half_even(exact) for exact, _ in vwaps] == [2, 2]

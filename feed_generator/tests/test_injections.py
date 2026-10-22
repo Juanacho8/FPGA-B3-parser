@@ -15,6 +15,7 @@ from conftest import scenario_config
 import sbe_decoder
 from book_builder import BookBuilder
 from replay import replay
+from replay import check_unreliable
 from wire import read_packets, split_messages
 
 DELETE = 51
@@ -368,18 +369,20 @@ def test_sequencing_continues_after_faults(runs):
 
 
 def test_unreliable_books_are_the_instruments_with_discarded_book_messages(runs):
+    # The messages a client discards: from each fault to the end of its packet.
     result = runs["malformed"]
     rows = intent_at(result)
-    want = {}
+    lost = []
     for fault in result.manifest["faults"]:
         if fault["fault"] == "short":
             continue
         packet = (fault["channel"], fault["sequenceVersion"], fault["sequenceNumber"])
-        for (c, v, s, i), row in sorted(rows.items()):
-            if (c, v, s) == packet and i >= fault["messages_before"] and \
-                    row["templateId"] not in (2, NEWS) and row["instrument"]:
-                want.setdefault(row["instrument"], list(packet))
-    assert result.manifest["unreliable_books"] == want
+        lost += [row for (c, v, s, i), row in sorted(rows.items())
+                 if (c, v, s) == packet and i >= fault["messages_before"]]
+    lost.sort(key=lambda r: (r["channel"], r["sequenceVersion"], r["sequenceNumber"], r["index"]))
+    channel_of = {i.name: i.channel for i in main.default_config().instruments}
+    assert result.manifest["unreliable_books"] and lost
+    check_unreliable(result.manifest["unreliable_books"], lost, channel_of)
 
 
 def test_split_messages_never_loops():
