@@ -217,9 +217,13 @@ Step 7c decisions (`edge`, `rare`, `schema`, `malformed`; injections at half the
 | PETR4 | Equity | Equities | 0.01 | 70 |
 | VALE3 | Equity | Equities | 0.01 | 70 |
 
-* Channel numbers are real B3 Binary UMDF channels. securityIDs, starting prices, multicast addresses and ports are invented.
-* All of it lives in the config file, so B3's real Market Data Channels Definition can be swapped in later.
-* Also in config: seed, message count, packet window, heartbeat interval, burst regime parameters, Feed B delay, loss rates.
+* securityIDs, starting prices, multicast addresses and ports are invented, and so is which channel carries which instrument (B3's real assignment is in its Market Data Channels Definition, not in spec/).
+* All of it lives in the config file (`feed_generator/config.toml`, decided in step 8), so B3's real channel definitions can be swapped in later.
+* Also in config: seed, message targets per set, packet window, heartbeat interval, regime and flow parameters (spike included), Feed B delay and jitter, loss/gap/idle parameters, session date.
+* **Config file (step 8):** TOML, read with `tomllib`. Every value carries a comment labelling it [B3] (from spec/), [B3 market] (a real convention not in spec/, such as ticks and lots), [inferred], [invented] or [stress]. Validation is strict: unknown keys, missing keys, wrong types and inconsistent values raise with the key path. The default file gives exactly `main.default_config()`.
+* **CLI (step 8):** `python -m b3gen build` builds `small`, `large`, `burst` (spike_every 50 ms, 200k messages, about 100 spikes) and every scenario folder from one config; `--seed` and `--messages` override every set chosen (malformed keeps 1,500). Every folder has both feeds, the keys, a manifest and `provenance.json` (config text and SHA-256, seed, git commit and dirty flag, schema XML SHA-256, command line). A scenario that cannot place what it promises within its target fails with a clear error.
+* **Streaming (step 8):** the packetizer hands over each packet once no channel can still produce an earlier one; Feed A's pcap and the intent log are written then, and the messages forgotten. Output is byte-identical to the in-memory writer. 1M messages: 2.20 GB peak and 40.9 s before, 214 MB and 42.6 s after (Feed A, intent log, book key).
+* Generated files go to `data/` (git-ignored) and are never committed.
 
 ### Outputs
 

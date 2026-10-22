@@ -29,12 +29,20 @@ the channel, or from start_ns before the first one. stream_down() stops a
 channel's heartbeats until it comes back up (weekend, overnight); the first
 start-of-day heartbeat goes out as it comes up.
 
+Streaming: given a sink, each packet is handed over (in final wire order,
+with its position) as soon as no channel can still produce an earlier one,
+instead of being kept until finish(). A channel's earliest possible next
+packet is its open packet's first message time, or, with none open, the
+earlier of its next heartbeat and the current time. In streaming mode the
+caller must add messages in nondecreasing time across all channels.
+
 Feed B (a delayed copy) and packet loss belong to scenarios.py, not here.
 
 Must not: change message content.
 See docs/FEED_GENERATOR_CONTEXT.md section 7 and spec/LAYOUTS.md sections 3 and 12.1.
 """
 
+import heapq
 from dataclasses import dataclass
 
 from b3gen import encode, layouts
@@ -91,7 +99,10 @@ class _Channel:
 
 class Packetizer:
     def __init__(self, channels, start_ns, *, window_ns=5000,
-                 heartbeat_ns=1_000_000_000, initial_sequence_number=1):
+                 heartbeat_ns=1_000_000_000, initial_sequence_number=1, sink=None):
+        """sink(position, time_ns, channel, sequence_version, sequence_number,
+        contents, data): streaming mode (see the module docstring). contents
+        is the packet's tags, or a heartbeat's nextSeqNo."""
         if window_ns is not None and window_ns < 0:
             raise PacketError("window_ns must be >= 0 or None")
         if heartbeat_ns <= 0:
@@ -103,6 +114,12 @@ class Packetizer:
         self._packets = []    # (time_ns, channel, emit order, bytes)
         self._contents = []   # per emitted packet: (sequence_version, seq, tags or next_seq_no)
         self._finished = False
+        self._sink = sink
+        self._ready = []      # streaming: heap of packets not handed over yet
+        self._emitted = 0
+        self._released = 0
+        self._now = start_ns  # latest time seen on any channel
+        self._heartbeat_list = []
 
     # -- public -------------------------------------------------------------
 
@@ -116,6 +133,7 @@ class Packetizer:
             raise PacketError(f"message of {len(message)} bytes cannot fit in a packet")
         if time_ns < ch.last_message_ns:
             raise PacketError(f"channel {channel}: time {time_ns} before {ch.last_message_ns}")
+        self._advance(time_ns)
         ch.last_message_ns = time_ns
 
         if ch.open_t0 is not None:
@@ -133,6 +151,7 @@ class Packetizer:
         ch.open_messages.append(bytes(message))
         ch.open_tags.append(tag)
         ch.open_size += len(message)
+        self._release()
 
     def bump_version(self, time_ns, channel, final_message=None, final_tag=None):
         """Close the open packet, send final_message (if any) alone as the
@@ -141,6 +160,7 @@ class Packetizer:
         ch = self._channel(channel)
         if time_ns < ch.last_message_ns:
             raise PacketError(f"channel {channel}: time {time_ns} before {ch.last_message_ns}")
+        self._advance(time_ns)
         ch.last_message_ns = time_ns
         self._close_by(ch, time_ns)
         self._heartbeats(ch, until_ns=time_ns, inclusive=False)
@@ -150,6 +170,7 @@ class Packetizer:
         ch.sequence_version = 1 if ch.sequence_version >= MAX_SEQUENCE_VERSION \
             else ch.sequence_version + 1
         ch.next_sequence_number = 1
+        self._release()
 
     def stream_down(self, time_ns, channel, up_ns):
         """Close the open packet at time_ns, send the heartbeats due before
@@ -157,10 +178,12 @@ class Packetizer:
         ch = self._channel(channel)
         if not time_ns <= up_ns or time_ns < ch.last_message_ns:
             raise PacketError(f"channel {channel}: bad stream_down {time_ns}..{up_ns}")
+        self._advance(time_ns)
         self._close_by(ch, time_ns)
         self._heartbeats(ch, until_ns=time_ns, inclusive=False)
         ch.last_message_ns = up_ns
         ch.last_send_ns = up_ns - self.heartbeat_ns
+        self._release()
 
     def finish(self, end_ns):
         """Close every open packet, emit trailing heartbeats up to end_ns and
@@ -173,6 +196,9 @@ class Packetizer:
             self._close_by(ch, end_ns)
             self._heartbeats(ch, until_ns=end_ns, inclusive=True)
         self._finished = True
+        if self._sink is not None:
+            self._release(everything=True)
+            return Packetized([], {}, self._heartbeat_list, None)
         order = sorted(self._packets)
         packets, placements, heartbeats, headers = [], {}, [], []
         for position, (t, c, emit, data) in enumerate(order):
@@ -188,6 +214,34 @@ class Packetizer:
         return Packetized(packets, placements, heartbeats, headers)
 
     # -- internals ----------------------------------------------------------
+
+    def _advance(self, time_ns):
+        if self._sink is not None and time_ns < self._now:
+            raise PacketError(f"streaming: time {time_ns} before {self._now} on another channel")
+        self._now = max(self._now, time_ns)
+
+    def _watermark(self):
+        """No packet still to come can be earlier than this."""
+        earliest = []
+        for ch in self.channels.values():
+            if ch.open_t0 is not None:
+                earliest.append(ch.open_t0)
+            else:
+                earliest.append(min(ch.last_send_ns + self.heartbeat_ns,
+                                    max(ch.last_message_ns, self._now)))
+        return min(earliest)
+
+    def _release(self, everything=False):
+        if self._sink is None:
+            return
+        limit = None if everything else self._watermark()
+        while self._ready and (limit is None or self._ready[0][0] < limit):
+            t, c, _, version, seq, contents, data = heapq.heappop(self._ready)
+            if seq == HEARTBEAT_SEQUENCE_NUMBER:
+                self._heartbeat_list.append(
+                    Heartbeat(Placement(c, version, seq, 0, t, self._released), contents))
+            self._sink(self._released, t, c, version, seq, contents, data)
+            self._released += 1
 
     def _channel(self, channel):
         if self._finished:
@@ -233,5 +287,10 @@ class Packetizer:
             "sendingTime": sending_time,
         }, f"channel {ch.number} packet header", use_nulls=False)
         ch.last_send_ns = sending_time
+        if self._sink is not None:
+            heapq.heappush(self._ready, (sending_time, ch.number, self._emitted, ch.sequence_version,
+                                         sequence_number, contents, bytes(header) + payload))
+            self._emitted += 1
+            return
         self._contents.append((ch.sequence_version, sequence_number, contents))
         self._packets.append((sending_time, ch.number, len(self._packets), bytes(header) + payload))

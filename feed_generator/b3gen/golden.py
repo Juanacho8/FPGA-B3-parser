@@ -38,8 +38,12 @@ See docs/FEED_GENERATOR_CONTEXT.md section 10 (Outputs).
 """
 
 import json
+from array import array
+from pathlib import Path
 
 from b3gen import layouts
+from b3gen.packet import HEARTBEAT_SEQUENCE_NUMBER, Heartbeat, Placement
+from b3gen.pcap import PcapWriter
 
 SEQUENCE_TEMPLATE = layouts.TEMPLATES_BY_NAME["Sequence_2"].id
 
@@ -76,27 +80,93 @@ def wire_fields(template_id, fields):
     return out, nulls
 
 
+def message_row(p, msg):
+    """Intent row for one Published message at Placement p."""
+    if msg.template_id in layouts.TEMPLATES:
+        fields, nulls = wire_fields(msg.template_id, msg.fields)
+    else:
+        fields, nulls = {"body": msg.fields["body"].hex()}, []
+    row = _row(p, msg.template_id, msg.instrument, fields, nulls,
+               msg.block_length, msg.version)
+    row.update(msg.annotations or {})
+    return row
+
+
+def heartbeat_row(hb):
+    fields, nulls = wire_fields(SEQUENCE_TEMPLATE, {"nextSeqNo": hb.next_seq_no})
+    return _row(hb.placement, SEQUENCE_TEMPLATE, None, fields, nulls)
+
+
 def intent_rows(published, packetized):
     """Rows for every published message (tagged by its index in published)
-    and every heartbeat, sorted in wire order."""
+    and every heartbeat, sorted in wire order. (The in-memory path; streamed
+    runs write the same rows packet by packet.)"""
     rows = []
     for tag, msg in enumerate(published):
         p = packetized.placements[tag]
-        if msg.template_id in layouts.TEMPLATES:
-            fields, nulls = wire_fields(msg.template_id, msg.fields)
-        else:
-            fields, nulls = {"body": msg.fields["body"].hex()}, []
-        row = _row(p, msg.template_id, msg.instrument, fields, nulls,
-                   msg.block_length, msg.version)
-        row.update(msg.annotations or {})
-        rows.append(((p.packet_position, p.index), row))
+        rows.append(((p.packet_position, p.index), message_row(p, msg)))
     for hb in packetized.heartbeats:
         p = hb.placement
-        fields, nulls = wire_fields(SEQUENCE_TEMPLATE, {"nextSeqNo": hb.next_seq_no})
-        rows.append(((p.packet_position, p.index),
-                     _row(p, SEQUENCE_TEMPLATE, None, fields, nulls)))
+        rows.append(((p.packet_position, p.index), heartbeat_row(hb)))
     rows.sort(key=lambda r: r[0])
     return [row for _, row in rows]
+
+
+class PlacementTable:
+    """tag -> Placement for every message of a streamed run, in compact
+    arrays (tags are 0, 1, 2, ... in publication order)."""
+
+    def __init__(self):
+        self._cols = [array("q") for _ in range(6)]
+
+    def set(self, tag, p):
+        for col, value in zip(self._cols, (p.channel, p.sequence_version, p.sequence_number,
+                                           p.index, p.sending_time, p.packet_position)):
+            if len(col) <= tag:
+                col.extend([-1] * (tag + 1 - len(col)))
+            col[tag] = value
+
+    def __getitem__(self, tag):
+        values = [col[tag] for col in self._cols]
+        if values[0] < 0:
+            raise KeyError(tag)
+        return Placement(*values)
+
+    def __contains__(self, tag):
+        return tag < len(self._cols[0]) and self._cols[0][tag] >= 0
+
+
+class StreamWriter:
+    """Writes Feed A's pcap and the intent log as the packetizer hands over
+    each packet (Packetizer sink), then forgets the packet's messages."""
+
+    def __init__(self, out_dir, published, channel_map, src_ip, src_port):
+        self.published = published          # tag -> Published, emptied as packets go out
+        self.placements = PlacementTable()
+        self.packets = []                   # (time_ns, channel, bytes): kept for Feed B
+        self._pcap = PcapWriter(Path(out_dir) / "feedA.pcap", channel_map=channel_map,
+                                src_ip=src_ip, src_port=src_port)
+        self._intent = open(Path(out_dir) / "intent.jsonl", "w", encoding="utf-8")
+
+    def __call__(self, position, time_ns, channel, version, seq, contents, data):
+        self.packets.append((time_ns, channel, data))
+        self._pcap.write(time_ns, channel, data)
+        if seq == HEARTBEAT_SEQUENCE_NUMBER:
+            p = Placement(channel, version, seq, 0, time_ns, position)
+            self._line(heartbeat_row(Heartbeat(p, contents)))
+            return
+        for index, tag in enumerate(contents):
+            p = Placement(channel, version, seq, index, time_ns, position)
+            self.placements.set(tag, p)
+            self._line(message_row(p, self.published.pop(tag)))
+
+    def _line(self, row):
+        self._intent.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False))
+        self._intent.write("\n")
+
+    def close(self):
+        self._pcap.close()
+        self._intent.close()
 
 
 def _row(p, template_id, instrument, fields, nulls, block_length=None, version=None):

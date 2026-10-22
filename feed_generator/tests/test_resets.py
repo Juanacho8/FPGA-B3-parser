@@ -419,7 +419,7 @@ def test_new_session_bands_follow_the_close_and_bind_new_orders(runs, tight_sess
     # ClosingPrice DAILY just before it, 8 decimals), and every new live
     # order after it stays inside it.
     result = tight_session_change if name == "tight" else runs[name]
-    bps = 20 if name == "tight" else main.RunConfig.band_bps
+    bps = 20 if name == "tight" else main.InstrumentConfig.band_bps
     at_edge = 0
     band = {}
     last_close = {}
