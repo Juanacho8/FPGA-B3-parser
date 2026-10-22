@@ -38,6 +38,11 @@ cpp_baseline/build/
 *.pcap
 *.pcapng
 
+# --- Generated feeds (python -m b3gen build --out data): never committed ---
+data/*
+!data/.gitkeep
+feed_generator/data/
+
 # --- Python tooling ---
 .pytest_cache/
 *.egg-info/

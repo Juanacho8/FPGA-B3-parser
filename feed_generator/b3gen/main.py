@@ -1,8 +1,10 @@
-"""Support: wiring the layers together (the CLI arrives in step 8).
+"""Support: wiring the layers together.
 
-run(config) drives one trading session for Feed A, and run_scenario(config,
-name) writes one scenario (clean, loss, gap, gap_one, idle) with both feeds and a
-manifest into out_dir/name:
+run(config) drives one trading session and writes Feed A, the intent log and
+the book key, streaming them to disk as packets close. build_set(config,
+name) does the same and adds Feed B and a manifest (the CLI's small, large
+and burst sets). run_scenario(config, name) writes one scenario with both
+feeds and a manifest into out_dir/name (in memory: scenarios are small):
 
     flow -> engine -> publisher -> packetizer -> pcap
                           |             |
@@ -12,10 +14,11 @@ start_session at the beginning, end_session at the end. Every published
 message is tagged with its index so the packetizer can report where it
 landed, which is what the intent log and book key are keyed by.
 
-RunConfig and default_config() hold the parameters for now; config.py and a
-config file take over in step 8. Instrument mapping, securityIDs, prices and
-multicast groups in the default are invented (channel numbers are real B3
-Binary UMDF channels; groups are from 233.252.0.0/14, MCAST-TEST-NET).
+RunConfig holds the parameters; config.py builds it from a TOML file
+(feed_generator/config.toml), and default_config() gives the same values in
+code for tests. Instrument mapping, securityIDs, prices and multicast groups
+are invented (channel numbers are real B3 Binary UMDF channels; groups are
+from 233.252.0.0/14, MCAST-TEST-NET).
 
 Must not: contain generation logic; it only wires the layers together.
 See docs/FEED_GENERATOR_CONTEXT.md sections 4 and 11.
@@ -56,6 +59,7 @@ class InstrumentConfig:
     max_trade_vol: int
     settlement_price: int | None = None
     open_interest: int | None = None
+    band_bps: int = 800           # PriceBand half-width around the previous close
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,7 @@ class RunConfig:
     src_ip: str = "10.0.0.1"
     src_port: int = 50000
     window_ns: int | None = 5000
-    band_bps: int = 800           # PriceBand half-width around the previous close
+    heartbeat_ns: int = 1_000_000_000
     book_key_every: int = 1000    # events between book key checkpoints
     record: bool = False          # keep per-arrival records (tests)
     channel_map_b: dict = None    # Feed B: channel -> (multicast group, port)
@@ -79,6 +83,7 @@ class RunConfig:
     loss: scenarios.BurstParams = scenarios.BurstParams(0.01, 3)
     gap: scenarios.BurstParams = scenarios.BurstParams(0.001, 2)
     idle: scenarios.IdleParams | None = None  # pause the flow once (idle scenario)
+    idle_ns: int = 3_500_000_000  # the idle scenario's pause
     resets: tuple = ()            # scenarios.Reset
     injections: tuple = ()        # scenarios.Inject
 
@@ -110,7 +115,9 @@ def _band(price, bps):
 
 
 def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overrides):
-    band_bps = overrides.get("band_bps", RunConfig.band_bps)
+    """The default config in code (config.toml gives the same). band_bps
+    overrides every instrument's band."""
+    band_bps = overrides.pop("band_bps", InstrumentConfig.band_bps)
     start = datetime.datetime(2026, 10, 19, 13, 0, tzinfo=datetime.timezone.utc)  # 10:00 BRT
     trade_date = (start.date() - datetime.date(1970, 1, 1)).days
 
@@ -118,7 +125,7 @@ def default_config(seed=1, target_messages=20_000, out_dir=Path("data"), **overr
              settle=None, oi=None):
         low, high = _band(close, band_bps)
         return InstrumentConfig(name, sid, channel, segment, group, tick, lot, future, close,
-                                low, high, adtv, maxvol, settle, oi)
+                                low, high, adtv, maxvol, settle, oi, band_bps)
 
     instruments = (
         # WIN: tick 5 points; DOL: tick 0.5; equities: tick 0.01. Prices x10^-4.
@@ -153,6 +160,7 @@ class ScenarioResult:
     feed_b_path: Path
     manifest_path: Path
     manifest: dict
+    run_config: RunConfig = None  # the config the run actually used
 
 
 SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS + \
@@ -162,14 +170,58 @@ EXTENDED_BLOCK = 8                # schema evolution: bytes added to the root bl
 EXTENDED_VERSION = 18
 UNKNOWN_TEMPLATE = 999
 DAY_NS = 86_400 * 1_000_000_000
-START_OF_DAY_NS = 2_500_000_000   # stream up this long before the session: 3 heartbeats
+START_OF_DAY_HEARTBEATS = 2.5     # stream up this many heartbeat intervals early: 3 heartbeats
+START_OF_DAY_NS = int(START_OF_DAY_HEARTBEATS * 1_000_000_000)  # at the default 1 s
 
 
-def run(config):
-    """Feed A, intent log and book key in out_dir."""
+def start_of_day_ns(config):
+    return int(START_OF_DAY_HEARTBEATS * config.heartbeat_ns)
+
+
+def run(config, stream=True):
+    """Feed A, intent log and book key in out_dir. stream=False holds
+    everything in memory and writes at the end (the reference the streamed
+    files are tested against)."""
+    if stream:
+        result, _, _, _ = _generate(config, stream=True)
+        return result
     result, published, packetized, checkpoints = _generate(config)
     _write(config, result, published, packetized, checkpoints, packetized.packets)
     return result
+
+
+def build_set(config, name):
+    """A standard set (small, large, burst): run() plus Feed B and a
+    manifest, in out_dir/name."""
+    config = dataclasses.replace(config, out_dir=Path(config.out_dir) / name, idle=None,
+                                 resets=(), injections=())
+    result, _, packetized, _ = _generate(config, stream=True)
+    feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b)
+    return _finish_feeds(config, name, result, packetized, feeds, unreliable={})
+
+
+def _finish_feeds(config, name, result, packetized, feeds, unreliable, extra=None):
+    """Feed B and the manifest (Feed A, intent log and book key are written)."""
+    out = Path(config.out_dir)
+    feed_b_path = out / "feedB.pcap"
+    pcap.write_pcap(feed_b_path, feeds.b, channel_map=config.channel_map_b,
+                    src_ip=config.src_ip, src_port=config.src_port)
+    params = {"feed_b": dataclasses.asdict(config.feed_b), "loss": None, "gap": None,
+              "idle": None, "gap_packets": None}
+    params.update((extra or {}).pop("params", {}))
+    manifest = {"scenario": name, "seed": config.seed,
+                "target_messages": config.target_messages,
+                "messages": result.messages, "heartbeats": result.heartbeats,
+                "params": params,
+                "missing": {"A": [list(k) for k in feeds.missing_a],
+                            "B": [list(k) for k in feeds.missing_b]},
+                "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())},
+                "resets": [_reset_record(r, packetized) for r in result.resets],
+                "injections": [_injection_record(r, packetized) for r in result.injections]}
+    manifest.update(extra or {})
+    manifest_path = out / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+    return ScenarioResult(result, feed_b_path, manifest_path, manifest, config)
 
 
 def run_scenario(config, name):
@@ -177,8 +229,8 @@ def run_scenario(config, name):
     if name not in SCENARIOS:
         raise ValueError(f"unknown scenario {name!r}; one of {SCENARIOS}")
     if name == "idle" and config.idle is None:
-        config = dataclasses.replace(
-            config, idle=scenarios.IdleParams(after_messages=config.target_messages // 2))
+        config = dataclasses.replace(config, idle=scenarios.IdleParams(
+            after_messages=config.target_messages // 2, duration_ns=config.idle_ns))
     elif name != "idle":
         config = dataclasses.replace(config, idle=None)
     if name in scenarios.RESET_KINDS:
@@ -205,68 +257,79 @@ def run_scenario(config, name):
     faults, lost = None, []
     if name == "malformed":
         packetized, faults, lost = scenarios.malform(packetized, config.seed)
-    chosen = [scenarios.single_instrument_packet(packetized, published)] \
-        if name == "gap_one" else []
+    try:
+        chosen = [scenarios.single_instrument_packet(packetized, published)] \
+            if name == "gap_one" else []
+    except ValueError as e:
+        raise scenarios.ScenarioError(f"scenario gap_one: {e}; raise the message target") from e
     feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b,
                                   loss=loss, gap=gap, gap_positions=chosen)
+    _require_scenario(name, config, result, feeds)
     _write(config, result, published, packetized, checkpoints, feeds.a)
-    out = Path(config.out_dir)
-    feed_b_path = out / "feedB.pcap"
-    pcap.write_pcap(feed_b_path, feeds.b, channel_map=config.channel_map_b,
-                    src_ip=config.src_ip, src_port=config.src_port)
     unreliable = scenarios.unreliable_books(feeds.gap_positions, packetized, published,
                                             on_channel)
     if lost:
         unreliable = scenarios.unreliable_from_lost(lost, packetized, published, on_channel)
-    params = {"feed_b": dataclasses.asdict(config.feed_b),
-              "loss": dataclasses.asdict(loss) if loss else None,
-              "gap": dataclasses.asdict(gap) if gap else None,
-              "idle": dataclasses.asdict(config.idle) if config.idle else None,
-              "gap_packets": [list(k) for k in feeds.missing_b] if chosen else None}
-    manifest = {"scenario": name, "seed": config.seed, "params": params,
-                "missing": {"A": [list(k) for k in feeds.missing_a],
-                            "B": [list(k) for k in feeds.missing_b]},
-                "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())},
-                "resets": [_reset_record(r, packetized) for r in result.resets],
-                "injections": [_injection_record(r, packetized) for r in result.injections]}
+    extra = {"params": {"loss": dataclasses.asdict(loss) if loss else None,
+                        "gap": dataclasses.asdict(gap) if gap else None,
+                        "idle": dataclasses.asdict(config.idle) if config.idle else None,
+                        "gap_packets": [list(k) for k in feeds.missing_b] if chosen else None}}
     if faults is not None:
-        manifest["faults"] = faults
-        manifest["expected_client_behavior"] = (
+        extra["faults"] = faults
+        extra["expected_client_behavior"] = (
             "Process the complete messages before the fault, discard the rest of the "
             "packet, carry on with sequencing. A datagram shorter than the 16-byte packet "
             "header is discarded and uses up no sequence number.")
     if name == "schema":
-        manifest["expected_client_behavior"] = (
+        extra["expected_client_behavior"] = (
             "Decode the known fields using the header's blockLength and version, skip the "
             "extra root-block bytes, skip unknown templates by messageLength. The book "
             "still matches the book key.")
-    manifest_path = out / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
-    return ScenarioResult(result, feed_b_path, manifest_path, manifest)
+    return _finish_feeds(config, name, result, packetized, feeds, unreliable, extra)
+
+
+def _require_scenario(name, config, result, feeds):
+    """A scenario that placed nothing would pass its tests vacuously."""
+    def fail(what):
+        raise scenarios.ScenarioError(
+            f"scenario {name}: {what} with a target of {config.target_messages} messages; "
+            f"raise the message target")
+    if name == "loss" and not feeds.missing_a:
+        fail("no packet was lost (burst_rate too low for so few packets)")
+    if name == "gap" and not feeds.missing_b:
+        fail("no packet was dropped (burst_rate too low for so few packets)")
+    if name == "idle" and not result.heartbeats:
+        fail("the pause produced no heartbeats")
 
 
 def _injections(name, config):
-    """The one-off actions of the 7c scenarios, at half the target."""
+    """The one-off actions of the 7c scenarios, at half the target. Targets
+    come from the config's instruments: the first one (WIN by default) for
+    the sweep, TradeBust and News, the first one on another channel (PETR4)
+    for the mass cancels, the last channel (70) for market-wide News."""
     half = config.target_messages // 2
-    by_name = {i.name: i for i in config.instruments}
+    insts = config.instruments
+    first = insts[0]
+    other = next((i for i in insts if i.channel != first.channel), insts[-1])
+    last_channel = max(i.channel for i in insts)
     inject = scenarios.Inject
     if name == "edge":
-        return (inject("mass_cancel", half, (("instrument", "PETR4"), ("side", eng.BUY))),
-                inject("mass_cancel", half, (("instrument", "PETR4"), ("side", eng.SELL))),
-                inject("sweep", half, (("instrument", "WIN"), ("side", eng.BUY),
+        return (inject("mass_cancel", half, (("instrument", other.name), ("side", eng.BUY))),
+                inject("mass_cancel", half, (("instrument", other.name), ("side", eng.SELL))),
+                inject("sweep", half, (("instrument", first.name), ("side", eng.BUY),
                                        ("orders", 30))))
     if name == "rare":
-        return (inject("trade_bust", half, (("instrument", "WIN"),)),
-                inject("news", half, (("channel", by_name["WIN"].channel),
-                                      ("instrument", "WIN"), ("text_bytes", 300),
+        return (inject("trade_bust", half, (("instrument", first.name),)),
+                inject("news", half, (("channel", first.channel),
+                                      ("instrument", first.name), ("text_bytes", 300),
                                       ("part_size", 1000), ("spread", 0))),
-                inject("news", half + 10, (("channel", 70), ("instrument", None),
+                inject("news", half + 10, (("channel", last_channel), ("instrument", None),
                                            ("text_bytes", 3000), ("part_size", 1000),
                                            ("spread", 40))))
     if name == "schema":
         return (inject("extend", half, (("count", 3),)),
-                inject("news", half, (("channel", by_name["WIN"].channel),
-                                      ("instrument", "WIN"), ("text_bytes", 200),
+                inject("news", half, (("channel", first.channel),
+                                      ("instrument", first.name), ("text_bytes", 200),
                                       ("part_size", 1000), ("spread", 0),
                                       ("block_extra", EXTENDED_BLOCK),
                                       ("version", EXTENDED_VERSION))),
@@ -306,7 +369,31 @@ def _reset_record(reset, packetized):
     return out
 
 
-def _generate(config):
+class _Messages:
+    """Published messages by tag (0, 1, 2, ...). Kept as a list in memory, or
+    as a dict the streaming writer empties as packets go out."""
+
+    def __init__(self, keep):
+        self.items = [] if keep else {}
+        self.n = 0
+
+    def add(self, m):
+        tag = self.n
+        if isinstance(self.items, list):
+            self.items.append(m)
+        else:
+            self.items[tag] = m
+        self.n += 1
+        return tag
+
+    def __len__(self):
+        return self.n
+
+
+def _generate(config, stream=False):
+    """One session. stream=True writes Feed A and the intent log while it
+    runs (and the book key at the end) and returns Packetized with the
+    packets kept for Feed B and placements as a PlacementTable."""
     insts = config.instruments
     engine = Engine([(i.name, i.tick, i.lot, i.segment) for i in insts])
     publisher = Publisher([Instrument(i.name, i.security_id, i.channel, i.segment,
@@ -315,9 +402,17 @@ def _generate(config):
                                      i.prev_close) for i in insts],
                      config.flow, config.seed, config.start_ns)
     channels = sorted({i.channel for i in insts})
-    packetizer = Packetizer(channels, config.start_ns, window_ns=config.window_ns)
+    published = _Messages(keep=not stream)
+    writer = None
+    if stream:
+        Path(config.out_dir).mkdir(parents=True, exist_ok=True)
+        writer = golden.StreamWriter(config.out_dir, published.items, config.channel_map,
+                                     config.src_ip, config.src_port)
+    packetizer = Packetizer(channels, config.start_ns, window_ns=config.window_ns,
+                            heartbeat_ns=config.heartbeat_ns, sink=writer)
+    last_trade = {}          # instrument -> its latest Published Trade, with its tag
+    message_times = []       # (channel, time_ns) per message, when record=True
 
-    published = []
     checkpoints = []
     cleared = set()  # instruments a ChannelReset emptied, not rebuilt yet
     last_tag_on_channel = {}
@@ -327,10 +422,13 @@ def _generate(config):
         """Packetize one event and take a book key checkpoint every N
         events, or now if asked."""
         for m in messages:
-            tag = len(published)
-            published.append(m)
+            tag = published.add(m)
             packetizer.add(m.time_ns, m.channel, m.data, tag)
             last_tag_on_channel[m.channel] = tag
+            if m.template_id == T_TRADE:
+                last_trade[m.instrument] = (tag, m)
+            if config.record:
+                message_times.append((m.channel, m.time_ns))
         state["events"] += 1
         if checkpoint or state["events"] % config.book_key_every == 0:
             # A correct client holds an empty book between a ChannelReset
@@ -366,8 +464,9 @@ def _generate(config):
 
     def sequence_reset(t, channel, log):
         m = publisher.sequence_reset(t, channel)
-        tag = len(published)
-        published.append(m)
+        tag = published.add(m)
+        if config.record:
+            message_times.append((m.channel, m.time_ns))
         packetizer.bump_version(t, channel, final_message=m.data, final_tag=tag)
         last_tag_on_channel[channel] = tag
         log["sequence_reset_tags"][channel] = tag
@@ -380,7 +479,7 @@ def _generate(config):
             emit([m])
         start = config.start_ns + (log["trade_date_before"] - config.trade_date + days) * DAY_NS
         for c in channels:
-            packetizer.stream_down(t, c, start - START_OF_DAY_NS)
+            packetizer.stream_down(t, c, start - start_of_day_ns(config))
         flow.pause(start - t)
         if at_start:
             at_start(start)
@@ -388,7 +487,7 @@ def _generate(config):
         new_values = {}
         for i in insts:
             close = publisher.closing_price(i.name)
-            low, high = _band(close, config.band_bps)
+            low, high = _band(close, i.band_bps)
             new_values[i.name] = dataclasses.replace(
                 values[i.name], prev_close=close, low_limit=low, high_limit=high,
                 settlement_price=close if i.is_future else None,
@@ -435,6 +534,9 @@ def _generate(config):
 
             weekly = reset.kind == "weekly_start"
             t = next_session(t, 3 if weekly else 1, log, start_up if weekly else None)
+        if reset.kind != "session_change" and not log["rebuild_tags"]:
+            raise scenarios.ScenarioError(
+                f"{reset.kind}: no book to rebuild at message {first}; raise the message target")
         log["tags"] = list(range(first, len(published)))
         reset_log.append(log)
         return t
@@ -459,19 +561,31 @@ def _generate(config):
         log = {"kind": item.kind, "time_ns": t, **{k: v for k, v in args.items()}}
         first = len(published)
         if item.kind == "mass_cancel":
-            emit(publisher.publish(submit(args["instrument"],
-                                          eng.MassCancel(t, args["side"]))))
+            outcome = submit(args["instrument"], eng.MassCancel(t, args["side"]))
+            if not outcome.orders:
+                raise scenarios.ScenarioError(
+                    f"mass_cancel: {args['instrument']} has no {args['side']} orders at "
+                    f"message {len(published)}; raise the message target")
+            emit(publisher.publish(outcome))
         elif item.kind == "sweep":
             opposite = eng.SELL if args["side"] == eng.BUY else eng.BUY
             book = [o for o in engine.books[args["instrument"]].resting_orders()
                     if o.side == opposite][:args["orders"]]
             log["orders_hit"] = len(book)
+            if len(book) < args["orders"]:
+                raise scenarios.ScenarioError(
+                    f"sweep: {args['instrument']} has {len(book)} of the {args['orders']} "
+                    f"{opposite} orders it needs at message {len(published)}; "
+                    f"raise the message target")
             emit(publisher.publish(submit(args["instrument"], eng.MarketOrder(
                 t, args["side"], sum(o.qty for o in book), firm=1))))
         elif item.kind == "trade_bust":
-            trade = next(m for m in reversed(published) if m.template_id == T_TRADE
-                         and m.instrument == args["instrument"])
-            log["trade_tags"] = [published.index(trade)]
+            if args["instrument"] not in last_trade:
+                raise scenarios.ScenarioError(
+                    f"trade_bust: {args['instrument']} has not traded by message "
+                    f"{len(published)}; raise the message target")
+            tag, trade = last_trade[args["instrument"]]
+            log["trade_tags"] = [tag]
             emit(publisher.trade_bust(t, trade))
         elif item.kind == "news":
             news_id = len(injection_log) + 1
@@ -560,8 +674,24 @@ def _generate(config):
             emit(messages)
     for m in publisher.end_session(t):
         emit([m])
+    if pending:
+        item = pending[0][2]
+        kind = item[0] if isinstance(item, tuple) else item.kind
+        raise scenarios.ScenarioError(
+            f"{kind} due at message {pending[0][0]} never placed: the target is "
+            f"{config.target_messages} messages; raise it")
+    if modify["extend"] or modify["unknown"]:
+        raise scenarios.ScenarioError(
+            "extend/unknown: no suitable live event after the injection point; "
+            "raise the message target")
 
     packetized = packetizer.finish(t)
+    if stream:
+        writer.close()
+        packetized = dataclasses.replace(packetized, packets=writer.packets,
+                                         placements=writer.placements)
+        golden.write_jsonl(Path(config.out_dir) / "book_key.jsonl",
+                           golden.book_key_rows(checkpoints, packetized))
     out = Path(config.out_dir)
     result = RunResult(
         pcap_path=out / "feedA.pcap", intent_path=out / "intent.jsonl",
@@ -572,9 +702,9 @@ def _generate(config):
         final_resting={i.name: len(engine.books[i.name].resting_orders()) for i in insts},
         arrivals=arrivals,
         regimes=list(flow.clock.segments) if config.record else [],
-        message_times=[(m.channel, m.time_ns) for m in published] if config.record else [],
+        message_times=message_times,
         resets=reset_log, injections=injection_log)
-    return result, published, packetized, checkpoints
+    return result, published.items, packetized, checkpoints
 
 
 def _write(config, result, published, packetized, checkpoints, feed_a):

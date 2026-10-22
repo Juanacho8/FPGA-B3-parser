@@ -10,7 +10,7 @@ Five layers, each feeding the next:
     (intents) (book + fills) (B3 messages + keys) (packets) (pcap files)
 
 Support modules: layouts, encode (wire format), golden (answer keys),
-scenarios, config, main (CLI).
+scenarios, config (TOML file), main (wiring), cli (python -m b3gen).
 
 See docs/FEED_GENERATOR_CONTEXT.md section 4.
 """

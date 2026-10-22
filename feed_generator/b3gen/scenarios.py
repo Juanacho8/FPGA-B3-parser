@@ -90,6 +90,11 @@ class IdleParams:
     duration_ns: int = 3_500_000_000     # long enough for 3 heartbeats per channel
 
 
+class ScenarioError(ValueError):
+    """A scenario could not place what it promises (usually: the message
+    target is too small)."""
+
+
 RESET_KINDS = ("failover", "channel_reset", "instrument_reset", "session_change",
                "weekly_start")
 

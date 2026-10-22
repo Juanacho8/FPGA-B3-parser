@@ -101,6 +101,33 @@ def pcap_bytes(packets, *, channel_map, src_ip, src_port, ttl=DEFAULT_TTL,
     return b"".join(out)
 
 
+class PcapWriter:
+    """Writes the same file as write_pcap, one packet at a time."""
+
+    def __init__(self, path, *, channel_map, src_ip, src_port, ttl=DEFAULT_TTL,
+                 src_mac=DEFAULT_SRC_MAC):
+        self._f = open(path, "wb")
+        self._f.write(struct.pack("<IHHiIII", PCAP_MAGIC_NS, *PCAP_VERSION, 0, 0, SNAPLEN,
+                                  LINKTYPE_ETHERNET))
+        self._args = dict(src_ip=src_ip, src_port=src_port, ttl=ttl, src_mac=src_mac)
+        self._channel_map = channel_map
+        self._ip_id = 0
+
+    def write(self, time_ns, channel, payload):
+        if channel not in self._channel_map:
+            raise ValueError(f"channel {channel} has no multicast group in channel_map")
+        group, port = self._channel_map[channel]
+        frame = build_frame(payload, dst_ip=group, dst_port=port, ip_id=self._ip_id,
+                            **self._args)
+        self._ip_id += 1
+        seconds, nanoseconds = divmod(time_ns, 1_000_000_000)
+        self._f.write(struct.pack("<IIII", seconds, nanoseconds, len(frame), len(frame)))
+        self._f.write(frame)
+
+    def close(self):
+        self._f.close()
+
+
 def write_pcap(path, packets, *, channel_map, src_ip, src_port, ttl=DEFAULT_TTL,
                src_mac=DEFAULT_SRC_MAC):
     """Write packets [(time_ns, channel, payload)] to a pcap file."""
