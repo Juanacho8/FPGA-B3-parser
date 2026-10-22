@@ -6,7 +6,8 @@ its own live orders, and occasional small market and IOC orders. Sizes are
 lot multiples, prices stay inside the session's PriceBand.
 
 Timing is bursty: each instrument's arrivals are a Poisson process whose
-rate depends on a market-wide regime (calm or busy). Regime switches come
+rate depends on a market-wide regime (calm, busy, or a short spike of a few
+ms dense enough that packets fill before the 5 us window). Regime switches come
 from their own RNG, random.Random(f"{seed}:regime"), and nothing else uses
 it; each instrument has its own random.Random(f"{seed}:{name}") for its
 arrivals and decisions, and its own rate in each regime.
@@ -26,14 +27,18 @@ from b3gen import engine
 
 CALM = "calm"
 BUSY = "busy"
+SPIKE = "spike"
+REGIMES = (CALM, BUSY, SPIKE)
 SECOND = 1_000_000_000
 
 
 @dataclass(frozen=True)
 class FlowParams:
-    rates: dict                       # instrument -> (calm rate, busy rate), arrivals/s
+    rates: dict                       # instrument -> (calm, busy, spike) rates, arrivals/s
     calm_mean_ns: int = 2 * SECOND    # mean regime durations
     busy_mean_ns: int = SECOND // 2
+    spike_mean_ns: int = 1_000_000
+    spike_every_ns: int = SECOND      # mean calm/busy time between spikes
     # Instruction mix (normalized).
     p_new: float = 0.55
     p_cancel: float = 0.18            # at target_live_orders; scales with live orders
@@ -72,25 +77,41 @@ class Arrival:
 
 
 class RegimeClock:
-    """Market-wide calm/busy regimes. Switch times come only from this
-    clock's RNG, generated lazily in time order, so queries in any order
-    see the same timeline."""
+    """Market-wide regimes. Calm and busy alternate; spikes are a separate
+    Poisson process that interrupts either, after which the interrupted
+    regime resumes. Durations are exponential (memoryless), so resuming with
+    a fresh duration is the same as resuming the remainder. Switch times
+    come only from this clock's RNG, generated lazily in time order, so
+    queries in any order see the same timeline."""
 
-    def __init__(self, seed, start_ns, calm_mean_ns, busy_mean_ns):
+    def __init__(self, seed, start_ns, calm_mean_ns, busy_mean_ns, spike_mean_ns,
+                 spike_every_ns):
         self._rng = random.Random(f"{seed}:regime")
-        self._means = {CALM: calm_mean_ns, BUSY: busy_mean_ns}
+        self._means = {CALM: calm_mean_ns, BUSY: busy_mean_ns, SPIKE: spike_mean_ns}
+        self._spike_every_ns = spike_every_ns
+        self._next = None  # regime after the last segment
         self.segments = []  # (start_ns, end_ns, regime), contiguous
         self._extend(start_ns, CALM)
 
+    def _draw(self, mean):
+        return max(1, round(self._rng.expovariate(1 / mean)))
+
     def _extend(self, start_ns, regime):
-        duration = max(1, round(self._rng.expovariate(1 / self._means[regime])))
+        duration = self._draw(self._means[regime])
+        if regime == SPIKE:
+            self._next = self._resume
+        else:
+            spike_in = self._draw(self._spike_every_ns)
+            if spike_in < duration:
+                duration, self._next, self._resume = spike_in, SPIKE, regime
+            else:
+                self._next = BUSY if regime == CALM else CALM
         self.segments.append((start_ns, start_ns + duration, regime))
 
     def at(self, t):
         """(regime, segment end) for time t."""
         while self.segments[-1][1] <= t:
-            _, end, regime = self.segments[-1]
-            self._extend(end, BUSY if regime == CALM else CALM)
+            self._extend(self.segments[-1][1], self._next)
         lo, hi = 0, len(self.segments) - 1
         while lo < hi:  # last segment starting at or before t
             mid = (lo + hi + 1) // 2
@@ -133,7 +154,9 @@ class _LiveOrders:
 class _InstrumentFlow:
     def __init__(self, inst, rates, params, seed, clock, start_ns):
         self.inst = inst
-        self.rates = {CALM: rates[0], BUSY: rates[1]}
+        if len(rates) != len(REGIMES):
+            raise ValueError(f"{inst.name}: rates must be (calm, busy, spike)")
+        self.rates = dict(zip(REGIMES, rates))
         self.p = params
         self.rng = random.Random(f"{seed}:{inst.name}")
         self.clock = clock
@@ -332,7 +355,8 @@ class OrderFlow:
         missing = {i.name for i in instruments} - set(params.rates)
         if missing:
             raise ValueError(f"no arrival rates for {sorted(missing)}")
-        self.clock = RegimeClock(seed, start_ns, params.calm_mean_ns, params.busy_mean_ns)
+        self.clock = RegimeClock(seed, start_ns, params.calm_mean_ns, params.busy_mean_ns,
+                                 params.spike_mean_ns, params.spike_every_ns)
         self.flows = {i.name: _InstrumentFlow(i, params.rates[i.name], params, seed,
                                               self.clock, start_ns) for i in instruments}
         self._order = {i.name: n for n, i in enumerate(instruments)}
