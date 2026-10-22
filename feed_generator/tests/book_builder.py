@@ -19,6 +19,9 @@ apply_packet() adds the client-side sequencing and reset rules
 * ChannelReset clears every book on its channel; EmptyBook clears one.
 * rptSeq is previous + 1 per instrument, or 1 on the message after an
   EmptyBook.
+* Unknown templates are skipped; a datagram too short for a packet header is
+  discarded. Callers pass only the complete messages before a packet fault
+  (tests/wire.py split_messages).
 """
 
 import sbe_decoder
@@ -36,10 +39,14 @@ class BookBuilder:
         self.channels = {}  # channel -> {"version", "next", "reset", "sids"}
         self.rpt_seq = {}   # securityID -> last rptSeq (0 after EmptyBook)
 
-    def apply_packet(self, channel, version, seq, messages, after=None, before=None):
+    def apply_packet(self, channel, version, seq, messages, after=None, before=None,
+                     skip=None):
         """One packet with the client's sequencing and reset rules.
         before(index) / after(index) run around each message (checkpoints
-        can fall mid-packet)."""
+        can fall mid-packet); a message for which skip(index, data) is true
+        is not applied (a book the caller no longer trusts)."""
+        if version is None:
+            return  # a datagram too short for a packet header: discarded
         ch = self.channels.setdefault(channel, {"version": None, "next": None,
                                                 "reset": False, "sids": set()})
         templates = [sbe_decoder.decode(m)[0]["templateId"] for m in messages]
@@ -61,7 +68,8 @@ class BookBuilder:
         for index, data in enumerate(messages):
             if before:
                 before(index)
-            self.apply(data, channel)
+            if not (skip and skip(index, data)):
+                self.apply(data, channel)
             if after:
                 after(index)
 
@@ -69,6 +77,8 @@ class BookBuilder:
         """One message. With a channel (apply_packet), also the reset and
         rptSeq rules."""
         header, f = sbe_decoder.decode(data)
+        if f is None:
+            return  # unknown template
         template = header["templateId"]
         if channel is not None:
             self._client_rules(template, f, channel)

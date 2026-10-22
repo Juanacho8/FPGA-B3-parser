@@ -23,16 +23,20 @@ See docs/FEED_GENERATOR_CONTEXT.md sections 4 and 11.
 
 import dataclasses
 import datetime
+import heapq
+import itertools
 import json
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from b3gen import golden, pcap, scenarios
+from b3gen import engine as eng
 from b3gen.engine import Engine
 from b3gen.flow import FlowInstrument, FlowParams, OrderFlow
 from b3gen.packet import Packetizer
-from b3gen.publisher import Instrument, Publisher, SessionValues
+from b3gen.publisher import T_TRADE, Instrument, Publisher, SessionValues
 
 
 @dataclass(frozen=True)
@@ -75,7 +79,8 @@ class RunConfig:
     loss: scenarios.BurstParams = scenarios.BurstParams(0.01, 3)
     gap: scenarios.BurstParams = scenarios.BurstParams(0.001, 2)
     idle: scenarios.IdleParams | None = None  # pause the flow once (idle scenario)
-    resets: tuple = ()            # scenarios.Reset, in after_messages order
+    resets: tuple = ()            # scenarios.Reset
+    injections: tuple = ()        # scenarios.Inject
 
 
 @dataclass
@@ -96,6 +101,7 @@ class RunResult:
     # Flow time: regimes do not move with an idle pause.
     message_times: list = field(default_factory=list)  # (channel, time_ns) per published message, when record=True
     resets: list = field(default_factory=list)    # one dict per reset applied (tags, not placements)
+    injections: list = field(default_factory=list)  # one dict per injection (tags, not placements)
 
 
 def _band(price, bps):
@@ -149,7 +155,12 @@ class ScenarioResult:
     manifest: dict
 
 
-SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS
+SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS + \
+    ("edge", "rare", "schema", "malformed")
+MALFORMED_MESSAGES = 1500         # the malformed file is small
+EXTENDED_BLOCK = 8                # schema evolution: bytes added to the root block
+EXTENDED_VERSION = 18
+UNKNOWN_TEMPLATE = 999
 DAY_NS = 86_400 * 1_000_000_000
 START_OF_DAY_NS = 2_500_000_000   # stream up this long before the session: 3 heartbeats
 
@@ -180,11 +191,20 @@ def run_scenario(config, name):
                                          trade_date=config.trade_date - 3)
     else:
         config = dataclasses.replace(config, resets=())
+    config = dataclasses.replace(config, injections=_injections(name, config))
+    if name == "malformed":
+        config = dataclasses.replace(config, target_messages=MALFORMED_MESSAGES)
     config = dataclasses.replace(config, out_dir=Path(config.out_dir) / name)
     loss = config.loss if name == "loss" else None
     gap = config.gap if name == "gap" else None
 
     result, published, packetized, checkpoints = _generate(config)
+    on_channel = {}
+    for i in config.instruments:
+        on_channel.setdefault(i.channel, []).append(i.name)
+    faults, lost = None, []
+    if name == "malformed":
+        packetized, faults, lost = scenarios.malform(packetized, config.seed)
     chosen = [scenarios.single_instrument_packet(packetized, published)] \
         if name == "gap_one" else []
     feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b,
@@ -194,11 +214,10 @@ def run_scenario(config, name):
     feed_b_path = out / "feedB.pcap"
     pcap.write_pcap(feed_b_path, feeds.b, channel_map=config.channel_map_b,
                     src_ip=config.src_ip, src_port=config.src_port)
-    on_channel = {}
-    for i in config.instruments:
-        on_channel.setdefault(i.channel, []).append(i.name)
     unreliable = scenarios.unreliable_books(feeds.gap_positions, packetized, published,
                                             on_channel)
+    if lost:
+        unreliable = scenarios.unreliable_from_lost(lost, packetized, published, on_channel)
     params = {"feed_b": dataclasses.asdict(config.feed_b),
               "loss": dataclasses.asdict(loss) if loss else None,
               "gap": dataclasses.asdict(gap) if gap else None,
@@ -208,10 +227,70 @@ def run_scenario(config, name):
                 "missing": {"A": [list(k) for k in feeds.missing_a],
                             "B": [list(k) for k in feeds.missing_b]},
                 "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())},
-                "resets": [_reset_record(r, packetized) for r in result.resets]}
+                "resets": [_reset_record(r, packetized) for r in result.resets],
+                "injections": [_injection_record(r, packetized) for r in result.injections]}
+    if faults is not None:
+        manifest["faults"] = faults
+        manifest["expected_client_behavior"] = (
+            "Process the complete messages before the fault, discard the rest of the "
+            "packet, carry on with sequencing. A datagram shorter than the 16-byte packet "
+            "header is discarded and uses up no sequence number.")
+    if name == "schema":
+        manifest["expected_client_behavior"] = (
+            "Decode the known fields using the header's blockLength and version, skip the "
+            "extra root-block bytes, skip unknown templates by messageLength. The book "
+            "still matches the book key.")
     manifest_path = out / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     return ScenarioResult(result, feed_b_path, manifest_path, manifest)
+
+
+def _injections(name, config):
+    """The one-off actions of the 7c scenarios, at half the target."""
+    half = config.target_messages // 2
+    by_name = {i.name: i for i in config.instruments}
+    inject = scenarios.Inject
+    if name == "edge":
+        return (inject("mass_cancel", half, (("instrument", "PETR4"), ("side", eng.BUY))),
+                inject("mass_cancel", half, (("instrument", "PETR4"), ("side", eng.SELL))),
+                inject("sweep", half, (("instrument", "WIN"), ("side", eng.BUY),
+                                       ("orders", 30))))
+    if name == "rare":
+        return (inject("trade_bust", half, (("instrument", "WIN"),)),
+                inject("news", half, (("channel", by_name["WIN"].channel),
+                                      ("instrument", "WIN"), ("text_bytes", 300),
+                                      ("part_size", 1000), ("spread", 0))),
+                inject("news", half + 10, (("channel", 70), ("instrument", None),
+                                           ("text_bytes", 3000), ("part_size", 1000),
+                                           ("spread", 40))))
+    if name == "schema":
+        return (inject("extend", half, (("count", 3),)),
+                inject("news", half, (("channel", by_name["WIN"].channel),
+                                      ("instrument", "WIN"), ("text_bytes", 200),
+                                      ("part_size", 1000), ("spread", 0),
+                                      ("block_extra", EXTENDED_BLOCK),
+                                      ("version", EXTENDED_VERSION))),
+                inject("unknown", half, (("template_id", UNKNOWN_TEMPLATE),
+                                         ("body_bytes", 20))))
+    return ()
+
+
+def _news_text(rng, size):
+    words = ["mercado", "ajuste", "vencimento", "leilao", "negociacao", "contrato",
+             "indice", "taxa", "liquidacao", "circuit", "breaker", "B3", "aviso"]
+    text = ""
+    while len(text) < size:
+        text += rng.choice(words) + " "
+    return text[:size]
+
+
+def _injection_record(inj, packetized):
+    def at(tag):
+        return golden.placement_key(packetized.placements[tag])
+    out = {k: v for k, v in inj.items() if not k.endswith("tags")}
+    for key in [k for k in inj if k.endswith("tags")]:
+        out[key[:-4] + "placements"] = [at(tag) for tag in inj[key]]
+    return out
 
 
 def _reset_record(reset, packetized):
@@ -360,7 +439,90 @@ def _generate(config):
         reset_log.append(log)
         return t
 
-    pending = sorted(config.resets, key=lambda r: r.after_messages)
+    injection_log = []
+    pending = []  # heap of (after_messages, order, action)
+    order = itertools.count()
+    for item in (*config.resets, *config.injections):
+        heapq.heappush(pending, (item.after_messages, next(order), item))
+    modify = {"extend": 0, "unknown": None}  # applied to the next live events
+    news_rng = random.Random(f"{config.seed}:news")
+
+    def submit(name, instruction):
+        instructions[type(instruction).__name__] += 1
+        outcome = engine.submit(name, instruction)
+        outcomes[type(outcome).__name__] += 1
+        flow.on_outcome(outcome)
+        return outcome
+
+    def inject(item, t):
+        args = item.params
+        log = {"kind": item.kind, "time_ns": t, **{k: v for k, v in args.items()}}
+        first = len(published)
+        if item.kind == "mass_cancel":
+            emit(publisher.publish(submit(args["instrument"],
+                                          eng.MassCancel(t, args["side"]))))
+        elif item.kind == "sweep":
+            opposite = eng.SELL if args["side"] == eng.BUY else eng.BUY
+            book = [o for o in engine.books[args["instrument"]].resting_orders()
+                    if o.side == opposite][:args["orders"]]
+            log["orders_hit"] = len(book)
+            emit(publisher.publish(submit(args["instrument"], eng.MarketOrder(
+                t, args["side"], sum(o.qty for o in book), firm=1))))
+        elif item.kind == "trade_bust":
+            trade = next(m for m in reversed(published) if m.template_id == T_TRADE
+                         and m.instrument == args["instrument"])
+            log["trade_tags"] = [published.index(trade)]
+            emit(publisher.trade_bust(t, trade))
+        elif item.kind == "news":
+            news_id = len(injection_log) + 1
+            parts = publisher.news_parts(
+                t, args["channel"], args["instrument"], news_id,
+                f"Aviso {news_id}", _news_text(news_rng, args["text_bytes"]),
+                args["part_size"], block_extra=args.get("block_extra", 0),
+                version=args.get("version"))
+            log.update(newsID=news_id, part_count=len(parts), part_tags=[])
+            for k, part in enumerate(parts):
+                if k and args["spread"]:
+                    # Later parts go out after live traffic, at their own time.
+                    heapq.heappush(pending, (len(published) + k * args["spread"],
+                                             next(order), ("news_part", part, log)))
+                else:
+                    log["part_tags"].append(len(published))
+                    emit(part)
+        elif item.kind == "extend":
+            modify["extend"] = args["count"]
+            log["event_tags"] = []
+        elif item.kind == "unknown":
+            body = bytes(news_rng.randrange(256) for _ in range(args["body_bytes"]))
+            modify["unknown"] = (args["template_id"], body, log)
+        if item.kind not in ("extend", "unknown", "news"):
+            log["event_tags"] = list(range(first, len(published)))
+        if item.kind == "extend":
+            modify["extend_log"] = log
+        injection_log.append(log)
+
+    def news_part(part, log, t):
+        log["part_tags"].append(len(published))
+        # Sent when its turn comes: only the send time moves (origTime and
+        # the bytes stay the News's own).
+        emit([dataclasses.replace(m, time_ns=t) for m in part])
+
+    def publish_live(outcome, t):
+        kind = type(outcome)
+        if modify["extend"] and kind is eng.Rested:
+            modify["extend"] -= 1
+            modify["extend_log"]["event_tags"].append(len(published))
+            return publisher.publish(outcome, block_extra=EXTENDED_BLOCK,
+                                     version=EXTENDED_VERSION)
+        messages = publisher.publish(outcome)
+        if modify["unknown"] and len(messages) >= 2:
+            template_id, body, log = modify["unknown"]
+            modify["unknown"] = None
+            unknown = Publisher.unknown(messages[0].time_ns, messages[0].channel,
+                                        template_id, body, EXTENDED_VERSION)
+            log["message_tags"] = [len(published) + 1]
+            return [messages[0], unknown, *messages[1:]]
+        return messages
 
     outcomes = Counter()
     instructions = Counter()
@@ -370,8 +532,14 @@ def _generate(config):
     t = config.start_ns
     paused = config.idle is None
     while len(published) < config.target_messages:
-        if pending and len(published) >= pending[0].after_messages:
-            t = apply_reset(pending.pop(0), t)
+        while pending and len(published) >= pending[0][0]:
+            item = heapq.heappop(pending)[2]
+            if isinstance(item, scenarios.Reset):
+                t = apply_reset(item, t)
+            elif isinstance(item, tuple):
+                news_part(item[1], item[2], t)
+            else:
+                inject(item, t)
         if not paused and len(published) >= config.idle.after_messages:
             # Shift the arrival clock before the engine, so every time on
             # the wire (transactTime, insert times, sendingTime) moves together.
@@ -384,13 +552,10 @@ def _generate(config):
         streak[name] = streak[name] + 1 if not (top[0] and top[1]) else 0
         max_streak[name] = max(max_streak[name], streak[name])
         instruction = flow.decide(arrival, top)
-        instructions[type(instruction).__name__] += 1
         if config.record:
             arrivals.append((arrival, instruction))
-        outcome = engine.submit(name, instruction)
-        outcomes[type(outcome).__name__] += 1
-        flow.on_outcome(outcome)
-        messages = publisher.publish(outcome)
+        outcome = submit(name, instruction)
+        messages = publish_live(outcome, t)
         if messages:
             emit(messages)
     for m in publisher.end_session(t):
@@ -408,7 +573,7 @@ def _generate(config):
         arrivals=arrivals,
         regimes=list(flow.clock.segments) if config.record else [],
         message_times=[(m.channel, m.time_ns) for m in published] if config.record else [],
-        resets=reset_log)
+        resets=reset_log, injections=injection_log)
     return result, published, packetized, checkpoints
 
 

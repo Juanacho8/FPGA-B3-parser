@@ -8,31 +8,63 @@ import pcap_reader
 HEADER = struct.Struct("<BBHIQ")
 
 
+MESSAGE_HEADER = 12
+ENCODING_TYPE = 0xEB50
+
+
+def split_messages(payload):
+    """(complete messages, fault) for one UDP payload, as a client must
+    read it: header first, then messages by messageLength. fault is None or
+    (kind, byte offset); everything from the fault on is discarded. Never
+    loops: a messageLength under 12 (including 0) stops the walk."""
+    if len(payload) < HEADER.size:
+        return [], ("short", 0)
+    messages, pos = [], HEADER.size
+    while pos < len(payload):
+        if len(payload) - pos < MESSAGE_HEADER:
+            return messages, ("truncated", pos)
+        length, encoding = struct.unpack_from("<HH", payload, pos)
+        if length == 0:
+            return messages, ("length_zero", pos)
+        if length < MESSAGE_HEADER:
+            return messages, ("length_too_small", pos)
+        if encoding != ENCODING_TYPE:
+            return messages, ("bad_encoding", pos)
+        if pos + length > len(payload):
+            return messages, ("length_past_end", pos)
+        messages.append(payload[pos:pos + length])
+        pos += length
+    return messages, None
+
+
 def read_packets(pcap_path):
-    """[{"time", "channel", "version", "seq", "sending", "payload", "messages"}]
-    in file order, decoded from the pcap alone."""
+    """[{"time", "channel", "version", "seq", "sending", "payload", "messages",
+    "fault"}] in file order, decoded from the pcap alone. A datagram too
+    short for the packet header has channel, version, seq and sending None."""
     _, records = pcap_reader.read_pcap(Path(pcap_path).read_bytes())
     out = []
     for rec in records:
         payload = rec["payload"]
-        channel, _, version, seq, sending = HEADER.unpack_from(payload, 0)
-        messages, pos = [], HEADER.size
-        while pos < len(payload):
-            (length,) = struct.unpack_from("<H", payload, pos)
-            messages.append(payload[pos:pos + length])
-            pos += length
-        assert pos == len(payload)
+        messages, fault = split_messages(payload)
+        if fault and fault[0] == "short":
+            channel = version = seq = sending = None
+        else:
+            channel, _, version, seq, sending = HEADER.unpack_from(payload, 0)
         out.append({"time": rec["time_ns"], "channel": channel, "version": version,
                     "seq": seq, "sending": sending, "payload": payload,
-                    "messages": messages})
+                    "messages": messages, "fault": fault})
     return out
 
 
 def decode_wire(pcap_path):
     """Every message in the pcap, in wire order:
     [((channel, version, seq, index, sendingTime), message bytes)]."""
-    return [((p["channel"], p["version"], p["seq"], index, p["sending"]), data)
-            for p in read_packets(pcap_path) for index, data in enumerate(p["messages"])]
+    out = []
+    for p in read_packets(pcap_path):
+        assert p["fault"] is None, p["fault"]
+        out += [((p["channel"], p["version"], p["seq"], index, p["sending"]), data)
+                for index, data in enumerate(p["messages"])]
+    return out
 
 
 def top5(builder, security_id):

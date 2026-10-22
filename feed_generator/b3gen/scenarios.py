@@ -39,19 +39,37 @@ bump_version/stream_down):
 v1 rebuilds every instrument before live flow resumes (open item J).
 
 unreliable_books: after a packet missing from both feeds, a client's book is
-wrong for every instrument with a message in it, from that packet on (until
-a snapshot, v2). A message with no instrument (SecurityGroupPhase) makes
-every instrument on its channel unreliable.
+wrong for every instrument with a book message in it, from that packet on
+(until a snapshot, v2). Only channel-wide state messages (SecurityGroupPhase,
+ChannelReset, SequenceReset) make every instrument on the channel
+unreliable. News and unknown templates never make a book unreliable.
+
+Step 7c:
+* Inject: one-off actions main.py performs through the normal layers
+  (mass_cancel, sweep, trade_bust, news, extend, unknown).
+* malform: packet-level faults for the malformed file, one per packet, with
+  what a client must do: process the complete messages before the fault,
+  discard the rest of the packet, carry on with sequencing.
 
 Must not: bypass the layers; scenarios drive the normal pipeline or apply
 documented packet-level faults.
 See docs/FEED_GENERATOR_CONTEXT.md section 9.
 """
 
+import dataclasses
 import random
+import struct
 from dataclasses import dataclass
 
-from b3gen.packet import HEARTBEAT_SEQUENCE_NUMBER
+from b3gen import layouts
+from b3gen.packet import HEARTBEAT_SEQUENCE_NUMBER, PACKET_HEADER_SIZE
+
+CHANNEL_WIDE = {layouts.TEMPLATES_BY_NAME[n].id for n in
+                ("SecurityGroupPhase_10", "ChannelReset_11", "SequenceReset_1")}
+NEWS = layouts.TEMPLATES_BY_NAME["News_5"].id
+INJECT_KINDS = ("mass_cancel", "sweep", "trade_bust", "news", "extend", "unknown")
+FAULTS = ("short", "length_past_end", "length_zero", "length_too_small", "bad_encoding",
+          "truncated")
 
 
 @dataclass(frozen=True)
@@ -92,6 +110,30 @@ class Reset:
 
 
 @dataclass(frozen=True)
+class Inject:
+    """A one-off action once after_messages messages are published.
+    args by kind:
+      mass_cancel: instrument, side
+      sweep: instrument, side, orders (market order for the best N opposite orders)
+      trade_bust: instrument (busts its latest trade)
+      news: channel, instrument (None: market-wide), text_bytes, part_size,
+            spread (messages between parts), block_extra, version
+      extend: count (next Rested outcomes encoded with blockLength +8, version 18)
+      unknown: template_id, body_bytes (inserted inside the next multi-message event)"""
+    kind: str
+    after_messages: int
+    args: tuple = ()
+
+    def __post_init__(self):
+        if self.kind not in INJECT_KINDS:
+            raise ValueError(f"unknown injection {self.kind!r}; one of {INJECT_KINDS}")
+
+    @property
+    def params(self):
+        return dict(self.args)
+
+
+@dataclass(frozen=True)
 class Feeds:
     a: list                # (time_ns, channel, bytes) in wire order
     b: list
@@ -109,7 +151,7 @@ def burst_positions(packetized, params, rng):
     per_channel = {}
     for position, ((_, channel, _), (_, seq)) in enumerate(
             zip(packetized.packets, packetized.headers)):
-        if seq != HEARTBEAT_SEQUENCE_NUMBER:
+        if seq not in (HEARTBEAT_SEQUENCE_NUMBER, None):  # None: a stray datagram
             per_channel.setdefault(channel, []).append(position)
     keep_going = 1 - 1 / params.mean_burst
     dropped = set()
@@ -186,13 +228,102 @@ def unreliable_books(gap_positions, packetized, published, channel_instruments):
     tags_at = {}
     for tag, p in packetized.placements.items():
         tags_at.setdefault(p.packet_position, []).append(tag)
+    return unreliable_from_lost(
+        [(position, sorted(tags_at.get(position, []))) for position in gap_positions],
+        packetized, published, channel_instruments)
+
+
+def unreliable_from_lost(lost, packetized, published, channel_instruments):
+    """lost: [(packet position, [tags a client never saw])] in wire order."""
     out = {}
-    for position in gap_positions:  # wire order, so the first one wins
+    for position, tags in lost:  # wire order, so the first one wins
         channel = packetized.packets[position][1]
         version, seq = packetized.headers[position]
-        for tag in tags_at.get(position, []):
-            instrument = published[tag].instrument
-            names = channel_instruments[channel] if instrument is None else [instrument]
+        for tag in tags:
+            msg = published[tag]
+            if msg.template_id in CHANNEL_WIDE:
+                names = channel_instruments[channel]
+            elif msg.instrument is None or msg.template_id == NEWS:
+                names = []  # News and unknown templates never touch a book
+            else:
+                names = [msg.instrument]
             for name in names:
                 out.setdefault(name, (channel, version, seq))
     return out
+
+
+def _message_starts(payload):
+    """Offsets of the messages in one of our own (well-formed) packets."""
+    starts, pos = [], PACKET_HEADER_SIZE
+    while pos < len(payload):
+        starts.append(pos)
+        pos += struct.unpack_from("<H", payload, pos)[0]
+    return starts
+
+
+def malform(packetized, seed):
+    """One fault per chosen packet, plus a stray short datagram.
+
+    Returns (packetized with the faulty packets and positions shifted for
+    the stray datagram, faults, lost) where faults lists, per fault, its
+    kind, packet, byte offset and messages before it, and lost is
+    [(position, [discarded tags])] for unreliable_from_lost."""
+    tags_at = {}
+    for tag, p in packetized.placements.items():
+        tags_at.setdefault(p.packet_position, []).append(tag)
+    eligible = [pos for pos, (_, seq) in enumerate(packetized.headers)
+                if seq != HEARTBEAT_SEQUENCE_NUMBER and pos >= len(packetized.packets) // 3
+                and len(_message_starts(packetized.packets[pos][2])) >= 3]
+    kinds = [k for k in FAULTS if k != "short"]
+    if len(eligible) < 10 * len(kinds):
+        raise ValueError("run too short for the malformed file")
+    chosen = dict(zip(eligible[::10], kinds))
+    packets = list(packetized.packets)
+    faults, lost = [], []
+    for pos, kind in chosen.items():
+        t, channel, payload = packets[pos]
+        data = bytearray(payload)
+        starts = _message_starts(payload)
+        index = len(starts) - 1 if kind == "truncated" else 1
+        offset = starts[index]
+        if kind == "length_past_end":
+            struct.pack_into("<H", data, offset, len(data) - offset + 100)
+        elif kind == "length_zero":
+            struct.pack_into("<H", data, offset, 0)
+        elif kind == "length_too_small":
+            struct.pack_into("<H", data, offset, 8)
+        elif kind == "bad_encoding":
+            struct.pack_into("<H", data, offset + 2, 0xEB51)
+        else:  # truncated inside the last message's 12-byte header
+            data = data[:offset + 5]
+        packets[pos] = (t, channel, bytes(data))
+        version, seq = packetized.headers[pos]
+        faults.append({"fault": kind, "channel": channel, "sequenceVersion": version,
+                       "sequenceNumber": seq, "offset": offset, "messages_before": index})
+        lost.append((pos, sorted(tags_at[pos])[index:]))
+
+    # The stray datagram: 10 bytes on channel 68's group, right after a
+    # packet in the middle of the file. It has no header, so it uses up no
+    # sequence number.
+    rng = random.Random(f"{seed}:malformed")
+    after = next(pos for pos in range(len(packets) // 2, len(packets))
+                 if packetized.headers[pos][1] != HEARTBEAT_SEQUENCE_NUMBER)
+    t, channel, _ = packets[after]
+    version, seq = packetized.headers[after]
+    packets.insert(after + 1, (t, channel, bytes(rng.randrange(256) for _ in range(10))))
+    headers = list(packetized.headers)
+    headers.insert(after + 1, (None, None))
+    faults.append({"fault": "short", "channel": channel, "after": [channel, version, seq],
+                   "length": 10})
+
+    def shift(p):
+        return dataclasses.replace(p, packet_position=p.packet_position + 1) \
+            if p.packet_position > after else p
+    shifted = dataclasses.replace(
+        packetized, packets=packets, headers=headers,
+        placements={tag: shift(p) for tag, p in packetized.placements.items()},
+        heartbeats=[dataclasses.replace(hb, placement=shift(hb.placement))
+                    for hb in packetized.heartbeats])
+    lost = [(pos + 1 if pos > after else pos, tags) for pos, tags in sorted(lost)]
+    faults.sort(key=lambda f: (f["channel"], f.get("sequenceVersion", 0), f.get("sequenceNumber", 0)))
+    return shifted, faults, lost

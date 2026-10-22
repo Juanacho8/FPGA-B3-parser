@@ -30,7 +30,7 @@ def sequenced(packets):
     """{(channel, version, seq): packet} for real (non-heartbeat) packets."""
     out = {}
     for p in packets:
-        if p["seq"] != 0:
+        if p["seq"]:  # not a heartbeat (0) or a stray datagram (None)
             key = (p["channel"], p["version"], p["seq"])
             assert key not in out, f"{key} twice in one feed"
             out[key] = p
@@ -253,7 +253,12 @@ def test_unreliable_books_are_the_instruments_in_the_gaps(runs, name):
     for row in [json.loads(line) for line in Path(result.run.intent_path).read_text().splitlines()]:
         key = (row["channel"], row["sequenceVersion"], row["sequenceNumber"])
         if key in gaps:
-            names = on_channel[row["channel"]] if row["instrument"] is None else [row["instrument"]]
+            if row["templateId"] in CHANNEL_WIDE:
+                names = on_channel[row["channel"]]
+            elif row["instrument"] is None or row["templateId"] == NEWS:
+                names = []  # News and unknown templates never touch a book
+            else:
+                names = [row["instrument"]]
             for name in names:
                 want.setdefault(name, list(key))
     assert result.manifest["unreliable_books"] == want
@@ -304,18 +309,24 @@ def test_gap_one_really_breaks_its_instrument(runs):
         replay(result, merged(*feeds(result)))
 
 
+CHANNEL_WIDE = {1, 10, 11}  # SequenceReset, SecurityGroupPhase, ChannelReset
+NEWS = 5
+
+
 class _Msg:
-    def __init__(self, instrument):
+    def __init__(self, instrument, template_id):
         self.instrument = instrument
+        self.template_id = template_id
 
 
-def test_message_without_instrument_marks_the_whole_channel():
+def test_channel_wide_message_marks_the_whole_channel():
     p = Packetizer([68, 70], 0, window_ns=0)
     published = []
-    for t, channel, instrument in [(1, 68, "WIN"), (2, 68, None), (3, 70, "PETR4"),
-                                   (4, 68, "DOL"), (5, 70, "VALE3")]:
+    for t, channel, instrument, template in [(1, 68, "WIN", 50), (2, 68, None, 10),
+                                             (3, 70, "PETR4", 51), (4, 68, "DOL", 50),
+                                             (5, 70, "VALE3", 53)]:
         p.add(t, channel, b"\x0c\x00" + bytes(10), tag=len(published))
-        published.append(_Msg(instrument))
+        published.append(_Msg(instrument, template))
     packetized = p.finish(10)
     on_channel = {68: ["WIN", "DOL"], 70: ["PETR4", "VALE3"]}
     position = {tag: pl.packet_position for tag, pl in packetized.placements.items()}
@@ -325,6 +336,26 @@ def test_message_without_instrument_marks_the_whole_channel():
     assert out == {"WIN": (68, 1, 2), "DOL": (68, 1, 2), "PETR4": (70, 1, 1)}
     out = scenarios.unreliable_books([position[3]], packetized, published, on_channel)
     assert out == {"DOL": (68, 1, 3)}
+
+
+@pytest.mark.parametrize("template", [1, 10, 11])
+def test_every_channel_wide_template_marks_the_channel(template):
+    p = Packetizer([68], 0, window_ns=0)
+    p.add(1, 68, b"\x0c\x00" + bytes(10), tag=0)
+    packetized = p.finish(10)
+    out = scenarios.unreliable_books([0], packetized, [_Msg(None, template)],
+                                     {68: ["WIN", "DOL"]})
+    assert out == {"WIN": (68, 1, 1), "DOL": (68, 1, 1)}
+
+
+def test_news_and_unknown_templates_never_make_a_book_unreliable():
+    p = Packetizer([68], 0, window_ns=0)
+    published = [_Msg("WIN", NEWS), _Msg(None, NEWS), _Msg(None, 999)]
+    for tag in range(3):
+        p.add(tag, 68, b"\x0c\x00" + bytes(10), tag=tag)
+    packetized = p.finish(10)
+    assert scenarios.unreliable_books([0, 1, 2], packetized, published,
+                                      {68: ["WIN", "DOL"]}) == {}
 
 
 # ---------------------------------------------------------------------------

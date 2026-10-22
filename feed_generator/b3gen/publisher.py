@@ -36,12 +36,26 @@ Resets (spec/LAYOUTS.md sections 12.1, 12.2, 12.5, 12.9):
 Statistics survive every reset; only start_session (TRADING_SESSION_CHANGE)
 clears them (section 12.9; LAYOUTS.md section 13 on Message Reference 9.2.7).
 
+Rare messages (step 7c; inferences recorded in docs/FEED_GENERATOR_CONTEXT.md):
+* trade_bust: TradeBust copying an earlier Trade (securityID, session,
+  price, size, tradeID, tradeDate), its own event (0x80). Statistics are
+  left unchanged.
+* news_parts: News split into parts (section 12.10): same newsID,
+  partNumber 1..partCount, totalTextLength = the whole text's bytes,
+  headline in part 1 only, each part a standalone message (0x80). No rptSeq
+  (the template has none). The last part is annotated with the reassembled
+  text for the intent log.
+* unknown: a message with a templateId the schema does not have (schema
+  evolution tests); publish(..., block_extra, version) encodes an event with
+  a larger blockLength (zero bytes) and another header version.
+
 Inferences (B3 does not specify them) are recorded as open items G, H and I
 in docs/FEED_GENERATOR_CONTEXT.md section 12.
 
 Must not: know about packet boundaries.
 """
 
+import dataclasses
 from dataclasses import dataclass
 
 from b3gen import encode, engine, layouts
@@ -80,6 +94,8 @@ T_GROUP_PHASE = _template_id("SecurityGroupPhase_10")
 T_SEQUENCE_RESET = _template_id("SequenceReset_1")
 T_EMPTY_BOOK = _template_id("EmptyBook_9")
 T_CHANNEL_RESET = _template_id("ChannelReset_11")
+T_NEWS = _template_id("News_5")
+T_TRADE_BUST = _template_id("TradeBust_57")
 
 END_OF_EVENT = _set_bit("MatchEventIndicator", "EndOfEvent")
 RECOVERY_MSG = _set_bit("MatchEventIndicator", "RecoveryMsg")
@@ -163,6 +179,9 @@ class Published:
     template_id: int
     fields: dict
     data: bytes
+    block_length: int | None = None   # header blockLength if not the schema's
+    version: int | None = None        # header version if not the schema's
+    annotations: dict | None = None   # extra intent log keys (News text)
 
 
 class PublishError(ValueError):
@@ -278,6 +297,56 @@ class Publisher:
     def trade_date(self, name):
         return self._state[name].trade_date
 
+    # -- rare messages --------------------------------------------------------
+
+    def trade_bust(self, time_ns, trade):
+        """TradeBust for an earlier Published Trade."""
+        if trade.template_id != T_TRADE:
+            raise PublishError("trade_bust needs a Trade")
+        f = trade.fields
+        return self._event(time_ns, [(trade.channel, trade.instrument, T_TRADE_BUST, {
+            "securityID": f["securityID"], "tradingSessionID": f["tradingSessionID"],
+            "mDEntryPx": f["mDEntryPx"], "mDEntrySize": f["mDEntrySize"],
+            "tradeID": f["tradeID"], "tradeDate": f["tradeDate"], "transactTime": time_ns})])
+
+    def news_parts(self, time_ns, channel, name, news_id, headline, text, part_size,
+                   source="OTHER", language="EN", block_extra=0, version=None):
+        """The parts of one News as [[Published]] (one event each), to be
+        sent in order. name None: market-wide (securityID null)."""
+        data = text.encode("ascii")  # ASCII: byte splits never cut a character
+        chunks = [data[i:i + part_size] for i in range(0, len(data), part_size)] or [b""]
+        parts = []
+        for number, chunk in enumerate(chunks, start=1):
+            fields = {"newsSource": ENUMS["NewsSource"][source], "languageCode": language,
+                      "partCount": len(chunks), "partNumber": number, "newsID": news_id,
+                      "origTime": time_ns, "totalTextLength": len(data), "text": chunk}
+            if name is not None:
+                fields["securityID"] = self.instruments[name].security_id
+            if number == 1:
+                fields["headline"] = headline.encode("ascii")
+            event = self._event(time_ns, [(channel, name, T_NEWS, fields)],
+                                block_extra=block_extra, version=version)
+            parts.append(event)
+        parts[-1][0] = dataclasses.replace(parts[-1][0], annotations={"news": {
+            "newsID": news_id, "headline": headline, "text": text}})
+        return parts
+
+    @staticmethod
+    def unknown(time_ns, channel, template_id, body, version):
+        """A message the schema does not define: header + body only."""
+        if template_id in layouts.TEMPLATES:
+            raise PublishError(f"template {template_id} is known")
+        header = bytearray(encode.HEADER_SIZE)
+        encode.write_members(header, 0, layouts.FRAMING_HEADER,
+                             {"messageLength": encode.HEADER_SIZE + len(body),
+                              "encodingType": encode.ENCODING_TYPE}, "unknown", use_nulls=False)
+        encode.write_members(header, encode.FRAMING_HEADER_SIZE, layouts.MESSAGE_HEADER,
+                             {"blockLength": len(body), "templateId": template_id,
+                              "schemaId": layouts.SCHEMA_ID, "version": version},
+                             "unknown", use_nulls=False)
+        return Published(time_ns, channel, None, template_id, {"body": bytes(body)},
+                         bytes(header) + bytes(body), block_length=len(body), version=version)
+
     # -- resets -------------------------------------------------------------
 
     def sequence_reset(self, time_ns, channel):
@@ -301,8 +370,10 @@ class Publisher:
 
     # -- outcomes -----------------------------------------------------------
 
-    def publish(self, outcome):
-        """Messages for one engine outcome (one event, or nothing)."""
+    def publish(self, outcome, block_extra=0, version=None):
+        """Messages for one engine outcome (one event, or nothing).
+        block_extra / version: encode it as a newer schema would (zero
+        bytes appended to each root block, another header version)."""
         self._require_session()
         kind = type(outcome)
         if kind in (engine.Unfilled, engine.Rejected):
@@ -341,7 +412,8 @@ class Publisher:
             msgs = self._execution(inst, outcome)
         else:
             raise PublishError(f"unknown outcome {outcome!r}")
-        return self._event(t, [(inst.channel, inst.name, tid, f) for tid, f in msgs])
+        return self._event(t, [(inst.channel, inst.name, tid, f) for tid, f in msgs],
+                           block_extra=block_extra, version=version)
 
     def _execution(self, inst, ex):
         sid = inst.security_id
@@ -453,7 +525,7 @@ class Publisher:
         if not self._in_session:
             raise PublishError("no trading session in progress; call start_session first")
 
-    def _event(self, time_ns, messages, recovery=False):
+    def _event(self, time_ns, messages, recovery=False, block_extra=0, version=None):
         """Finish one event: matchEventIndicator (EndOfEvent on the last
         message only, RecoveryMsg on every message of a recovery), rptSeq
         per instrument in message order, then encode."""
@@ -472,7 +544,11 @@ class Publisher:
                 state = self._state[instrument]
                 state.rpt_seq += 1
                 fields["rptSeq"] = state.rpt_seq
+            block_length = layouts.TEMPLATES[template_id].block_length + block_extra \
+                if block_extra else None
             out.append(Published(time_ns, channel, instrument, template_id, fields,
-                                 encode.encode(template_id, fields)))
+                                 encode.encode(template_id, fields, block_length=block_length,
+                                               version=version),
+                                 block_length=block_length, version=version))
         return out
 
