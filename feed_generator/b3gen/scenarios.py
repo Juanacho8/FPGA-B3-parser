@@ -13,7 +13,8 @@ Built so far (step 7a):
   never leaves before the previous one on its channel. Only the pcap
   timestamp moves.
 * Loss: bursts of sequenced packets missing from Feed A only.
-* Gaps: bursts of sequenced packets missing from both feeds.
+* Gaps: bursts of sequenced packets missing from both feeds, or (gap_one)
+  one chosen packet holding messages for exactly one instrument.
   Burst model for both: at each sequenced packet of a channel a burst starts
   with probability burst_rate; its length is geometric with mean mean_burst.
   Loss and gaps have their own RNGs (f"{seed}:loss", f"{seed}:gap").
@@ -105,9 +106,25 @@ def feed_b_times(packetized, params, rng):
     return times
 
 
-def build_feeds(packetized, seed, *, feed_b=FeedBParams(), loss=None, gap=None):
+def single_instrument_packet(packetized, published):
+    """The first sequenced packet from the middle of the run on whose
+    messages all belong to one instrument (not a channel-wide message)."""
+    tags_at = {}
+    for tag, p in packetized.placements.items():
+        tags_at.setdefault(p.packet_position, []).append(tag)
+    n = len(packetized.packets)
+    for position in range(n // 2, n):
+        names = {published[tag].instrument for tag in tags_at.get(position, [])}
+        if len(names) == 1 and None not in names:
+            return position
+    raise ValueError("no packet with messages for exactly one instrument")
+
+
+def build_feeds(packetized, seed, *, feed_b=FeedBParams(), loss=None, gap=None,
+                gap_positions=()):
+    """gap_positions: packets missing from both feeds besides the random gaps."""
     lost = burst_positions(packetized, loss, random.Random(f"{seed}:loss"))
-    gapped = burst_positions(packetized, gap, random.Random(f"{seed}:gap"))
+    gapped = burst_positions(packetized, gap, random.Random(f"{seed}:gap")) | set(gap_positions)
     b_times = feed_b_times(packetized, feed_b, random.Random(f"{seed}:feedB"))
 
     def key(position):

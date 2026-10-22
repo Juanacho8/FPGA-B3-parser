@@ -135,10 +135,12 @@ def test_missing_packets_match_the_manifest(runs, name):
     assert missing(full, a) == manifest["missing"]["A"]
     assert missing(full, b) == manifest["missing"]["B"]
     expect = {"clean": (False, False), "idle": (False, False),
-              "loss": (True, False), "gap": (True, True)}[name]
+              "loss": (True, False), "gap": (True, True), "gap_one": (True, True)}[name]
     assert (bool(manifest["missing"]["A"]), bool(manifest["missing"]["B"])) == expect
-    if name == "gap":
+    if name in ("gap", "gap_one"):
         assert manifest["missing"]["A"] == manifest["missing"]["B"]
+    if name == "gap_one":
+        assert len(manifest["missing"]["B"]) == 1
 
 
 @pytest.mark.parametrize("name", main.SCENARIOS)
@@ -194,7 +196,7 @@ def merged(a, b):
     return [by_key[k] for k in sorted(by_key)]
 
 
-@pytest.mark.parametrize("name", ["loss", "gap"])
+@pytest.mark.parametrize("name", ["loss", "gap", "gap_one"])
 def test_merging_a_and_b_reproduces_the_feed(runs, name):
     full = sequenced(read_packets(runs["clean"].run.pcap_path))
     gaps = {tuple(k) for k in runs[name].manifest["missing"]["B"]}
@@ -245,8 +247,9 @@ def test_book_from_feed_a_alone_breaks_under_loss(runs):
                                     key=lambda p: (p["channel"], p["version"], p["seq"])))
 
 
-def test_unreliable_books_are_the_instruments_in_the_gaps(runs):
-    result = runs["gap"]
+@pytest.mark.parametrize("name", ["gap", "gap_one"])
+def test_unreliable_books_are_the_instruments_in_the_gaps(runs, name):
+    result = runs[name]
     gaps = {tuple(k) for k in result.manifest["missing"]["B"]}
     cfg = main.default_config()
     on_channel = {}
@@ -263,8 +266,9 @@ def test_unreliable_books_are_the_instruments_in_the_gaps(runs):
     assert want
 
 
-def test_gap_books_match_the_key_where_reliable(runs):
-    result = runs["gap"]
+@pytest.mark.parametrize("name", ["gap", "gap_one"])
+def test_gap_books_match_the_key_where_reliable(runs, name):
+    result = runs[name]
     cfg = main.default_config()
     name_of = {i.security_id: i.name for i in cfg.instruments}
     first_gap = {n: tuple(k) for n, k in result.manifest["unreliable_books"].items()}
@@ -275,11 +279,15 @@ def test_gap_books_match_the_key_where_reliable(runs):
 
     checks = replay(result, merged(*feeds(result)), skip)
     rows = len(Path(result.run.book_key_path).read_text().splitlines())
-    for name, n in checks.items():
-        if name in first_gap:
-            assert 0 < n < rows, (name, n)  # checked up to its first gap only
+    for instrument, n in checks.items():
+        if instrument in first_gap:
+            assert 0 < n < rows, (instrument, n)  # checked up to its first gap only
         else:
-            assert n == rows, (name, n)
+            assert n == rows, (instrument, n)
+    if name == "gap_one":
+        # One packet, one instrument: the other three stay reliable to the end.
+        assert len(first_gap) == 1
+        assert sum(n == rows for n in checks.values()) == 3
 
 
 def test_bursts_never_take_heartbeats():
@@ -293,6 +301,13 @@ def test_bursts_never_take_heartbeats():
                                            random.Random(0))
     real = {i for i, (_, seq) in enumerate(packetized.headers) if seq}
     assert everything == real
+
+
+def test_gap_one_really_breaks_its_instrument(runs):
+    # Trusting the unreliable book past the gap must go wrong somewhere.
+    result = runs["gap_one"]
+    with pytest.raises((AssertionError, KeyError)):
+        replay(result, merged(*feeds(result)))
 
 
 class _Msg:
