@@ -52,7 +52,7 @@ Details and references in `spec/LAYOUTS.md`.
 
 | Stage | Component | Status |
 |---|---|---|
-| 1 | Feed generator (Python) | Planned, building next |
+| 1 | Feed generator (Python) | Built (steps 0 to 8 and review fixes, branch `feed-generator`) |
 | 2 | C++ baseline parser | Not started |
 | 3 | RTL v1: parser (bytes to per-order events) | Not started |
 | 4 | RTL v2: A/B line arbitration in front of the parser | Not started |
@@ -123,7 +123,7 @@ Following what B3 sends during continuous trading:
 | ClosingPrice (17) | Session start (previous close) and session end |
 | PriceBand (22) / QuantityBand (21) | Session start |
 | SettlementPrice (28) / OpenInterest (29) | Session start, futures only |
-| SecurityGroupPhase (10) / SecurityStatus (3) | Session start and status changes |
+| SecurityGroupPhase (10) | Session start (TRADING_SESSION_CHANGE). SecurityStatus (3) is not emitted in v1 |
 | Sequence (2) | Heartbeat when idle more than 1 s, in a packet with sequenceNumber 0 |
 | SequenceReset (1), EmptyBook (9), ChannelReset (11) | Restart and reset scenarios |
 | TradeBust (57) | Scenario |
@@ -181,7 +181,7 @@ Kept in separate files from the clean main file.
 | ChannelReset | ChannelReset, then the same per-instrument rebuild |
 | Single-instrument reset | EmptyBook + recovery orders for one instrument, whose rptSeq restarts at 1 |
 | New trading session | SecurityGroupPhase with TRADING_SESSION_CHANGE, statistics reset |
-| Edge orders | Null-price (market-on-auction) orders, MassDelete, aggression sweeping several levels, events spanning packets |
+| Edge orders | Market supervision DELETE_THRU, a firm's mass cancel across instruments, aggression sweeping several levels, events spanning packets (null-price orders are out of v1: they only exist in auctions) |
 | Schema evolution | A message with a larger blockLength than the schema, and an unknown templateId. Tests "trust the header" |
 | Rare messages | TradeBust, multi-part News |
 | Malformed | Truncated packets, bad lengths. Separate small file |
