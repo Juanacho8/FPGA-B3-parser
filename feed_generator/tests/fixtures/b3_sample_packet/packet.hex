@@ -1,0 +1,14 @@
+# B3 Binary UMDF Message Reference v2.3.1, section 6 (page 29): sample packet.
+# 168 bytes: 16-byte packet header + Order_MBO_50 (84 bytes) + Trade_53 (68 bytes).
+# Transcribed from the hex dump. Lines starting with # are comments.
+37 00 01 00 b1 68 de 3a 00 c8 98 65 f4 ac eb 15
+54 00 50 eb 48 00 32 00 02 00 11 00 a4 92 78 48
+17 00 00 00 80 01 31 00 4e 61 bc 00 00 00 00 00
+10 27 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 c8 98 65 f4 ac eb 15 00 00 00 00
+00 00 00 00 44 00 50 eb 38 00 35 00 02 00 11 00
+a4 92 78 48 17 00 00 00 00 00 00 00 4e 61 bc 00
+00 00 00 00 10 27 00 00 00 00 00 00 00 00 00 00
+d2 04 00 00 2e 16 00 00 00 00 00 00 00 c8 98 65
+f4 ac eb 15 00 00 00 00

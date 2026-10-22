@@ -1,0 +1,118 @@
+# Tiny test config (tests/test_cli.py): two instruments, small targets.
+# Derived from feed_generator/config.toml.
+#
+# Every value is marked:
+#   [B3]        a fact from B3's documents (spec/), with where it comes from
+#   [B3 market] a real B3 market convention not stated in spec/ (contract
+#               specifications: ticks, lots)
+#   [inferred]  our reading where B3 does not say (open items in
+#               docs/FEED_GENERATOR_CONTEXT.md section 12)
+#   [invented]  a made-up value for a realistic-looking feed
+#   [stress]    chosen to exercise parsers, not to look like B3
+#
+# Prices are Price mantissas (x10^-4, LAYOUTS.md section 8): 385_000 = 38.50.
+# Times are nanoseconds. Validation is strict: unknown or missing keys and
+# wrong types are errors.
+
+seed = 1                          # [invented] every RNG derives from it
+session_date = 2026-10-19         # [invented] a Monday; tradeDate of the session
+session_open_utc = "13:00"        # [invented] 10:00 BRT; real hours vary by market (Guidelines 3.1)
+
+[sets]                            # what `python -m b3gen build` produces
+small_messages = 600           # [invented] RTL simulation size
+large_messages = 900        # [invented] throughput test size
+burst_messages = 900          # [stress] about 100 spikes at the burst rate below
+burst_spike_every_ns = 50_000_000 # [stress] burst set: a spike every 50 ms on average (vs flow.spike_every_ns)
+scenario_messages = 2_000         # smallest comfortable size: edge needs 30 offers on WIN by mid-run (1,500 is the floor)
+book_key_every = 50            # [invented] events between book key checkpoints
+
+[packetizer]
+window_ns = 5_000                 # [inferred] close a packet 5 us after its first message (open item F)
+heartbeat_ns = 1_000_000_000      # [B3] Sequence heartbeat every 1 s while idle (Guidelines p.43)
+
+[network]
+src_ip = "10.0.0.1"               # [invented] sender address in the pcaps
+src_port = 50_000                 # [invented]
+
+# Channel numbers and which instruments sit on them are invented (B3's real
+# assignment is in its Market Data Channels Definition, not in spec/).
+# Multicast groups and ports are invented, from 233.252.0.0/14 (MCAST-TEST-NET).
+[channels.68]                     # [invented] derivatives here
+feed_a = { group = "233.252.8.68", port = 30068 }   # [invented]
+feed_b = { group = "233.252.9.68", port = 31068 }   # [invented] Feed B: same packets, other path (LAYOUTS.md 11)
+
+[channels.70]                     # [invented] equities here
+feed_a = { group = "233.252.8.70", port = 30070 }   # [invented]
+feed_b = { group = "233.252.9.70", port = 31070 }   # [invented]
+
+# Instruments. securityIDs, previous closes, bands, quantities and rates are
+# invented; ticks and lots follow B3's contract specifications ([B3 market]).
+[[instruments]]
+name = "WIN"                      # mini Ibovespa future
+security_id = 200_000_001         # [invented]
+channel = 68
+segment = "DRV"                   # [invented] label; B3 runs two PUMA segments (LAYOUTS.md 12.7)
+security_group = "IND"            # [invented]
+tick = 50_000                     # [B3 market] 5 index points
+lot = 1                           # [B3 market]
+is_future = true
+prev_close = 1_300_000_000        # [invented] 130,000 points
+band_bps = 800                    # [invented] PriceBand +-8% of the previous close
+avg_daily_traded_qty = 0          # [invented]
+max_trade_vol = 5_000             # [invented] QuantityBand
+settlement_price = 1_300_000_000  # [invented] previous day's FINAL settlement
+open_interest = 450_000           # [invented]
+rates = { calm = 400, busy = 4_000, spike = 960_000 }  # arrivals/s [invented]; spike [stress]
+
+[[instruments]]
+name = "PETR4"                    # equity
+security_id = 100_000_001         # [invented]
+channel = 70
+segment = "EQT"                   # [invented] label for the equities segment
+security_group = "EQ1"            # [invented]
+tick = 100                        # [B3 market] R$0.01
+lot = 100                         # [B3 market] round lot
+is_future = false
+prev_close = 385_000              # [invented] R$38.50
+band_bps = 800                    # [invented]
+avg_daily_traded_qty = 40_000_000 # [invented]
+max_trade_vol = 10_000_000        # [invented]
+rates = { calm = 250, busy = 2_500, spike = 960_000 }  # [invented]; spike [stress]
+
+[flow]                            # zero-intelligence order flow (context section 8), all [invented]
+calm_mean_ns = 1_000_000_000      # mean calm period
+busy_mean_ns = 500_000_000        # mean busy period
+spike_mean_ns = 1_000_000         # [stress] mean spike length: 1 ms
+spike_every_ns = 1_000_000_000    # [stress] mean calm/busy time between spikes
+p_new = 0.55                      # instruction mix weights (normalized together)
+p_cancel = 0.18                   # at target_live_orders; scales with live orders
+p_size = 0.08
+p_price = 0.09
+p_ioc = 0.06
+p_market = 0.04
+target_live_orders = 200          # per instrument: where cancels balance new orders
+near_ticks = 5                    # passive orders 0..near_ticks-1 ticks from mid
+cross_fraction = 0.10             # share of new limit orders that cross the spread
+cross_ticks = 2                   # how far past the best opposite price
+lots_continue = 0.6               # order size: geometric, P(one more lot)
+max_lots = 20
+aggressive_max_lots = 3           # market and IOC orders stay small
+price_change_ticks = 4            # price changes move up to this many ticks
+thin_levels = 3                   # a side with fewer levels is "thin"
+thin_bias = 0.8                   # share of new limits sent to a thin side
+firm_count = 30                   # enteringFirm 1..firm_count
+
+[feed_b]                          # [inferred] Feed A is the faster one (B3 circular OC 131/2023)
+base_delay_ns = 20_000            # [invented] B = A + 20 us ...
+jitter_ns = 10_000                # [invented] ... + uniform 0..10 us, never reordering a channel
+
+[loss]                            # loss scenario: bursts missing from Feed A only, all [invented]
+burst_rate = 0.01                 # chance a burst starts at a packet
+mean_burst = 3.0                  # mean burst length (geometric), packets
+
+[gap]                             # gap scenario: higher, so a tiny run still drops packets
+burst_rate = 0.02
+mean_burst = 2.0
+
+[idle]                            # idle scenario
+duration_ns = 3_500_000_000       # [invented] long enough for 3 heartbeats per channel
