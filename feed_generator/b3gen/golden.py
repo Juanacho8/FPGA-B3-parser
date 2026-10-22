@@ -4,8 +4,14 @@ Intent log (JSON Lines): one row per message on the wire, in wire order
 (packet order, then index in packet), heartbeats included:
 
     {"channel", "sequenceVersion", "sequenceNumber", "index", "sendingTime",
-     "templateId", "instrument", "fields": {every field: wire value},
+     "templateId", "blockLength", "version", "instrument",
+     "fields": {every field: wire value},
      "null": [fields whose wire value is their null]}
+
+blockLength and version are the message header's (the schema's unless the
+publisher encoded a newer-schema message). A template the schema does not
+have gets fields {"body": hex}. The last part of a News also carries
+"news": {"newsID", "headline", "text"} with the reassembled text.
 
 fields holds every non-constant field of the template. Fields the publisher
 left out get their null from layouts.py. An optional field is listed in
@@ -76,9 +82,14 @@ def intent_rows(published, packetized):
     rows = []
     for tag, msg in enumerate(published):
         p = packetized.placements[tag]
-        fields, nulls = wire_fields(msg.template_id, msg.fields)
-        rows.append(((p.packet_position, p.index),
-                     _row(p, msg.template_id, msg.instrument, fields, nulls)))
+        if msg.template_id in layouts.TEMPLATES:
+            fields, nulls = wire_fields(msg.template_id, msg.fields)
+        else:
+            fields, nulls = {"body": msg.fields["body"].hex()}, []
+        row = _row(p, msg.template_id, msg.instrument, fields, nulls,
+                   msg.block_length, msg.version)
+        row.update(msg.annotations or {})
+        rows.append(((p.packet_position, p.index), row))
     for hb in packetized.heartbeats:
         p = hb.placement
         fields, nulls = wire_fields(SEQUENCE_TEMPLATE, {"nextSeqNo": hb.next_seq_no})
@@ -88,10 +99,14 @@ def intent_rows(published, packetized):
     return [row for _, row in rows]
 
 
-def _row(p, template_id, instrument, fields, nulls):
+def _row(p, template_id, instrument, fields, nulls, block_length=None, version=None):
+    if block_length is None:
+        block_length = layouts.TEMPLATES[template_id].block_length
     return {"channel": p.channel, "sequenceVersion": p.sequence_version,
             "sequenceNumber": p.sequence_number, "index": p.index,
             "sendingTime": p.sending_time, "templateId": template_id,
+            "blockLength": block_length,
+            "version": layouts.SCHEMA_VERSION if version is None else version,
             "instrument": instrument, "fields": fields, "null": nulls}
 
 

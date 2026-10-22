@@ -133,6 +133,8 @@ def decode(message):
         "blockLength": block_length, "templateId": template_id,
         "schemaId": schema_id, "version": version,
     }
+    if template_id not in LAYOUTS:
+        return header, None  # unknown template: skipped by messageLength
     _, fields_layout = LAYOUTS[template_id]
     body = 12
     fields = {}

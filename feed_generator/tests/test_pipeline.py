@@ -60,6 +60,7 @@ def independent_row(placement, data, securities):
              (fields[name] == optional[name] or (isinstance(fields[name], str) and fields[name] == ""))]
     return {"channel": channel, "sequenceVersion": version, "sequenceNumber": seq,
             "index": index, "sendingTime": sending, "templateId": template,
+            "blockLength": header["blockLength"], "version": header["version"],
             "instrument": securities.get(fields.get("securityID")),
             "fields": fields, "null": nulls}
 
