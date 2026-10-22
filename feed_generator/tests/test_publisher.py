@@ -160,6 +160,25 @@ def test_sweep_with_partial_fill_of_last_level_and_remainder_resting():
     assert (msgs[9].fields["mDEntryPx"], msgs[10].fields["mDEntryPx"]) == (1100, 1000)
 
 
+def test_sweep_with_partial_fill_of_last_level_no_remainder():
+    r = Run()
+    # Book A's lot is 100, so the 100/100/300 vs 450 case is scaled by 10.
+    r(NewOrder, SELL, 1000, 1000, 1)
+    r(NewOrder, SELL, 1000, 1000, 2)
+    (last,) = r(NewOrder, SELL, 1100, 3000, 3)
+    msgs = r(NewOrder, BUY, 1100, 4500, 9)
+    # Fills: 1000@1000, 1000@1000, 2500@1100. The 1100 order keeps 500; nothing rests.
+    assert templates(msgs) == [SUMMARY, TRADE, TRADE, TRADE, DELETE, DELETE, ORDER,
+                               OPENING, HIGH, LOW, STATS]
+    deletes = [m.fields for m in msgs if m.template_id == DELETE]
+    assert [(d["mDEntryPx"], d["mDEntrySize"]) for d in deletes] == [(1000, 1000), (1000, 1000)]
+    (change,) = [m.fields for m in msgs if m.template_id == ORDER]
+    assert (change["mDUpdateAction"], change["mDEntrySize"], change["mDEntryPrevSize"]) == (1, 500, 3000)
+    assert change["secondaryOrderID"] == last.fields["secondaryOrderID"]
+    assert change["mDEntryPx"] == 1100
+    assert msgs[0].fields["fillQty"] == 4500 and msgs[0].fields["lastPx"] == 1100
+
+
 def test_partial_fill_of_resting_is_order_change():
     r = Run()
     (resting,) = r(NewOrder, SELL, 1000, 500, 1)
