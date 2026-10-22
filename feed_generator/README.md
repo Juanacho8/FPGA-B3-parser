@@ -60,9 +60,9 @@ its own (delayed) times.
 | `instrument_reset` | EmptyBook and a rebuild for one instrument |
 | `session_change` | end of day, stream down overnight, start-of-day heartbeats, next session (statistics, tradeID and tradeDate reset; new price bands) |
 | `weekly_start` | Friday, weekend down, start-of-day heartbeats, SequenceReset, ChannelReset, rebuilds, Monday's session |
-| `edge` | a mass cancel of each side of one instrument, and a sweep whose event spans 3+ packets |
+| `edge` | market supervision deleting each side of one instrument (DELETE_THRU), a firm's mass cancel across two instruments (one event of DeleteOrder_MBO), and a sweep whose event spans 3+ packets |
 | `rare` | a TradeBust of a real trade, News in one part and in 3 parts with live traffic between the parts |
-| `schema` | messages with a larger blockLength and version 18, and an unknown templateId |
+| `schema` | messages with a larger blockLength and version 18, Order_MBO of older versions 15 and 14 (shorter block, later fields missing), and an unknown templateId |
 | `malformed` | a short file with one fault per packet (bad messageLength, wrong encodingType, truncation) and a stray short datagram |
 
 ## Output files
@@ -99,8 +99,9 @@ then message index within the packet. Heartbeats are included.
   - Chars are strings; a null char is `""`.
 - `null` lists the optional fields whose wire value is their null.
 - `blockLength` and `version` are the message header's values. They differ from the schema only in the `schema` scenario.
+- `absent` (only on messages of an older version) lists the fields that version did not have; they are not in `fields` or `null`.
 - An unknown template has `"fields": {"body": "<hex>"}`.
-- The last part of a News message also carries `"news": {"newsID", "headline", "text"}`, with the text reassembled.
+- The last part of a News message also carries `"news": {"headline", "text"}`, with the text reassembled. newsID is null on the wire (B3 sends it only on its Unified News Channel), so a client groups the parts of a News by channel and order: part 1 starts it, part partCount ends it.
 
 To check a decoder, decode each pcap message and compare it with the row at
 the same `(channel, sequenceVersion, sequenceNumber, index)`.

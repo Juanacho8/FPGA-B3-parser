@@ -58,11 +58,15 @@ def independent_row(placement, data, securities):
     optional = MESSAGE_LAYOUTS[template]["optional_nulls"]
     nulls = [name for name in fields if name in optional and
              (fields[name] == optional[name] or (isinstance(fields[name], str) and fields[name] == ""))]
-    return {"channel": channel, "sequenceVersion": version, "sequenceNumber": seq,
+    absent = [name for _, _, name in sbe_decoder.LAYOUTS[template][1] if name not in fields]
+    row = {"channel": channel, "sequenceVersion": version, "sequenceNumber": seq,
             "index": index, "sendingTime": sending, "templateId": template,
             "blockLength": header["blockLength"], "version": header["version"],
             "instrument": securities.get(fields.get("securityID")),
             "fields": fields, "null": nulls}
+    if absent:
+        row["absent"] = absent
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -284,3 +288,22 @@ def test_packets_close_by_size_and_events_span_packets(big_run):
     print(f"closed by size: {by_size}, events spanning packets: {spanning}")
     assert by_size >= 50, by_size
     assert spanning >= 10, spanning
+
+
+def test_secondary_order_ids_never_repeat_across_segments(big_run):
+    # Guidelines p.68: unique across all market segments, incremental per
+    # segment. Read from the wire: new IDs by segment (channel 68 carries
+    # the derivatives, 70 the equities in the default config).
+    config, result, _ = big_run
+    segment_of = {i.security_id: i.segment for i in config.instruments}
+    new_ids = {}
+    for _, data in decode_wire(result.pcap_path):
+        header, fields = sbe_decoder.decode(data)
+        if header["templateId"] == 50 and fields["mDUpdateAction"] == 0:
+            new_ids.setdefault(segment_of[fields["securityID"]], []).append(
+                fields["secondaryOrderID"])
+    assert len(new_ids) == 2
+    for ids in new_ids.values():
+        assert ids == sorted(ids) and len(set(ids)) == len(ids)
+    first, second = (set(v) for v in new_ids.values())
+    assert not first & second

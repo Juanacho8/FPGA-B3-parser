@@ -46,7 +46,8 @@ unreliable. News and unknown templates never make a book unreliable.
 
 Step 7c:
 * Inject: one-off actions main.py performs through the normal layers
-  (mass_cancel, sweep, trade_bust, news, extend, unknown).
+  (supervisor_delete_thru, firm_mass_cancel, sweep, trade_bust, news,
+  extend, unknown).
 * malform: packet-level faults for the malformed file, one per packet, with
   what a client must do: process the complete messages before the fault,
   discard the rest of the packet, carry on with sequencing.
@@ -67,7 +68,8 @@ from b3gen.packet import HEARTBEAT_SEQUENCE_NUMBER, PACKET_HEADER_SIZE
 CHANNEL_WIDE = {layouts.TEMPLATES_BY_NAME[n].id for n in
                 ("SecurityGroupPhase_10", "ChannelReset_11", "SequenceReset_1")}
 NEWS = layouts.TEMPLATES_BY_NAME["News_5"].id
-INJECT_KINDS = ("mass_cancel", "sweep", "trade_bust", "news", "extend", "unknown")
+INJECT_KINDS = ("supervisor_delete_thru", "firm_mass_cancel", "sweep", "trade_bust", "news",
+                "extend", "older_version", "unknown")
 FAULTS = ("short", "length_past_end", "length_zero", "length_too_small", "bad_encoding",
           "truncated")
 
@@ -118,12 +120,20 @@ class Reset:
 class Inject:
     """A one-off action once after_messages messages are published.
     args by kind:
-      mass_cancel: instrument, side
+      supervisor_delete_thru: instrument, side (market supervision deletes one
+            side: MassDeleteOrders_MBO DELETE_THRU, Guidelines p.71)
+      firm_mass_cancel: channel (a participant cancels all its orders on the
+            channel's instruments: one event of DeleteOrder_MBO; the firm
+            with the most resting orders there, spanning 2+ instruments
+            when the channel has them; main.py picks the channel with the
+            most instruments)
       sweep: instrument, side, orders (market order for the best N opposite orders)
       trade_bust: instrument (busts its latest trade)
       news: channel, instrument (None: market-wide), text_bytes, part_size,
             spread (messages between parts), block_extra, version
       extend: count (next Rested outcomes encoded with blockLength +8, version 18)
+      older_version: versions (the next Rested outcomes, one per version, encoded
+            as that older schema version: shorter block, later fields absent)
       unknown: template_id, body_bytes (inserted inside the next multi-message event)"""
     kind: str
     after_messages: int

@@ -12,9 +12,13 @@ Identifiers:
 * handle: permanent, assigned by the engine when an order enters, unique
   across the engine. The caller refers to the order by it.
 * secondaryOrderID (soid): from a counter shared by every book of a market
-  segment. Allocated at entry for every new order, even one that fully
-  fills (so IDs on the feed have realistic gaps), and again on every
-  requeue (size increase or price change).
+  segment. B3: "unique across all market segments. It is a sequence that
+  is incremental per market segment" (Guidelines p.68), so each segment
+  counts inside its own range of SOID_SEGMENT_SPAN IDs: the first segment
+  from 1, the second from SOID_SEGMENT_SPAN + 1, and so on, in the order
+  the segments first appear. Allocated at entry for every new order, even
+  one that fully fills (so IDs on the feed have realistic gaps), and again
+  on every requeue (size increase or price change).
 
 Rules (docs/FEED_GENERATOR_CONTEXT.md section 5, Engine):
 * Size reduction keeps priority and soid. Size increase or price change
@@ -26,6 +30,10 @@ Rules (docs/FEED_GENERATOR_CONTEXT.md section 5, Engine):
   remainder rests at its limit price; a market or IOC remainder is
   discarded. Market orders have no price protection.
 * No self-trade prevention.
+* SupervisorDeleteThru removes one side of one book (market supervision,
+  Guidelines p.71). FirmMassCancel (Engine.firm_mass_cancel) removes every
+  order of one firm on several books (a participant's mass cancel,
+  Guidelines p.15).
 * Instructions naming an unknown or already-gone handle return Rejected.
   Invalid input (off-tick price, qty not a positive lot multiple, size
   change to 0 or to the same qty, price change to the same price, time going
@@ -46,15 +54,25 @@ class EngineError(ValueError):
     """Invalid instruction input."""
 
 
+# Each market segment's soids live in [k * SPAN + 1, (k + 1) * SPAN] for
+# segment k: unique across segments, incremental within one. 10^12 IDs per
+# segment is far more than any run uses; the 64-bit signed range B3 counts
+# up to (Guidelines p.68) holds over 9 million such ranges.
+SOID_SEGMENT_SPAN = 10 ** 12
+
+
 class Counter:
     """Increasing integer source. One per market segment for soids, one per
-    engine for handles."""
+    engine for handles. limit: the last value it may hand out."""
 
-    def __init__(self, start=1):
+    def __init__(self, start=1, limit=None):
         self._next = start
+        self._limit = limit
 
     def next(self):
         value = self._next
+        if self._limit is not None and value > self._limit:
+            raise EngineError(f"counter passed its range end {self._limit}")
         self._next += 1
         return value
 
@@ -110,9 +128,21 @@ class PriceChange:
 
 
 @dataclass(frozen=True)
-class MassCancel:
+class SupervisorDeleteThru:
+    """Market supervision deletes a whole side of one book (published as
+    MassDeleteOrders_MBO DELETE_THRU, Guidelines p.71)."""
     time_ns: int
     side: str
+
+
+@dataclass(frozen=True)
+class FirmMassCancel:
+    """A participant's mass cancel: every resting order of one firm on the
+    given instruments, both sides (Engine.firm_mass_cancel; published as
+    one event of DeleteOrder_MBO, Guidelines p.15)."""
+    time_ns: int
+    firm: int
+    instruments: tuple
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +258,20 @@ class Requeued:
 
 
 @dataclass(frozen=True)
-class MassCancelled:
+class SupervisorDeletedThru:
     instrument: str
     time_ns: int
     side: str
     orders: tuple            # OrderViews removed, in priority order
+
+
+@dataclass(frozen=True)
+class FirmMassCancelled:
+    """No single instrument: it can cover several books."""
+    time_ns: int
+    firm: int
+    cancelled: tuple         # (instrument, OrderView): instruments in the order
+                             # given, each book's orders in priority order
 
 
 @dataclass(frozen=True)
@@ -339,8 +378,8 @@ class Book:
             return self._size_change(instruction)
         if kind is PriceChange:
             return self._price_change(instruction)
-        if kind is MassCancel:
-            return self._mass_cancel(instruction)
+        if kind is SupervisorDeleteThru:
+            return self._supervisor_delete_thru(instruction)
         raise EngineError(f"unknown instruction {instruction!r}")
 
     def top(self, n):
@@ -539,7 +578,7 @@ class Book:
                         old.soid, order.soid, old.price, new_price, old.qty, new_qty,
                         old.insert_time_ns, time_ns)
 
-    def _mass_cancel(self, instruction):
+    def _supervisor_delete_thru(self, instruction):
         self._check_side(instruction.side)
         s = self._sides[instruction.side]
         removed = []
@@ -547,8 +586,17 @@ class Book:
             removed.extend(s.levels[price].values())
         for order in removed:
             self._unrest(order)
-        return MassCancelled(self.instrument, instruction.time_ns, instruction.side,
-                             tuple(o.view() for o in removed))
+        return SupervisorDeletedThru(self.instrument, instruction.time_ns, instruction.side,
+                                     tuple(o.view() for o in removed))
+
+    def cancel_firm(self, time_ns, firm):
+        """Remove every resting order of firm (bids then offers, priority
+        order) and return their views."""
+        self._check_time(time_ns)
+        removed = [o for o in self.resting_orders() if o.firm == firm]
+        for view in removed:
+            self._unrest(self._orders[view.handle])
+        return removed
 
 
 # ---------------------------------------------------------------------------
@@ -557,17 +605,24 @@ class Book:
 
 class Engine:
     """Books for several instruments. Books of the same market segment
-    share one soid counter; handles are unique across the engine."""
+    share one soid counter, each segment in its own range (module
+    docstring); handles are unique across the engine."""
 
     def __init__(self, instruments, *, soid_start=1, handle_start=1):
-        """instruments: iterable of (name, tick, lot, segment)."""
+        """instruments: iterable of (name, tick, lot, segment). soid_start
+        is the first soid inside each segment's range."""
+        if not 1 <= soid_start <= SOID_SEGMENT_SPAN:
+            raise EngineError(f"soid_start must be in 1..{SOID_SEGMENT_SPAN}")
         self._handles = Counter(handle_start)
         self.segments = {}
         self.books = {}
         for name, tick, lot, segment in instruments:
             if name in self.books:
                 raise EngineError(f"duplicate instrument {name}")
-            counter = self.segments.setdefault(segment, Counter(soid_start))
+            if segment not in self.segments:
+                base = len(self.segments) * SOID_SEGMENT_SPAN
+                self.segments[segment] = Counter(base + soid_start, limit=base + SOID_SEGMENT_SPAN)
+            counter = self.segments[segment]
             self.books[name] = Book(name, tick, lot, counter, self._handles)
 
     def submit(self, instrument, instruction):
@@ -575,3 +630,14 @@ class Engine:
         if book is None:
             raise EngineError(f"unknown instrument {instrument}")
         return book.apply(instruction)
+
+    def firm_mass_cancel(self, instruction):
+        """FirmMassCancel across its instruments, as one outcome."""
+        unknown = [n for n in instruction.instruments if n not in self.books]
+        if unknown or len(set(instruction.instruments)) != len(instruction.instruments):
+            raise EngineError(f"bad instruments for a mass cancel: {instruction.instruments}")
+        cancelled = []
+        for name in instruction.instruments:
+            for view in self.books[name].cancel_firm(instruction.time_ns, instruction.firm):
+                cancelled.append((name, view))
+        return FirmMassCancelled(instruction.time_ns, instruction.firm, tuple(cancelled))

@@ -9,9 +9,11 @@ Intent log (JSON Lines): one row per message on the wire, in wire order
      "null": [fields whose wire value is their null]}
 
 blockLength and version are the message header's (the schema's unless the
-publisher encoded a newer-schema message). A template the schema does not
+publisher encoded a newer- or older-schema message). A message of an older
+version has "absent": [fields that version did not have]; they are not in
+"fields" or "null". A template the schema does not
 have gets fields {"body": hex}. The last part of a News also carries
-"news": {"newsID", "headline", "text"} with the reassembled text.
+"news": {"headline", "text"} with the reassembled text.
 
 fields holds every non-constant field of the template. Fields the publisher
 left out get their null from layouts.py. An optional field is listed in
@@ -41,21 +43,27 @@ import json
 from array import array
 from pathlib import Path
 
-from b3gen import layouts
+from b3gen import encode, layouts
 from b3gen.packet import HEARTBEAT_SEQUENCE_NUMBER, Heartbeat, Placement
 from b3gen.pcap import PcapWriter
 
 SEQUENCE_TEMPLATE = layouts.TEMPLATES_BY_NAME["Sequence_2"].id
 
 
-def wire_fields(template_id, fields):
-    """(every field -> wire value, [null field names]) for one message."""
+def wire_fields(template_id, fields, version=None):
+    """(every field -> wire value, [null field names], [absent field names])
+    for one message. A message of an older schema version has no bytes for
+    the fields that came later: they are absent, not null."""
     template = layouts.TEMPLATES[template_id]
     if template.groups:
         raise NotImplementedError(f"{template.name}: groups in the intent log")
+    present = template.fields
+    if version is not None and version < layouts.SCHEMA_VERSION:
+        present = encode.fields_at_version(template, version)
+    absent = [f.name for f in template.fields if f not in present]
     out = {}
     nulls = []
-    for f in template.fields:
+    for f in present:
         if f.primitive == "composite":
             raise NotImplementedError(f"{template.name}.{f.name}: composite in the intent log")
         if f.deprecated is not None or f.name not in fields:
@@ -77,23 +85,26 @@ def wire_fields(template_id, fields):
     for d in template.var_data:
         value = fields.get(d.name, b"")
         out[d.name] = value.decode("utf-8") if isinstance(value, bytes) else value
-    return out, nulls
+    return out, nulls, absent
 
 
 def message_row(p, msg):
     """Intent row for one Published message at Placement p."""
+    absent = []
     if msg.template_id in layouts.TEMPLATES:
-        fields, nulls = wire_fields(msg.template_id, msg.fields)
+        fields, nulls, absent = wire_fields(msg.template_id, msg.fields, msg.version)
     else:
         fields, nulls = {"body": msg.fields["body"].hex()}, []
     row = _row(p, msg.template_id, msg.instrument, fields, nulls,
                msg.block_length, msg.version)
+    if absent:
+        row["absent"] = absent
     row.update(msg.annotations or {})
     return row
 
 
 def heartbeat_row(hb):
-    fields, nulls = wire_fields(SEQUENCE_TEMPLATE, {"nextSeqNo": hb.next_seq_no})
+    fields, nulls, _ = wire_fields(SEQUENCE_TEMPLATE, {"nextSeqNo": hb.next_seq_no})
     return _row(hb.placement, SEQUENCE_TEMPLATE, None, fields, nulls)
 
 

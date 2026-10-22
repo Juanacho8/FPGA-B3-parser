@@ -15,8 +15,14 @@ Outcome -> messages (one event each, EndOfEvent only on the last message):
 * Cancelled: DeleteOrder_MBO.
 * SizeReduced: Order_MBO CHANGE (same soid, mDEntryPrevSize = old qty).
 * Requeued: DeleteOrder_MBO (old) then Order_MBO NEW (new soid).
-* MassCancelled: MassDeleteOrders_MBO DELETE_THRU, nothing if no orders went.
-* Executed: ExecutionSummary; DeleteOrder_MBO for a replaced order (crossing
+* SupervisorDeletedThru (market supervision, Guidelines p.71):
+  MassDeleteOrders_MBO DELETE_THRU, nothing if no orders went.
+* FirmMassCancelled (a participant's mass cancel, Guidelines p.15): one
+  event of DeleteOrder_MBO across its instruments, all on one channel,
+  only the last with EndOfEvent (LAYOUTS.md 12.2); nothing if no orders
+  went.
+* Executed: ExecutionSummary (tradedHiddenQty 0, cxlQty = discarded
+  market/IOC remainder or 0); DeleteOrder_MBO for a replaced order (crossing
   price change); one Trade per fill; per resting order hit DeleteOrder_MBO
   (fully filled) or Order_MBO CHANGE (partially); Order_MBO NEW for a resting
   remainder; OpeningPrice/HighPrice/LowPrice as needed; ExecutionStatistics.
@@ -40,16 +46,21 @@ Rare messages (step 7c; inferences recorded in docs/FEED_GENERATOR_CONTEXT.md):
 * trade_bust: TradeBust copying an earlier Trade (securityID, session,
   price, size, tradeID, tradeDate), its own event (0x80). Statistics are
   left unchanged.
-* news_parts: News split into parts (section 12.10): same newsID,
-  partNumber 1..partCount, totalTextLength = the whole text's bytes,
+* news_parts: News split into parts (section 12.10): partNumber
+  1..partCount, totalTextLength = the whole text's bytes, newsID null
+  (B3 sends it only on the Unified News Channel, "not sent for trading
+  engine News messages": clients group parts by channel and order),
+  languageCode "en" (lowercase ISO 639-1),
   headline in part 1 only, each part a standalone message (0x80). No rptSeq
   (the template has none). The last part is annotated with the reassembled
   text for the intent log.
 * unknown: a message with a templateId the schema does not have (schema
   evolution tests); publish(..., block_extra, version) encodes an event with
-  a larger blockLength (zero bytes) and another header version.
+  a larger blockLength (zero bytes) and another header version. A version
+  older than the schema leaves out the fields it did not have (both from
+  the bytes and from the intent) and uses its shorter blockLength.
 
-Inferences (B3 does not specify them) are recorded as open items G, H and I
+Inferences (B3 does not specify them) are recorded as open items G, H, I, N and P
 in docs/FEED_GENERATOR_CONTEXT.md section 12.
 
 Must not: know about packet boundaries.
@@ -309,8 +320,8 @@ class Publisher:
             "mDEntryPx": f["mDEntryPx"], "mDEntrySize": f["mDEntrySize"],
             "tradeID": f["tradeID"], "tradeDate": f["tradeDate"], "transactTime": time_ns})])
 
-    def news_parts(self, time_ns, channel, name, news_id, headline, text, part_size,
-                   source="OTHER", language="EN", block_extra=0, version=None):
+    def news_parts(self, time_ns, channel, name, headline, text, part_size,
+                   source="OTHER", language="en", block_extra=0, version=None):
         """The parts of one News as [[Published]] (one event each), to be
         sent in order. name None: market-wide (securityID null)."""
         data = text.encode("ascii")  # ASCII: byte splits never cut a character
@@ -318,7 +329,7 @@ class Publisher:
         parts = []
         for number, chunk in enumerate(chunks, start=1):
             fields = {"newsSource": ENUMS["NewsSource"][source], "languageCode": language,
-                      "partCount": len(chunks), "partNumber": number, "newsID": news_id,
+                      "partCount": len(chunks), "partNumber": number,
                       "origTime": time_ns, "totalTextLength": len(data), "text": chunk}
             if name is not None:
                 fields["securityID"] = self.instruments[name].security_id
@@ -328,7 +339,7 @@ class Publisher:
                                 block_extra=block_extra, version=version)
             parts.append(event)
         parts[-1][0] = dataclasses.replace(parts[-1][0], annotations={"news": {
-            "newsID": news_id, "headline": headline, "text": text}})
+            "headline": headline, "text": text}})
         return parts
 
     @staticmethod
@@ -378,6 +389,8 @@ class Publisher:
         kind = type(outcome)
         if kind in (engine.Unfilled, engine.Rejected):
             return []
+        if kind is engine.FirmMassCancelled:
+            return self._firm_mass_cancel(outcome, block_extra, version)
         inst = self.instruments.get(outcome.instrument)
         if inst is None:
             raise PublishError(f"unknown instrument {outcome.instrument}")
@@ -402,7 +415,7 @@ class Publisher:
                                "enteringFirm": outcome.firm,
                                "mDInsertTimestamp": outcome.new_insert_time_ns,
                                "secondaryOrderID": outcome.new_soid, "transactTime": t})]
-        elif kind is engine.MassCancelled:
+        elif kind is engine.SupervisorDeletedThru:
             if not outcome.orders:
                 return []  # no effect on the book, nothing to publish (choice 1)
             msgs = [(T_MASS_DELETE, {"securityID": sid, "mDUpdateAction": DELETE_THRU,
@@ -415,13 +428,29 @@ class Publisher:
         return self._event(t, [(inst.channel, inst.name, tid, f) for tid, f in msgs],
                            block_extra=block_extra, version=version)
 
+    def _firm_mass_cancel(self, outcome, block_extra, version):
+        if not outcome.cancelled:
+            return []
+        insts = [self.instruments[name] for name, _ in outcome.cancelled]
+        if len({i.channel for i in insts}) != 1:
+            raise PublishError("a mass cancel event must stay on one channel")
+        t = outcome.time_ns
+        msgs = [(inst.channel, inst.name, *self._delete(inst.security_id, t, o.side, o.price,
+                                                          o.qty, o.soid))
+                for inst, (_, o) in zip(insts, outcome.cancelled)]
+        return self._event(t, msgs, block_extra=block_extra, version=version)
+
     def _execution(self, inst, ex):
         sid = inst.security_id
         s = self._state[inst.name]
         t = ex.time_ns
+        # tradedHiddenQty 0: no hidden (iceberg) orders in v1. cxlQty: the
+        # market/IOC remainder discarded at the end of matching, 0 when
+        # nothing is cancelled (inference, open item N).
         msgs = [(T_EXEC_SUMMARY, {
             "securityID": sid, "aggressorSide": AGGRESSOR[ex.side],
             "lastPx": ex.fills[-1].price, "fillQty": ex.filled_qty,
+            "tradedHiddenQty": 0, "cxlQty": ex.discarded_qty,
             "aggressorTime": t, "transactTime": t})]
         if ex.replaced is not None:
             # Crossing price change: the old order leaves the book first
@@ -544,8 +573,14 @@ class Publisher:
                 state = self._state[instrument]
                 state.rpt_seq += 1
                 fields["rptSeq"] = state.rpt_seq
-            block_length = layouts.TEMPLATES[template_id].block_length + block_extra \
-                if block_extra else None
+            template = layouts.TEMPLATES[template_id]
+            block_length = template.block_length + block_extra if block_extra else None
+            if version is not None and version < layouts.SCHEMA_VERSION:
+                # An older encoder: fields newer than its version are not
+                # on the wire, so they are not in the intent either.
+                kept = {f.name for f in encode.fields_at_version(template, version)}
+                fields = {k: v for k, v in fields.items() if k in kept}
+                block_length = encode.block_length_at_version(template, version) + block_extra
             out.append(Published(time_ns, channel, instrument, template_id, fields,
                                  encode.encode(template_id, fields, block_length=block_length,
                                                version=version),

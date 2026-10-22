@@ -17,7 +17,10 @@ Value rules:
 * Groups take a list of dicts. Var data takes bytes or str (UTF-8).
 
 Overrides for the schema evolution scenario: block_length larger than the
-schema (extra zero bytes after the known fields) and version.
+schema (extra zero bytes after the known fields) and version. A version
+older than the schema writes only the fields that version had (sinceVersion
+<= version) and its shorter root block, as an encoder built from that
+schema would (LAYOUTS.md section 5); naming a newer field then raises.
 
 The thin wrappers at the bottom name the templates the generator emits
 (docs/FEED_GENERATOR_CONTEXT.md section 6).
@@ -185,6 +188,29 @@ def encode_var_data(data, value, where):
 
 
 # ---------------------------------------------------------------------------
+# Older schema versions
+# ---------------------------------------------------------------------------
+
+def fields_at_version(template, version):
+    """The root-block fields a version of the schema has."""
+    return [f for f in template.fields if f.since_version is None or f.since_version <= version]
+
+
+def block_length_at_version(template, version):
+    """The root block a version of the schema has: everything before its
+    first newer field. Newer fields are only ever appended (Guidelines
+    5.9), so they must all sit after the kept ones."""
+    kept = fields_at_version(template, version)
+    newer = [f for f in template.fields if f not in kept]
+    if not newer:
+        return template.block_length
+    start = min(f.offset for f in newer)
+    if any(f.offset + f.size > start for f in kept):
+        raise EncodeError(f"{template.name}: version {version} fields are not a prefix")
+    return start
+
+
+# ---------------------------------------------------------------------------
 # Message
 # ---------------------------------------------------------------------------
 
@@ -192,24 +218,32 @@ def encode(template_id, values, *, block_length=None, version=None):
     """Encode one message (framing header + SBE header + body) to bytes.
 
     block_length: override, must be >= the schema blockLength. The extra
-    bytes are zero. version: override for the header's schema version."""
+    bytes are zero. version: override for the header's schema version; an
+    older one drops the fields that version did not have."""
     template = layouts.TEMPLATES.get(template_id)
     if template is None:
         raise EncodeError(f"unknown template id {template_id}")
     where = template.name
     values = dict(values)
 
+    fields, schema_block = template.fields, template.block_length
+    if version is not None and version < layouts.SCHEMA_VERSION:
+        fields = fields_at_version(template, version)
+        schema_block = block_length_at_version(template, version)
+        newer = set(values) & {f.name for f in template.fields if f not in fields}
+        if newer:
+            raise EncodeError(f"{where}: {sorted(newer)} not in schema version {version}")
+
     extra = {g.name for g in template.groups} | {d.name for d in template.var_data}
-    check_names(values, template.fields, template.constants, extra, where)
+    check_names(values, fields, template.constants, extra, where)
 
     if block_length is None:
-        block_length = template.block_length
-    if block_length < template.block_length:
-        raise EncodeError(f"{where}: block_length {block_length} < schema "
-                          f"{template.block_length}")
+        block_length = schema_block
+    if block_length < schema_block:
+        raise EncodeError(f"{where}: block_length {block_length} < schema {schema_block}")
 
     root = bytearray(block_length)  # zero-filled: padding and the extension tail
-    write_block(root, 0, template.fields, values, where)
+    write_block(root, 0, fields, values, where)
 
     tail = b""
     for g in template.groups:

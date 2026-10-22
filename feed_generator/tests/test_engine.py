@@ -13,7 +13,7 @@ import pytest
 
 from b3gen.engine import (
     BUY, SELL, Cancel, Cancelled, Engine, EngineError, Executed, IocOrder, MarketOrder,
-    MassCancel, MassCancelled, NewOrder, PriceChange, Rejected, Requeued, Rested,
+    SupervisorDeleteThru, SupervisorDeletedThru, NewOrder, PriceChange, Rejected, Requeued, Rested,
     SizeChange, SizeReduced, Unfilled,
 )
 from order_stream import BOOKS, LOT, TICK, random_stream, to_engine_instruction
@@ -187,17 +187,17 @@ def test_unfilled_ioc_and_market():
     assert d.top() == ([], [(1100, 100, 1)])
 
 
-def test_mass_cancel_one_side_in_priority_order():
+def test_supervisor_delete_thru_one_side_in_priority_order():
     d = Driver()
     a = d(NewOrder, BUY, 900, 100, 1)
     b = d(NewOrder, BUY, 1000, 100, 1)
     c = d(NewOrder, BUY, 1000, 100, 1)
     d(NewOrder, SELL, 1200, 100, 1)
-    out = d(MassCancel, BUY)
-    assert isinstance(out, MassCancelled)
+    out = d(SupervisorDeleteThru, BUY)
+    assert isinstance(out, SupervisorDeletedThru)
     assert [o.handle for o in out.orders] == [b.handle, c.handle, a.handle]
     assert d.top() == ([], [(1200, 100, 1)])
-    assert d(MassCancel, BUY).orders == ()
+    assert d(SupervisorDeleteThru, BUY).orders == ()
 
 
 def test_rejections_on_unknown_and_gone_handles():
@@ -258,8 +258,33 @@ def test_soid_counter_shared_within_segment_only():
     f = engine.submit("F", NewOrder(1, BUY, 50_000, 1, 1))
     a2 = engine.submit("A", NewOrder(2, BUY, 1000, 100, 1))
     assert (a.soid, b.soid, a2.soid) == (1, 2, 3)  # A and B share EQT's counter
-    assert f.soid == 1                             # DRV has its own
+    assert f.soid == 10 ** 12 + 1                  # DRV counts in its own range
     assert len({a.handle, b.handle, f.handle, a2.handle}) == 4  # handles engine-wide
+
+
+def test_soids_never_repeat_across_segments():
+    # Guidelines p.68: unique across all market segments, incremental per
+    # segment. Every soid a random stream allocates, by segment.
+    engine = Engine([(name, tick, lot, seg) for name, (seg, tick, lot) in BOOKS.items()])
+    by_segment = {}
+    for instr, _, _ in random_stream(4, 3000):
+        out = engine.submit(instr[1], to_engine_instruction(instr))
+        # Newly allocated soids only (SizeReduced reports the kept one).
+        new = {Rested: "soid", Executed: "soid", Unfilled: "soid", Requeued: "new_soid"}
+        if type(out) in new:
+            by_segment.setdefault(BOOKS[instr[1]][0], []).append(getattr(out, new[type(out)]))
+    assert len(by_segment) == 2 and all(len(v) > 500 for v in by_segment.values())
+    for soids in by_segment.values():
+        assert soids == sorted(soids) and len(set(soids)) == len(soids)  # incremental
+    eqt, drv = (set(v) for v in by_segment.values())
+    assert not eqt & drv
+
+
+def test_soid_range_end_raises():
+    engine = Engine([("A", TICK, LOT, "EQT")], soid_start=10 ** 12)
+    engine.submit("A", NewOrder(1, BUY, 1000, 100, 1))
+    with pytest.raises(EngineError, match="range end"):
+        engine.submit("A", NewOrder(2, BUY, 1000, 100, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +326,8 @@ def tally_outcome(tally, normalized):
             tally["market_executed"] += 1
     if kind == "Rejected" and data["handle"] != 10 ** 9:
         tally["rejected_gone_handle"] += 1
-    if kind == "MassCancelled" and data["orders"]:
-        tally["mass_cancel_nonempty"] += 1
+    if kind == "SupervisorDeletedThru" and data["orders"]:
+        tally["delete_thru_nonempty"] += 1
 
 
 # About half of what each seed actually produces, so a weaker stream fails.
@@ -311,7 +336,7 @@ MINIMUMS = {
     "Requeued": 500, "Rejected": 250, "Unfilled": 120,
     "sweep_2plus_levels": 110, "partial_fill_of_resting": 280,
     "crossing_price_change": 70, "ioc_partial_discard": 30, "market_executed": 70,
-    "rejected_gone_handle": 150, "mass_cancel_nonempty": 14,
+    "rejected_gone_handle": 150, "delete_thru_nonempty": 14,
 }
 
 
