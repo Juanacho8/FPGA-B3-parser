@@ -74,6 +74,7 @@ class RunConfig:
     loss: scenarios.BurstParams = scenarios.BurstParams(0.01, 3)
     gap: scenarios.BurstParams = scenarios.BurstParams(0.001, 2)
     idle: scenarios.IdleParams | None = None  # pause the flow once (idle scenario)
+    resets: tuple = ()            # scenarios.Reset, in after_messages order
 
 
 @dataclass
@@ -93,6 +94,7 @@ class RunResult:
     regimes: list = field(default_factory=list)   # (start, end, regime) when record=True
     # Flow time: regimes do not move with an idle pause.
     message_times: list = field(default_factory=list)  # (channel, time_ns) per published message, when record=True
+    resets: list = field(default_factory=list)    # one dict per reset applied (tags, not placements)
 
 
 def _band(price, pct):
@@ -144,7 +146,9 @@ class ScenarioResult:
     manifest: dict
 
 
-SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle")
+SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS
+DAY_NS = 86_400 * 1_000_000_000
+START_OF_DAY_NS = 2_500_000_000   # stream up this long before the session: 3 heartbeats
 
 
 def run(config):
@@ -163,6 +167,16 @@ def run_scenario(config, name):
             config, idle=scenarios.IdleParams(after_messages=config.target_messages // 2))
     elif name != "idle":
         config = dataclasses.replace(config, idle=None)
+    if name in scenarios.RESET_KINDS:
+        target = {"channel_reset": config.instruments[0].channel,
+                  "instrument_reset": config.instruments[0].name}.get(name)
+        config = dataclasses.replace(
+            config, resets=(scenarios.Reset(name, config.target_messages // 2, target),))
+        if name == "weekly_start":  # the file opens on the Friday before
+            config = dataclasses.replace(config, start_ns=config.start_ns - 3 * DAY_NS,
+                                         trade_date=config.trade_date - 3)
+    else:
+        config = dataclasses.replace(config, resets=())
     config = dataclasses.replace(config, out_dir=Path(config.out_dir) / name)
     loss = config.loss if name == "loss" else None
     gap = config.gap if name == "gap" else None
@@ -190,10 +204,24 @@ def run_scenario(config, name):
     manifest = {"scenario": name, "seed": config.seed, "params": params,
                 "missing": {"A": [list(k) for k in feeds.missing_a],
                             "B": [list(k) for k in feeds.missing_b]},
-                "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())}}
+                "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())},
+                "resets": [_reset_record(r, packetized) for r in result.resets]}
     manifest_path = out / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     return ScenarioResult(result, feed_b_path, manifest_path, manifest)
+
+
+def _reset_record(reset, packetized):
+    """A reset's log entry with tags turned into wire placements."""
+    def at(tag):
+        return golden.placement_key(packetized.placements[tag])
+    out = {k: v for k, v in reset.items() if not k.endswith("tags")}
+    out["first"] = at(reset["tags"][0]) if reset["tags"] else None
+    out["last"] = at(reset["tags"][-1]) if reset["tags"] else None
+    out["sequence_resets"] = {str(ch): at(tag) for ch, tag in reset["sequence_reset_tags"].items()}
+    out["rebuilds"] = {name: [at(first), at(last)]
+                       for name, (first, last) in reset["rebuild_tags"].items()}
+    return out
 
 
 def _generate(config):
@@ -209,19 +237,24 @@ def _generate(config):
 
     published = []
     checkpoints = []
+    cleared = set()  # instruments a ChannelReset emptied, not rebuilt yet
     last_tag_on_channel = {}
     state = {"events": 0}
 
-    def emit(messages):
-        """Packetize one event and take a book key checkpoint every N events."""
+    def emit(messages, checkpoint=False):
+        """Packetize one event and take a book key checkpoint every N
+        events, or now if asked."""
         for m in messages:
             tag = len(published)
             published.append(m)
             packetizer.add(m.time_ns, m.channel, m.data, tag)
             last_tag_on_channel[m.channel] = tag
         state["events"] += 1
-        if state["events"] % config.book_key_every == 0:
-            books = {i.name: (last_tag_on_channel[i.channel], engine.books[i.name].top(5))
+        if checkpoint or state["events"] % config.book_key_every == 0:
+            # A correct client holds an empty book between a ChannelReset
+            # and the instrument's own rebuild.
+            books = {i.name: (last_tag_on_channel[i.channel],
+                              ((), ()) if i.name in cleared else engine.books[i.name].top(5))
                      for i in insts if i.channel in last_tag_on_channel}
             checkpoints.append((len(published) - 1, books))
 
@@ -234,6 +267,90 @@ def _generate(config):
     for m in publisher.start_session(config.start_ns, config.trade_date, values):
         emit([m])  # standalone: each its own event
 
+    on_channel = {c: [i.name for i in insts if i.channel == c] for c in channels}
+    reset_log = []
+
+    def rebuild(t, names, log):
+        """One recovery event per instrument with a book, each followed by a
+        book key checkpoint."""
+        for name in names:
+            orders = engine.books[name].resting_orders()
+            if not orders:
+                continue  # only instruments that had a book (Guidelines p.46)
+            first = len(published)
+            cleared.discard(name)
+            emit(publisher.rebuild(t, name, orders), checkpoint=True)
+            log["rebuild_tags"][name] = (first, len(published) - 1)
+
+    def sequence_reset(t, channel, log):
+        m = publisher.sequence_reset(t, channel)
+        tag = len(published)
+        published.append(m)
+        packetizer.bump_version(t, channel, final_message=m.data, final_tag=tag)
+        last_tag_on_channel[channel] = tag
+        log["sequence_reset_tags"][channel] = tag
+
+    def next_session(t, days, log, at_start=None):
+        """End the session at t, stream down until START_OF_DAY_NS before
+        the session `days` later, call at_start (the weekly start-up) and
+        open the new session with the same bands."""
+        for m in publisher.end_session(t):
+            emit([m])
+        start = config.start_ns + (log["trade_date_before"] - config.trade_date + days) * DAY_NS
+        for c in channels:
+            packetizer.stream_down(t, c, start - START_OF_DAY_NS)
+        flow.pause(start - t)
+        if at_start:
+            at_start(start)
+        new_date = log["trade_date_before"] + days
+        new_values = {i.name: dataclasses.replace(
+            values[i.name], prev_close=publisher.closing_price(i.name),
+            settlement_price=publisher.closing_price(i.name) if i.is_future else None,
+            settl_date=log["trade_date_before"] if i.is_future else None) for i in insts}
+        session = publisher.start_session(start, new_date, new_values)
+        for k, m in enumerate(session):
+            emit([m], checkpoint=k == len(session) - 1)
+        log["trade_date_after"] = new_date
+        log["session_start_ns"] = start
+        return start
+
+    def apply_reset(reset, t):
+        log = {"kind": reset.kind, "time_ns": t, "target": reset.target,
+               "sequence_reset_tags": {}, "rebuild_tags": {}}
+        first = len(published)
+        if reset.kind == "failover":
+            for c in channels:
+                sequence_reset(t, c, log)
+            for c in channels:
+                rebuild(t, on_channel[c], log)
+        elif reset.kind == "channel_reset":
+            cleared.update(on_channel[reset.target])
+            emit(publisher.channel_reset(t, reset.target))
+            rebuild(t, on_channel[reset.target], log)
+            cleared.clear()  # instruments without a book stay empty anyway
+        elif reset.kind == "instrument_reset":
+            rebuild(t, [reset.target], log)
+        else:
+            log["trade_date_before"] = publisher.trade_date(insts[0].name)
+
+            def start_up(start):
+                for c in channels:
+                    sequence_reset(start, c, log)
+                for c in channels:
+                    cleared.update(on_channel[c])
+                    emit(publisher.channel_reset(start, c))
+                for c in channels:
+                    rebuild(start, on_channel[c], log)
+                cleared.clear()
+
+            weekly = reset.kind == "weekly_start"
+            t = next_session(t, 3 if weekly else 1, log, start_up if weekly else None)
+        log["tags"] = list(range(first, len(published)))
+        reset_log.append(log)
+        return t
+
+    pending = sorted(config.resets, key=lambda r: r.after_messages)
+
     outcomes = Counter()
     instructions = Counter()
     streak = {i.name: 0 for i in insts}
@@ -242,6 +359,8 @@ def _generate(config):
     t = config.start_ns
     paused = config.idle is None
     while len(published) < config.target_messages:
+        if pending and len(published) >= pending[0].after_messages:
+            t = apply_reset(pending.pop(0), t)
         if not paused and len(published) >= config.idle.after_messages:
             # Shift the arrival clock before the engine, so every time on
             # the wire (transactTime, insert times, sendingTime) moves together.
@@ -277,7 +396,8 @@ def _generate(config):
         final_resting={i.name: len(engine.books[i.name].resting_orders()) for i in insts},
         arrivals=arrivals,
         regimes=list(flow.clock.segments) if config.record else [],
-        message_times=[(m.channel, m.time_ns) for m in published] if config.record else [])
+        message_times=[(m.channel, m.time_ns) for m in published] if config.record else [],
+        resets=reset_log)
     return result, published, packetized, checkpoints
 
 

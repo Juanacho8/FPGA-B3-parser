@@ -887,6 +887,7 @@ A set is a bitfield: each listed bit number is a flag.
 * When the incremental stream is idle for more than 1 s, B3 sends a packet containing a **Sequence** message. Its packet `sequenceNumber` is **0 and must be ignored**. Its `nextSeqNo` field is the sequenceNumber the next real packet will have.
 * No message on a stream for 3 heartbeat intervals means the stream is down and the book should be treated as inconsistent.
 * **SequenceReset** on the incremental stream means a severe failure or a regular start-up. The sequence restarts at 1 and sequenceVersion is incremented. After it, B3 replenishes the books with EmptyBook and Order_MBO messages that have the RecoveryMsg bit set.
+* **Where the SequenceReset goes** (Guidelines p.45 diagram): alone in a packet that is the old version's last, sequenceNumber X+1 and the old sequenceVersion N (the diagram marks these as "[P] probably X+1" and "[Q] probably the same as the last one"). The next packet (EmptyBook in the diagram) is sequenceNumber 1, sequenceVersion N+1. B3 calls P and Q arbitrary, so a client must accept the SequenceReset packet without checking its own sequenceNumber or sequenceVersion.
 
 ### 12.2 Events and MatchEventIndicator
 
@@ -989,4 +990,5 @@ The XML wins in every case below.
 | Message Reference, PriceBand_22 | Summary table names it "PriceBand_20" (template 20 was removed in schema 10). Template id 22 and length 48 are correct |
 | Message Reference, sample packet (6.3/6.5) | Table shows SchemaVersion hex as `10 00` while the hex dump and decoded value are `11 00` = 17. The dump is right |
 | Guidelines 6.5.5.4 and 6.5.5.5 | Example packets use schemaVersion 3, Order blockLength 60, Trade blockLength 52. These are from an old schema and do not match version 17 |
+| Message Reference 9.2.7, ChannelReset_11 | Says ChannelReset empties statistics. Guidelines p.47 and 14.3 say clients should keep statistics until a SecurityGroupPhase with securityTradingEvent = TRADING_SESSION_CHANGE (4). We follow the Guidelines (section 12.9) |
 | Guidelines 10 | Example table gives old message sizes (Trade 52, OpeningPrice 40, DeleteOrder 40) and lists ExecutionStatistics as template 55. Current values: Trade 56, OpeningPrice 44, DeleteOrder 52, ExecutionStatistics 56 |

@@ -17,15 +17,19 @@ within a channel.
 
 Sequencing: sequenceNumber +1 per packet per channel, sequenceVersion starts
 at 1. bump_version() increments the version (rolling back to 1 after 65534)
-and restarts sequenceNumber at 1.
+and restarts sequenceNumber at 1. Given a final message (SequenceReset), it
+first sends that message alone as the old version's last packet, at the next
+sequenceNumber (LAYOUTS.md section 12.1).
 
 Heartbeats: when a channel has no open packet for more than heartbeat_ns,
 a packet holding only a Sequence message is sent, with packet
 sequenceNumber 0 and nextSeqNo = the next real packet's number. Repeats
 every heartbeat_ns while idle. Idle time counts from the last packet sent on
-the channel, or from start_ns before the first one.
+the channel, or from start_ns before the first one. stream_down() stops a
+channel's heartbeats until it comes back up (weekend, overnight); the first
+start-of-day heartbeat goes out as it comes up.
 
-Feed B (a delayed copy) and packet loss belong to step 7, not here.
+Feed B (a delayed copy) and packet loss belong to scenarios.py, not here.
 
 Must not: change message content.
 See docs/FEED_GENERATOR_CONTEXT.md section 7 and spec/LAYOUTS.md sections 3 and 12.1.
@@ -130,17 +134,33 @@ class Packetizer:
         ch.open_tags.append(tag)
         ch.open_size += len(message)
 
-    def bump_version(self, time_ns, channel):
-        """Close the open packet, then sequenceVersion +1 and sequenceNumber 1."""
+    def bump_version(self, time_ns, channel, final_message=None, final_tag=None):
+        """Close the open packet, send final_message (if any) alone as the
+        old version's last packet, then sequenceVersion +1 and
+        sequenceNumber 1."""
         ch = self._channel(channel)
         if time_ns < ch.last_message_ns:
             raise PacketError(f"channel {channel}: time {time_ns} before {ch.last_message_ns}")
         ch.last_message_ns = time_ns
         self._close_by(ch, time_ns)
         self._heartbeats(ch, until_ns=time_ns, inclusive=False)
+        if final_message is not None:
+            self._emit(ch, time_ns, ch.next_sequence_number, bytes(final_message), [final_tag])
+            ch.next_sequence_number += 1
         ch.sequence_version = 1 if ch.sequence_version >= MAX_SEQUENCE_VERSION \
             else ch.sequence_version + 1
         ch.next_sequence_number = 1
+
+    def stream_down(self, time_ns, channel, up_ns):
+        """Close the open packet at time_ns, send the heartbeats due before
+        it, then nothing until up_ns, when start-of-day heartbeats begin."""
+        ch = self._channel(channel)
+        if not time_ns <= up_ns or time_ns < ch.last_message_ns:
+            raise PacketError(f"channel {channel}: bad stream_down {time_ns}..{up_ns}")
+        self._close_by(ch, time_ns)
+        self._heartbeats(ch, until_ns=time_ns, inclusive=False)
+        ch.last_message_ns = up_ns
+        ch.last_send_ns = up_ns - self.heartbeat_ns
 
     def finish(self, end_ns):
         """Close every open packet, emit trailing heartbeats up to end_ns and

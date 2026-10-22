@@ -21,15 +21,9 @@ from wire import read_packets, top5
 TIMESTAMPS = ("transactTime", "mDEntryTimestamp", "mDInsertTimestamp", "aggressorTime")
 
 
-def config(out_dir, **overrides):
-    return main.default_config(seed=1, target_messages=6000, out_dir=out_dir,
-                               book_key_every=50, **overrides)
+from conftest import scenario_config as config
 
-
-@pytest.fixture(scope="module")
-def runs(tmp_path_factory):
-    out = tmp_path_factory.mktemp("scenarios")
-    return {name: main.run_scenario(config(out), name) for name in main.SCENARIOS}
+FEED_SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle")  # same session as clean
 
 
 def sequenced(packets):
@@ -128,14 +122,14 @@ def missing(full, feed):
 
 @pytest.mark.parametrize("name", main.SCENARIOS)
 def test_missing_packets_match_the_manifest(runs, name):
-    full = read_packets(runs["clean"].run.pcap_path)
     a, b = feeds(runs[name])
+    full = read_packets(runs["clean"].run.pcap_path) if name in FEED_SCENARIOS else a
     manifest = json.loads(Path(runs[name].manifest_path).read_text())
     assert manifest == runs[name].manifest
     assert missing(full, a) == manifest["missing"]["A"]
     assert missing(full, b) == manifest["missing"]["B"]
-    expect = {"clean": (False, False), "idle": (False, False),
-              "loss": (True, False), "gap": (True, True), "gap_one": (True, True)}[name]
+    expect = {"loss": (True, False), "gap": (True, True), "gap_one": (True, True)}.get(
+        name, (False, False))
     assert (bool(manifest["missing"]["A"]), bool(manifest["missing"]["B"])) == expect
     if name in ("gap", "gap_one"):
         assert manifest["missing"]["A"] == manifest["missing"]["B"]

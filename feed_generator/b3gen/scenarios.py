@@ -23,6 +23,21 @@ Built so far (step 7a):
 * Idle: a pause in the order flow (main.py, via OrderFlow.pause), so the
   packetizer sends heartbeats on both feeds.
 
+Step 7b: Reset describes a restart or reset that main.py drives through the
+normal layers (publisher.sequence_reset/channel_reset/rebuild, packetizer
+bump_version/stream_down):
+* failover: per channel SequenceReset, alone in the old version's last
+  packet (sequenceNumber X+1, version N); then version N+1 from 1, and each
+  instrument with a book rebuilt (LAYOUTS.md 12.1, 12.9).
+* channel_reset: ChannelReset on one channel, then its rebuilds. No version change.
+* instrument_reset: one instrument's rebuild (EmptyBook + orders).
+* session_change: end of session, the stream down overnight, 3 start-of-day
+  heartbeats, then the next day's session start (TRADING_SESSION_CHANGE).
+* weekly_start: Friday's end of session, the stream down over the weekend,
+  3 start-of-day heartbeats, per channel SequenceReset and version +1,
+  ChannelReset, rebuilds of the orders carried over, then Monday's session.
+v1 rebuilds every instrument before live flow resumes (open item J).
+
 unreliable_books: after a packet missing from both feeds, a client's book is
 wrong for every instrument with a message in it, from that packet on (until
 a snapshot, v2). A message with no instrument (SecurityGroupPhase) makes
@@ -55,6 +70,25 @@ class BurstParams:
 class IdleParams:
     after_messages: int                  # pause once this many messages are published
     duration_ns: int = 3_500_000_000     # long enough for 3 heartbeats per channel
+
+
+RESET_KINDS = ("failover", "channel_reset", "instrument_reset", "session_change",
+               "weekly_start")
+
+
+@dataclass(frozen=True)
+class Reset:
+    """A restart or reset once after_messages messages are published
+    (step 7b, docs/FEED_GENERATOR_CONTEXT.md section 9). target is the
+    channel for channel_reset, the instrument for instrument_reset, unused
+    otherwise."""
+    kind: str
+    after_messages: int
+    target: object = None
+
+    def __post_init__(self):
+        if self.kind not in RESET_KINDS:
+            raise ValueError(f"unknown reset {self.kind!r}; one of {RESET_KINDS}")
 
 
 @dataclass(frozen=True)

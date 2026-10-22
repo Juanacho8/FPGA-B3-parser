@@ -24,6 +24,18 @@ Outcome -> messages (one event each, EndOfEvent only on the last message):
 Session start/end and other standalone statistics or status messages each
 form their own event and carry EndOfEvent.
 
+Resets (spec/LAYOUTS.md sections 12.1, 12.2, 12.5, 12.9):
+* sequence_reset: SequenceReset, alone (no matchEventIndicator, no event).
+* channel_reset: ChannelReset as its own event, 0xA0 (RecoveryMsg +
+  EndOfEvent); Guidelines p.47 draws it outside the recovery bracket.
+* rebuild: one event per instrument, EmptyBook then an Order_MBO NEW for
+  every resting order in priority order, all with RecoveryMsg (0x20), the
+  last 0xA0. Orders keep their secondaryOrderID and mDInsertTimestamp;
+  transactTime is the rebuild time. EmptyBook has no rptSeq; the
+  instrument's rptSeq restarts at 1 on the message after it.
+Statistics survive every reset; only start_session (TRADING_SESSION_CHANGE)
+clears them (section 12.9; LAYOUTS.md section 13 on Message Reference 9.2.7).
+
 Inferences (B3 does not specify them) are recorded as open items G, H and I
 in docs/FEED_GENERATOR_CONTEXT.md section 12.
 
@@ -65,8 +77,12 @@ T_QTY_BAND = _template_id("QuantityBand_21")
 T_SETTLEMENT = _template_id("SettlementPrice_28")
 T_OPEN_INTEREST = _template_id("OpenInterest_29")
 T_GROUP_PHASE = _template_id("SecurityGroupPhase_10")
+T_SEQUENCE_RESET = _template_id("SequenceReset_1")
+T_EMPTY_BOOK = _template_id("EmptyBook_9")
+T_CHANNEL_RESET = _template_id("ChannelReset_11")
 
 END_OF_EVENT = _set_bit("MatchEventIndicator", "EndOfEvent")
+RECOVERY_MSG = _set_bit("MatchEventIndicator", "RecoveryMsg")
 REGULAR_TRADE = _set_bit("TradeCondition", "RegularTrade")
 OPENING_TRADE = _set_bit("TradeCondition", "OpeningPrice")
 SAME_PRICE = _set_bit("TradeCondition", "LastTradeAtTheSamePrice")
@@ -171,6 +187,7 @@ class _State:
         self.low = None
         self.last_price = None
         self.opened = False
+        self.close = None        # set by end_session
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +263,41 @@ class Publisher:
         for inst in self.instruments.values():
             s = self._state[inst.name]
             close = s.last_price if s.last_price is not None else s.prev_close
+            s.close = close
             out += self._event(time_ns, [(inst.channel, inst.name, T_CLOSING, {
                 "securityID": inst.security_id, "openCloseSettlFlag": FLAG_DAILY,
                 "mDEntryPx": close * PRICE8_FACTOR, "tradeDate": s.trade_date,
                 "mDEntryTimestamp": time_ns})])
         self._in_session = False
         return out
+
+    def closing_price(self, name):
+        """The close end_session published for an instrument."""
+        return self._state[name].close
+
+    def trade_date(self, name):
+        return self._state[name].trade_date
+
+    # -- resets -------------------------------------------------------------
+
+    def sequence_reset(self, time_ns, channel):
+        """SequenceReset (no fields: newSeqNo is the constant 1)."""
+        return Published(time_ns, channel, None, T_SEQUENCE_RESET, {},
+                         encode.encode(T_SEQUENCE_RESET, {}))
+
+    def channel_reset(self, time_ns, channel):
+        return self._event(time_ns, [(channel, None, T_CHANNEL_RESET,
+                                      {"mDEntryTimestamp": time_ns})], recovery=True)
+
+    def rebuild(self, time_ns, name, orders):
+        """EmptyBook then the instrument's resting orders (engine OrderViews,
+        priority order), as one recovery event."""
+        inst = self.instruments[name]
+        sid = inst.security_id
+        msgs = [(T_EMPTY_BOOK, {"securityID": sid, "mDEntryTimestamp": time_ns})]
+        msgs += [self._order_new(sid, time_ns, o) for o in orders]
+        return self._event(time_ns, [(inst.channel, name, tid, f) for tid, f in msgs],
+                           recovery=True)
 
     # -- outcomes -----------------------------------------------------------
 
@@ -407,18 +453,22 @@ class Publisher:
         if not self._in_session:
             raise PublishError("no trading session in progress; call start_session first")
 
-    def _event(self, time_ns, messages):
+    def _event(self, time_ns, messages, recovery=False):
         """Finish one event: matchEventIndicator (EndOfEvent on the last
-        message only), rptSeq per instrument in message order, then encode."""
+        message only, RecoveryMsg on every message of a recovery), rptSeq
+        per instrument in message order, then encode."""
         out = []
         last = len(messages) - 1
+        flags = RECOVERY_MSG if recovery else 0
         for i, (channel, instrument, template_id, fields) in enumerate(messages):
             fields = dict(fields)
             if HAS_MATCH_EVENT[template_id]:
-                fields["matchEventIndicator"] = END_OF_EVENT if i == last else 0
+                fields["matchEventIndicator"] = flags | (END_OF_EVENT if i == last else 0)
             elif i == last:
                 raise PublishError(f"template {template_id} cannot end an event")
-            if HAS_RPTSEQ[template_id]:
+            if template_id == T_EMPTY_BOOK:
+                self._state[instrument].rpt_seq = 0  # restarts at 1 with the next message
+            elif HAS_RPTSEQ[template_id]:
                 state = self._state[instrument]
                 state.rpt_seq += 1
                 fields["rptSeq"] = state.rpt_seq
