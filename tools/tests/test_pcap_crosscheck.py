@@ -10,8 +10,8 @@ import zlib
 import pcap_crosscheck as pc
 
 
-def frame(payload, dst=(233, 252, 8, 68), port=30068, proto=17, flags=0x4000):
-    udp = struct.pack("!HHHH", 50000, port, 8 + len(payload), 0) + payload
+def frame(payload, dst=(233, 252, 8, 68), port=30068, proto=17, flags=0x4000, udp_short=0):
+    udp = struct.pack("!HHHH", 50000, port, 8 + len(payload) - udp_short, 0) + payload
     ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 1, flags, 64, proto, 0,
                      bytes([10, 0, 0, 1]), bytes(dst))
     return bytes.fromhex("01005e7c0844" "02b300000001" "0800") + ip + udp
@@ -67,3 +67,26 @@ def test_unsupported_files_fail(tmp_path, capsys):
     path.write_bytes(pcap([(frame(b"a"), 0)])[:-3])     # record cut off
     assert pc.main([str(tmp_path), "--cpp", "/bin/false"]) == 1
     assert "UNSUPPORTED" in capsys.readouterr().out
+
+
+def test_udp_shorter_than_ip(tmp_path):
+    path = write(tmp_path, [(frame(b"abcd", udp_short=2), 0), (frame(b"ok"), 0)])
+    info = pc.python_info(path)
+    assert info["udp_shorter_than_ip"] == 1
+    assert info["udp_payloads"] == 2 and info["payload_bytes"] == 4    # "ab" + "ok"
+
+
+def test_sets_missing_a_feed_are_reported(tmp_path, capsys):
+    good = tmp_path / "small"
+    good.mkdir()
+    write(good, [(frame(b"hello"), 0)])
+    (good / "feedB.pcap").write_bytes((good / "feedA.pcap").read_bytes())
+    lonely = tmp_path / "scenarios" / "nopcap"
+    lonely.mkdir(parents=True)
+    (lonely / "intent.jsonl").write_text("")
+    line = {"file": "x", **pc.python_info(good / "feedA.pcap")}
+    assert pc.main([str(tmp_path), "--cpp", str(fake_cpp(tmp_path, json.dumps(line)))]) == 0
+    out = capsys.readouterr().out
+    assert "SKIPPED scenarios/nopcap/feedA.pcap" in out
+    assert "SKIPPED scenarios/nopcap/feedB.pcap" in out
+    assert "2/2 files match in 2 sets, 2 skipped" in out

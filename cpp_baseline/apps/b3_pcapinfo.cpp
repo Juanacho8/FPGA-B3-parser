@@ -118,7 +118,8 @@ int main(int argc, char** argv) {
         const auto& c = capture.counters();
         std::printf("{\"file\":\"%s\",\"frames\":%llu,\"udp_payloads\":%llu,\"payload_bytes\":%llu,"
                     "\"non_ipv4\":%llu,\"non_udp\":%llu,\"fragments\":%llu,\"truncated\":%llu,"
-                    "\"bad_lengths\":%llu,\"trailing_garbage\":%llu,\"crc32\":%u,\"groups\":{",
+                    "\"bad_lengths\":%llu,\"trailing_garbage\":%llu,\"udp_shorter_than_ip\":%llu,"
+                    "\"crc32\":%u,\"groups\":{",
                     json_escape(path).c_str(),
                     static_cast<unsigned long long>(c.frames),
                     static_cast<unsigned long long>(c.udp_payloads),
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(c.truncated),
                     static_cast<unsigned long long>(c.bad_lengths),
                     static_cast<unsigned long long>(c.trailing_garbage),
+                    static_cast<unsigned long long>(c.udp_shorter_than_ip),
                     crc.value());
         bool first = true;
         for (const auto& [key, val] : groups) {

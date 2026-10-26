@@ -6,7 +6,8 @@
 //   UDP. Each UDP datagram becomes a PacketView into the buffer. Every
 //   frame that yields none is counted in exactly one counter, checked in
 //   this order: truncated capture, Ethernet too short, not IPv4, IPv4
-//   header lengths, not UDP, fragment, UDP lengths.
+//   header lengths, not UDP, fragment, UDP lengths. udp_shorter_than_ip
+//   counts yielded datagrams whose UDP length leaves IPv4 payload unused.
 //
 // What it must not do:
 //   Read the UDP payload, or stop on a damaged record: it counts, skips and
@@ -204,6 +205,9 @@ void Capture::index() {
             continue;
         }
         // UDP checksum: not verified either (same place, over the pseudo-header).
+        if (udp_len < total_len - ihl) {
+            ++counters_.udp_shorter_than_ip;   // still yielded, at the UDP length
+        }
 
         PacketView v{};
         v.frame_number = frame_number;
