@@ -7,8 +7,11 @@ import sys
 
 import pytest
 
+import b3intent
 import decode_crosscheck as dc
+from conftest import generated_sets
 from rows import heartbeat, order, row, stats
+from test_pcap_crosscheck import frame, pcap
 
 
 def news(text, headline="", url="", block=36):
@@ -75,8 +78,9 @@ def test_match_and_mismatch(tmp_path, capsys):
             order(0, seq=1, index=0, channel=70, blockLength=72)]
     manifest = {"missing": {"A": [], "B": []}}
     intent = write_set(folder, rows, manifest)
+    two_packets = pcap([(frame(b"\x00" * 100), 0), (frame(b"\x00" * 100, port=30070), 0)])
     for feed in "AB":
-        (folder / f"feed{feed}.pcap").write_bytes(b"")
+        (folder / f"feed{feed}.pcap").write_bytes(two_packets)   # guard 2 counts 2 packets
     counts, listing = dc.expected(intent, manifest, "A")
     assert dc.main([str(data), "--cpp", str(fake_cpp(tmp_path, counts, listing))]) == 0
 
@@ -100,3 +104,98 @@ def test_missing_pcap_is_reported(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out.count("SKIPPED") == 2
     assert "no pcap was checked" in captured.err
+
+
+# ---- Guards 1 to 3 on altered copies of the generator's malformed set ----
+def copy_set(needs_data, tmp_path, name="scenarios/malformed"):
+    src = dict(generated_sets())[name]
+    dst = tmp_path / "data" / name
+    dst.mkdir(parents=True)
+    for f in ("intent.jsonl", "manifest.json", "feedA.pcap", "feedB.pcap"):
+        (dst / f).write_bytes((src / f).read_bytes())
+    return tmp_path / "data", dst
+
+
+def edit_manifest(folder, change):
+    m = json.loads((folder / "manifest.json").read_text())
+    change(m)
+    (folder / "manifest.json").write_text(json.dumps(m))
+
+
+def first_packet_fault(m):
+    return next(f for f in m["faults"] if f["fault"] != "short")
+
+
+def run_guarded(data, capsys):
+    # --cpp /bin/false: a guard that does not fire lets the run reach the C++
+    # and crash, so each test also proves its guard runs before the C++.
+    assert dc.main([str(data), "--cpp", "/bin/false"]) == 1
+    return capsys.readouterr().out
+
+
+def test_guard1_fault_at_message_0(needs_data, tmp_path, capsys):
+    data, folder = copy_set(needs_data, tmp_path)
+    edit_manifest(folder, lambda m: first_packet_fault(m).update(messages_before=0))
+    out = run_guarded(data, capsys)
+    assert "messages_before 0: the intent log can no longer give the packet count" in out
+    assert "scenarios/malformed/manifest.json: faults[1]" in out
+
+
+def test_guard1_messages_before_missing(needs_data, tmp_path, capsys):
+    data, folder = copy_set(needs_data, tmp_path)
+    edit_manifest(folder, lambda m: first_packet_fault(m).pop("messages_before"))
+    out = run_guarded(data, capsys)
+    assert "messages_before missing: the intent log can no longer give the packet count" in out
+
+
+def test_guard2_index0_row_removed(needs_data, tmp_path, capsys):
+    data, folder = copy_set(needs_data, tmp_path)
+    lines = (folder / "intent.jsonl").read_text().splitlines(keepends=True)
+    at = next(i for i, ln in enumerate(lines)
+              if json.loads(ln)["index"] == 0 and json.loads(ln)["sequenceNumber"] == 100)
+    del lines[at]
+    (folder / "intent.jsonl").write_text("".join(lines))
+    out = run_guarded(data, capsys)
+    assert "the 'one row at index 0 per packet' assumption broke" in out
+    assert "scenarios/malformed/feedA.pcap: the intent log gives 757 packets" in out
+    assert "the pcap has 758 datagrams of at least 16 bytes" in out
+
+
+def test_guard3_unknown_fault_kind(needs_data, tmp_path, capsys):
+    data, folder = copy_set(needs_data, tmp_path)
+    edit_manifest(folder, lambda m: first_packet_fault(m).update(fault="checksum_wrong"))
+    out = run_guarded(data, capsys)
+    assert "unknown fault kind 'checksum_wrong'" in out
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda m: m.update(missing=[]), "'missing' must be an object with keys 'A' and 'B'"),
+    (lambda m: m["missing"].update(A=[[68, 1]]), "'missing.A' must be a list of"),
+    (lambda m: m.update(faults={}), "'faults' must be a list"),
+    (lambda m: first_packet_fault(m).update(sequenceNumber="140"), "needs an integer 'sequenceNumber'"),
+])
+def test_guard3_manifest_shape(needs_data, tmp_path, capsys, change, message):
+    data, folder = copy_set(needs_data, tmp_path)
+    edit_manifest(folder, change)
+    assert message in run_guarded(data, capsys)
+
+
+def test_guard3_every_tool_refuses_a_bad_manifest(needs_data, tmp_path):
+    _, folder = copy_set(needs_data, tmp_path)
+    edit_manifest(folder, lambda m: first_packet_fault(m).update(fault="checksum_wrong"))
+    with pytest.raises(b3intent.ManifestError, match="unknown fault kind"):
+        b3intent.load_manifest(folder / "intent.jsonl")
+    import intent_to_events
+    with pytest.raises(b3intent.ManifestError):
+        intent_to_events.main([str(folder / "intent.jsonl"), "-o", str(tmp_path / "e.bin")])
+
+
+def test_guards_pass_on_the_real_set(needs_data, tmp_path):
+    """The unaltered copy passes guards 1 to 3 (no C++ needed for that)."""
+    data, folder = copy_set(needs_data, tmp_path)
+    raw = json.loads((folder / "manifest.json").read_text())
+    dc.check_fault_positions(raw, "malformed")
+    manifest = b3intent.validate_manifest(raw)
+    for feed in "AB":
+        counts, _ = dc.expected(folder / "intent.jsonl", manifest, feed)
+        dc.check_packet_count(counts["packets"], folder / f"feed{feed}.pcap", feed)

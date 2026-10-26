@@ -277,3 +277,25 @@ TEST_CASE("every schema template has a dispatch case") {
         CHECK_FALSE(b3::walker::dispatch(MessageView{{}, 0, id, 17, 0, 12, nullptr, nullptr}, sink));
     }
 }
+
+TEST_CASE("CountingSink: 256 slots, larger ids only in the unknown counter") {
+    b3::walker::CountingSink sink;
+    static_assert(sizeof(sink.per_template) / sizeof(sink.per_template[0]) == 256);
+    b3::walker::Walker walker;
+    const Bytes d = packet({Msg{999, 20, 20, -1, 0xEB50, 2, 18}, Msg{}, Msg{4, 0, 0}});
+    b3::packet::PacketDecoder<> dec;
+    b3::packet::PacketHeader h;
+    REQUIRE(dec.decode(d.data(), d.size(), h));
+    walker.walk(h, d.data(), d.size(), sink);
+
+    // 999, as in the generator's schema set: unknown, in no slot.
+    CHECK(sink.unknown == 2);                       // 999 and 4
+    CHECK(walker.counters().unknown_templates == 2);
+    // A known id is counted in its own slot.
+    CHECK(sink.per_template[50] == 1);
+    // An unknown id below 256 keeps a slot too.
+    CHECK(sink.per_template[4] == 1);
+    std::uint64_t total = 0;
+    for (const auto n : sink.per_template) total += n;
+    CHECK(total == 2);                              // 50 and 4; 999 has no slot
+}

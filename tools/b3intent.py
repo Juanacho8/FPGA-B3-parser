@@ -23,9 +23,63 @@ class FeedOrderUnknown(ValueError):
     """The intent log cannot give this feed's record order."""
 
 
+class ManifestError(ValueError):
+    """manifest.json does not have the shape these tools read."""
+
+
+# Fault kinds the feed generator's malformed set writes (b3gen/scenarios.py
+# FAULTS). feed_filter's rule (keep messages before messages_before) is right
+# for every one of them; a new kind may need another rule, so it is refused.
+KNOWN_FAULT_KINDS = ("short", "length_past_end", "length_zero", "length_too_small",
+                     "bad_encoding", "truncated")
+PACKET_FIELDS = ("channel", "sequenceVersion", "sequenceNumber")
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def validate_manifest(manifest, where="manifest.json"):
+    """Raises ManifestError unless the keys these tools read have the shape
+    they expect: "missing" = {"A": [[ch, ver, seq], ...], "B": [...]}, and
+    "faults" (optional) = [{"fault": known kind, ...}], where every kind but
+    "short" names its packet and messages_before."""
+    if not isinstance(manifest, dict):
+        raise ManifestError(f"{where}: not a JSON object")
+    missing = manifest.get("missing")
+    if not isinstance(missing, dict) or not {"A", "B"} <= set(missing):
+        raise ManifestError(f"{where}: 'missing' must be an object with keys 'A' and 'B', "
+                            f"got {missing!r:.80}")
+    for feed in ("A", "B"):
+        keys = missing[feed]
+        if not isinstance(keys, list) or not all(
+                isinstance(k, list) and len(k) == 3 and all(map(_is_int, k)) for k in keys):
+            raise ManifestError(f"{where}: 'missing.{feed}' must be a list of "
+                                f"[channel, sequenceVersion, sequenceNumber]")
+    faults = manifest.get("faults")
+    if faults is None:
+        return manifest
+    if not isinstance(faults, list):
+        raise ManifestError(f"{where}: 'faults' must be a list, got {type(faults).__name__}")
+    for i, fault in enumerate(faults):
+        if not isinstance(fault, dict) or not isinstance(fault.get("fault"), str):
+            raise ManifestError(f"{where}: faults[{i}] has no 'fault' kind: {fault!r:.80}")
+        kind = fault["fault"]
+        if kind not in KNOWN_FAULT_KINDS:
+            raise ManifestError(f"{where}: faults[{i}] has unknown fault kind {kind!r} "
+                                f"(known: {', '.join(KNOWN_FAULT_KINDS)})")
+        if kind == "short":
+            continue
+        for field in PACKET_FIELDS + ("messages_before",):
+            if not _is_int(fault.get(field)):
+                raise ManifestError(f"{where}: faults[{i}] ({kind}) needs an integer {field!r}")
+    return manifest
+
+
 def load_manifest(intent_path, manifest_path=None):
+    """manifest.json, checked by validate_manifest."""
     path = Path(manifest_path) if manifest_path else Path(intent_path).with_name("manifest.json")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return validate_manifest(json.loads(path.read_text(encoding="utf-8")), str(path))
 
 
 def read_jsonl(path):
@@ -47,10 +101,11 @@ def feed_filter(manifest, feed):
     """keep(row) -> bool for the rows a decoder of `feed` ("A" or "B") sees."""
     if feed not in ("A", "B"):
         raise ValueError(f"feed must be A or B, got {feed!r}")
-    missing = {tuple(k) for k in manifest.get("missing", {}).get(feed, [])}
+    validate_manifest(manifest)
+    missing = {tuple(k) for k in manifest["missing"][feed]}
     cut = {}  # packet -> messages kept before the fault
     for fault in manifest.get("faults") or []:
-        if "sequenceNumber" in fault:
+        if fault["fault"] != "short":
             cut[(fault["channel"], fault["sequenceVersion"], fault["sequenceNumber"])] = \
                 fault["messages_before"]
 

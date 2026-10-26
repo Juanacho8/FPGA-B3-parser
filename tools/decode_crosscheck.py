@@ -18,9 +18,18 @@ What it does:
   reported as unsupported.
   A set missing a feed's pcap is reported as SKIPPED.
 
+  Guards, checked before the C++ output is looked at:
+    * fault positions: the packet count comes from "rows with index 0",
+      which needs every fault to leave message 0 standing (guard 1)
+    * packet count: that same count from the pcap, read by the generator's
+      independent reader, must agree (guard 2)
+    * manifest shape and fault kinds: b3intent.validate_manifest, plus every
+      kind mapped to a walker reason here (guard 3)
+
 What it must not do:
-  Import b3gen, or read the pcap itself. The answer keys come from the
-  generator's intent log and manifest only.
+  Import b3gen. The answer keys come from the generator's intent log and
+  manifest; the pcap is read only by guard 2, with the generator's
+  independent reader (feed_generator/tests/pcap_reader.py), never by C++ code.
 
 Usage:
   python3 tools/decode_crosscheck.py --cpp cpp_baseline/build/release/b3_decode DATA_DIR
@@ -34,9 +43,12 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO / "feed_generator" / "tests"))
 
 import b3intent  # noqa: E402
+import pcap_reader  # noqa: E402  (independent of b3gen and of the C++)
 
 # spec/LAYOUTS.md section 6: every templateId of the schema.
 SCHEMA_TEMPLATES = {1, 2, 3, 5, 9, 10, 11, 12, 15, 16, 17, 19, 21, 22, 24, 25, 27, 28, 29, 30,
@@ -53,10 +65,62 @@ FAULT_REASON = {"truncated": "header_truncated", "length_zero": "length_zero",
 REASONS = ("header_truncated", "length_zero", "length_too_small", "length_past_end",
            "bad_encoding", "bad_schema_id", "block_length_past_end")
 FEEDS = ("A", "B")
+PACKET_HEADER = 16
+# b3_decode's per-template counts hold ids 0..255 (walker.hpp CountingSink);
+# larger ids are only in unknown_templates and the listing.
+TEMPLATE_SLOTS = 256
+
+# Guard 3: every fault kind b3intent accepts must map to a walker reason.
+_unmapped = set(b3intent.KNOWN_FAULT_KINDS) - {"short"} - set(FAULT_REASON)
+if _unmapped:
+    raise SystemExit(f"decode_crosscheck: no walker reason for fault kinds {sorted(_unmapped)}")
 
 
 class Unsupported(Exception):
     pass
+
+
+class AssumptionBroken(Exception):
+    """A fact the expected counts rely on no longer holds for this data."""
+
+
+def check_fault_positions(manifest, where):
+    """Guard 1. expected() counts packets as rows with index 0. That holds
+    only if every packet keeps its message 0 in the intent view, so a fault
+    must leave message 0 standing: messages_before >= 1. It holds today
+    because b3gen/scenarios.py malform() faults message 1, or the last message
+    for "truncated", and only in packets with at least 3 messages. Short
+    datagrams have no packet header and no rows, so they are exempt."""
+    faults = manifest.get("faults") if isinstance(manifest, dict) else None
+    if not isinstance(faults, list):
+        return
+    for i, fault in enumerate(faults):
+        if not isinstance(fault, dict) or fault.get("fault") == "short":
+            continue
+        before = fault.get("messages_before")
+        if before is None or before == 0:
+            raise AssumptionBroken(
+                f"{where}: faults[{i}] ({fault.get('fault')!r} at "
+                f"{[fault.get(k) for k in b3intent.PACKET_FIELDS]}) has messages_before "
+                f"{'missing' if before is None else 0}: the intent log can no longer give the "
+                f"packet count (rows with index 0), since that packet keeps no message 0")
+
+
+def pcap_packet_count(pcap):
+    """Guard 2's second source: datagrams of at least 16 bytes in the pcap,
+    read with the generator's independent reader."""
+    _, records = pcap_reader.read_pcap(Path(pcap).read_bytes())
+    return sum(1 for rec in records if len(rec["payload"]) >= PACKET_HEADER)
+
+
+def check_packet_count(intent_packets, pcap, where):
+    """Guard 2: the intent log's packet count against the pcap's, without the C++."""
+    on_wire = pcap_packet_count(pcap)
+    if on_wire != intent_packets:
+        raise AssumptionBroken(
+            f"{where}: the intent log gives {intent_packets} packets (rows with index 0) but "
+            f"the pcap has {on_wire} datagrams of at least 16 bytes: the 'one row at index 0 "
+            f"per packet' assumption broke (an empty packet, or a fault at message 0?)")
 
 
 def message_length(row):
@@ -89,7 +153,7 @@ def expected(intent, manifest, feed):
               "oversize_packets": 0, "empty_packets": 0, "messages": len(listing),
               "unknown_templates": sum(n for t, n in templates.items() if t not in SCHEMA_TEMPLATES),
               "malformed_packets": sum(malformed.values()), "malformed": malformed,
-              "templates": {str(t): n for t, n in sorted(templates.items())}}
+              "templates": {str(t): n for t, n in sorted(templates.items()) if t < TEMPLATE_SLOTS}}
     return counts, listing
 
 
@@ -150,7 +214,15 @@ def main(argv=None):
     checked = failed = skipped = 0
     for folder in sets:
         name = folder.relative_to(root)
-        manifest = b3intent.load_manifest(folder / "intent.jsonl")
+        try:
+            raw = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+            check_fault_positions(raw, f"{name}/manifest.json")              # guard 1
+            manifest = b3intent.validate_manifest(raw, f"{name}/manifest.json")  # guard 3
+        except (AssumptionBroken, b3intent.ManifestError) as e:
+            print(f"FAIL {e}")
+            failed += 1
+            checked += 1
+            continue
         for feed in FEEDS:
             pcap = folder / f"feed{feed}.pcap"
             if not pcap.is_file():
@@ -160,8 +232,13 @@ def main(argv=None):
             checked += 1
             try:
                 want_counts, want_list = expected(folder / "intent.jsonl", manifest, feed)
+                check_packet_count(want_counts["packets"], pcap, f"{name}/{pcap.name}")  # guard 2
             except Unsupported as e:
                 print(f"UNSUPPORTED {name}/{pcap.name}: {e}")
+                failed += 1
+                continue
+            except AssumptionBroken as e:
+                print(f"FAIL {e}")
                 failed += 1
                 continue
             got_counts, got_list = run_cpp(args.cpp, pcap)
