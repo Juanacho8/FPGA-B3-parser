@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 3 (build system, generated field layouts, pcap reader).
+Status: step 4 (build system, generated field layouts, pcap reader, packet decoder and message walker).
 
 ## Requirements
 
@@ -25,6 +25,8 @@ From the repo root:
 | `make cpp-uncapped` | Release, uncapped book | `cpp_baseline/build/uncapped` |
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
+| `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
+| `make decode-crosscheck` | Release build, then `b3_decode` against intent.jsonl and manifest.json on both feeds of every set under `B3_DATA` | `cpp_baseline/build/release` |
 | `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `data/`, filled by `make data`) | `cpp_baseline/build/release` |
 
 All builds use `-Wall -Wextra -Wpedantic -Werror`.
@@ -56,6 +58,19 @@ It never reads the UDP payload.
 
 ```
 cpp_baseline/build/release/b3_pcapinfo [--timing] feedA.pcap   # counters as one JSON line
+```
+
+## Packet decoder and message walker
+
+`include/b3/packet.hpp`: parses the 16-byte packet header; datagrams under 16
+bytes are discarded and counted. Sequencing is a template parameter
+(`AcceptAll` until step 6). `include/b3/walker.hpp`: steps through messages by
+messageLength, applies the complete-message test of `docs/DESIGN.md` 3.6.1
+(stopping at the first failure, counted by reason), and dispatches each
+message by a switch on templateId to a sink given as a template parameter.
+
+```
+cpp_baseline/build/release/b3_decode [--list FILE] feedA.pcap   # counts as one JSON line
 ```
 
 ## Book parameters
@@ -92,9 +107,13 @@ include/b3/wire.hpp          unaligned little/big-endian loads (memcpy)
 include/b3/pcap.hpp          pcap reader
 src/pcap.cpp
 apps/b3_pcapinfo.cpp         pcap -> counters JSON line
+include/b3/packet.hpp        packet header, short datagrams, sequencing hook
+include/b3/walker.hpp        message framing, malformed test, dispatch
+apps/b3_decode.cpp           pcap -> decode counts JSON (and --list)
 tests/test_build.cpp         doctest main, build parameter tests
 tests/test_layouts.cpp       layouts.hpp against spec/LAYOUTS.md
 tests/test_wire.cpp          both byte orders, every width
 tests/test_pcap.cpp          reader on hand-built pcap bytes
+tests/test_walker.cpp        packet decoder and walker on hand-built packets
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```
