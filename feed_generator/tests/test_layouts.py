@@ -25,7 +25,7 @@ FEED_GENERATOR = Path(__file__).resolve().parents[1]
 
 
 def load_generator():
-    path = FEED_GENERATOR / "tools" / "gen_layouts.py"
+    path = FEED_GENERATOR.parent / "tools" / "gen_layouts.py"
     spec = importlib.util.spec_from_file_location("gen_layouts", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

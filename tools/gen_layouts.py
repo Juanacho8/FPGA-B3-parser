@@ -19,8 +19,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-FEED_GENERATOR = Path(__file__).resolve().parents[1]
-REPO = FEED_GENERATOR.parent
+REPO = Path(__file__).resolve().parents[1]
+FEED_GENERATOR = REPO / "feed_generator"
 XML_PATH = REPO / "spec" / "b3-market-data-messages-2.3.1.xml"
 OUT_PATH = FEED_GENERATOR / "b3gen" / "layouts.py"
 
