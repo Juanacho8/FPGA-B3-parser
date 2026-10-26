@@ -4,7 +4,8 @@
 //   Loads a pcap (b3::pcap::Capture), runs every UDP payload through the
 //   packet decoder and the message walker, and prints one JSON line of
 //   counts: datagrams, short datagrams, packets, oversize and empty packets,
-//   messages per templateId, unknown templates, malformed packets by reason.
+//   messages per templateId (ids below 256; larger ones are only in the
+//   unknown count), unknown templates, malformed packets by reason.
 //   --list FILE also writes one line per dispatched message,
 //     channel seq_version seq_num msg_index templateId messageLength
 //   for tools/decode_crosscheck.py. The listing goes to a buffer reserved

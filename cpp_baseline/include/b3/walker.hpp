@@ -200,15 +200,39 @@ private:
     WalkCounters counters_;
 };
 
+// ---- Every schema templateId fits in one byte ----
+// Two things depend on it: CountingSink's 256 counter slots below, and port 1's
+// venue_msg_type, which stores the templateId in one byte (docs/DESIGN.md 3.1).
+// A future schema with a larger id must stop the build here, not overflow the
+// array or truncate venue_msg_type.
+inline constexpr std::size_t kTemplateSlots = 256;
+
+constexpr bool template_ids_fit_in_a_byte() noexcept {
+    for (const auto id : L::template_ids) {
+        if (id >= kTemplateSlots) return false;
+    }
+    return true;
+}
+static_assert(template_ids_fit_in_a_byte(),
+              "a schema templateId is >= 256: CountingSink's slots and port 1's one-byte "
+              "venue_msg_type (DESIGN.md 3.1) both need a wider type");
+
 // ---- Step 4 sink: counts messages per templateId ----
 struct CountingSink {
-    std::array<std::uint64_t, 65536> per_template{};   // by templateId, unknown included
+    std::array<std::uint64_t, kTemplateSlots> per_template{};   // ids 0..255, unknown ones included
+    std::uint64_t unknown = 0;                                   // every unknown id, >= 256 only here
 
     template <std::uint16_t TemplateId>
     void on(const MessageView&) noexcept {
+        static_assert(TemplateId < kTemplateSlots);
         ++per_template[TemplateId];
     }
-    void on_unknown(const MessageView& m) noexcept { ++per_template[m.template_id]; }
+    void on_unknown(const MessageView& m) noexcept {
+        ++unknown;
+        if (m.template_id < kTemplateSlots) {
+            ++per_template[m.template_id];
+        }
+    }
 };
 
 }  // namespace b3::walker
