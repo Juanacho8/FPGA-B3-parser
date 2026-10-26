@@ -363,7 +363,7 @@ python3 tools/intent_to_events.py data/small/intent.jsonl -o expected/small_even
 python3 tools/dump_events.py expected/small_events.bin --limit 20
 python3 tools/compare_decode.py out/small/decode.jsonl data/small/intent.jsonl
 python3 -m pytest tools/tests
-B3_DATA=feed_generator/data python3 -m pytest tools/tests   # also runs on every generated set
+make data && python3 -m pytest tools/tests   # data tests fail until make data has run
 ```
 
 `intent_to_events.py` writes N, K and MAX_INSTRUMENTS into the header (defaults 5, 16, 64, matching `book_params.hpp`). For a golden file matched against another build, pass `--tracked-depth 32` (or `0` for uncapped) and so on.
