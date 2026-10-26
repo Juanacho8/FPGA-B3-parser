@@ -7,15 +7,21 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean layouts layouts-check pcap-crosscheck cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
 
 sim-all: $(addprefix sim-,$(UNIT_TESTS))
 
-# ---- 3. Generated layouts: one script, one parse of B3's XML, both outputs ----
-PYTHON       ?= python3
+# ---- 3. Test data: every generator set, into data/ (gitignored) ----
+PYTHON  ?= python3
+B3_DATA ?= data
+
+data:
+	cd feed_generator && $(PYTHON) -m b3gen build --out $(abspath $(B3_DATA))
+
+# ---- 4. Generated layouts: one script, one parse of B3's XML, both outputs ----
 LAYOUT_FILES := feed_generator/b3gen/layouts.py cpp_baseline/include/b3/layouts.hpp
 
 layouts:
@@ -30,7 +36,7 @@ layouts-check:
 	if [ $$status -ne 0 ]; then echo "layouts-check: generated files are stale or hand-edited; run 'make layouts'" >&2; exit 1; fi && \
 	echo "layouts-check: $(LAYOUT_FILES) up to date"
 
-# ---- 4. C++ baseline: one build folder per configuration under cpp_baseline/build ----
+# ---- 5. C++ baseline: one build folder per configuration under cpp_baseline/build ----
 CPP_DIR   := cpp_baseline
 CPP_BUILD := $(CPP_DIR)/build
 
@@ -61,8 +67,7 @@ cpp-uncapped:
 cpp-variants: cpp-k16 cpp-k32 cpp-uncapped
 
 # The C++ pcap reader against the generator's independent Python reader, on
-# feedA.pcap and feedB.pcap of every set under B3_DATA. Fails on any difference.
-B3_DATA ?= feed_generator/data
+# feedA.pcap and feedB.pcap of every set under B3_DATA (make data). Fails on any difference.
 
 pcap-crosscheck: cpp-release
 	$(PYTHON) tools/pcap_crosscheck.py --cpp $(CPP_BUILD)/release/b3_pcapinfo $(B3_DATA)
@@ -70,6 +75,6 @@ pcap-crosscheck: cpp-release
 cpp-clean:
 	rm -rf $(CPP_BUILD)
 
-# ---- 5. Clean ----
+# ---- 6. Clean ----
 clean: cpp-clean
 	for t in $(UNIT_TESTS); do $(MAKE) -C $(UNIT_DIR)/$$t clean; rm -f $(UNIT_DIR)/$$t/results.xml; done

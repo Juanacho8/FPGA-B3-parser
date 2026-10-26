@@ -25,7 +25,7 @@ From the repo root:
 | `make cpp-uncapped` | Release, uncapped book | `cpp_baseline/build/uncapped` |
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
-| `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `feed_generator/data`) | `cpp_baseline/build/release` |
+| `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `data/`, filled by `make data`) | `cpp_baseline/build/release` |
 
 All builds use `-Wall -Wextra -Wpedantic -Werror`.
 
