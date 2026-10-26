@@ -214,7 +214,7 @@ Recovery is faithful because the generator's engine always knows the true book. 
 | # | Item | Status |
 |---|---|---|
 | A | **Parser output contract**: what a decoded message looks like when handed to the next stage (fixed-width record vs per-type records, which fields). Leaning fixed-width for FPGA friendliness | Deferred to the C++/RTL phase. Will live in `docs/DESIGN.md` |
-| B | `layouts.py`: generated from the XML, or hand-written with a test checking it against the XML | Decided: generated at build time by `feed_generator/tools/gen_layouts.py`, output checked in, guarded by tests. See `docs/FEED_GENERATOR_CONTEXT.md` section 12 |
+| B | `layouts.py`: generated from the XML, or hand-written with a test checking it against the XML | **Resolved.** One repo-level script, `tools/gen_layouts.py`, generates both `feed_generator/b3gen/layouts.py` and `cpp_baseline/include/b3/layouts.hpp` from the XML in one run. It refuses to run unless the XML's SHA-256 matches `spec/LAYOUTS.md`. Outputs checked in; a staleness check (`make layouts-check`, run by `make cpp-test`, plus the generator's tests) fails if either differs from a fresh run. See `docs/FEED_GENERATOR_CONTEXT.md` section 12 |
 | C | Diff Guidelines v2.3.1.2 against v2.3.1 | Open |
 
 ## 13. Things to ask the C6 quants for
