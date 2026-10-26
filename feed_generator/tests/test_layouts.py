@@ -22,10 +22,12 @@ from b3gen import layouts
 from layouts_md import LAYOUTS_ENUMS, LAYOUTS_SETS, MESSAGE_LAYOUTS, TEMPLATE_INDEX
 
 FEED_GENERATOR = Path(__file__).resolve().parents[1]
+REPO = FEED_GENERATOR.parent
 
 
 def load_generator():
-    path = FEED_GENERATOR.parent / "tools" / "gen_layouts.py"
+    # The generator lives at the repo level: it also writes the C++ header.
+    path = REPO / "tools" / "gen_layouts.py"
     spec = importlib.util.spec_from_file_location("gen_layouts", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -47,7 +49,7 @@ def test_regenerating_matches_checked_in_file():
     checked_in = (FEED_GENERATOR / "b3gen" / "layouts.py").read_text(encoding="utf-8")
     assert gen_layouts.render() == checked_in, (
         "b3gen/layouts.py is stale or was edited by hand. "
-        "Run: python3 tools/gen_layouts.py"
+        "Run, from the repo root: python3 tools/gen_layouts.py (or make layouts)"
     )
 
 

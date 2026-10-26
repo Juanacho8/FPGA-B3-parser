@@ -104,7 +104,7 @@ target_compile_definitions(b3 INTERFACE ${B3_PARAM_DEFINES})
 
 # ---- 6. Tests ----
 enable_testing()
-add_executable(b3_tests tests/test_build.cpp)
+add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # What CMake configured, so the test can check the code saw the same values.

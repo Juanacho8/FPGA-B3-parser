@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 0 (build system and test harness).
+Status: step 2 (build system, test harness, generated field layouts).
 
 ## Requirements
 
@@ -19,7 +19,7 @@ From the repo root:
 |---|---|---|
 | `make cpp-release` | `-O3 -mcpu=native` | `cpp_baseline/build/release` |
 | `make cpp-debug` | `-O1 -g`, AddressSanitizer + UndefinedBehaviorSanitizer | `cpp_baseline/build/debug` |
-| `make cpp-test` | Debug build, then runs the tests with `ctest` | `cpp_baseline/build/debug` |
+| `make cpp-test` | `make layouts-check`, Debug build, then runs the tests with `ctest` | `cpp_baseline/build/debug` |
 | `make cpp-k16` | Release, K = 16 | `cpp_baseline/build/k16` |
 | `make cpp-k32` | Release, K = 32 | `cpp_baseline/build/k32` |
 | `make cpp-uncapped` | Release, uncapped book | `cpp_baseline/build/uncapped` |
@@ -27,6 +27,22 @@ From the repo root:
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 
 All builds use `-Wall -Wextra -Wpedantic -Werror`.
+
+## Generated layouts
+
+`include/b3/layouts.hpp` holds every B3 template's field offsets, sizes, types,
+sinceVersion, null values, enums and sets as constexpr values in `b3::layout`
+(for example `b3::layout::Order_MBO_50::mDEntryPx::offset`). It is generated
+by `tools/gen_layouts.py` from B3's XML, in the same run as the feed
+generator's `layouts.py`. Never edit it by hand:
+
+| Target | What it does |
+|---|---|
+| `make layouts` | Regenerates both files |
+| `make layouts-check` | Regenerates into a temp folder, fails if either checked-in file differs. Run by `make cpp-test` |
+
+`tests/test_layouts.cpp` checks a few values against numbers copied by hand
+from `spec/LAYOUTS.md`.
 
 ## Book parameters
 
@@ -57,6 +73,8 @@ ctest --test-dir cpp_baseline/build/k4 --output-on-failure
 ```
 CMakeLists.txt
 include/b3/book_params.hpp   book parameters (only place they are set)
-tests/test_build.cpp         doctest tests
+include/b3/layouts.hpp       generated field layouts (do not edit)
+tests/test_build.cpp         doctest main, build parameter tests
+tests/test_layouts.cpp       layouts.hpp against spec/LAYOUTS.md
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```
