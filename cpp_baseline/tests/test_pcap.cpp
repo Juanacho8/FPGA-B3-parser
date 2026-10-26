@@ -254,12 +254,22 @@ TEST_CASE("bad lengths are counted and skipped") {
     CHECK(cap.counters().bad_lengths == 6);
     CHECK(cap.packets().size() == 1);
 
-    // A UDP length shorter than the IPv4 payload is trusted: the rest is padding.
+    CHECK(cap.counters().udp_shorter_than_ip == 0);
+}
+
+TEST_CASE("UDP length shorter than the IPv4 payload: trusted, and counted") {
     Frame shorter;
-    shorter.udp_len_delta = -2;
-    const auto cap2 = File().record(frame(shorter)).load();
-    REQUIRE(cap2.packets().size() == 1);
-    CHECK(payload_is(cap2.packets()[0], {0xDE, 0xAD}));
+    shorter.udp_len_delta = -2;    // the last 2 payload bytes are outside the UDP datagram
+    Frame padded;
+    padded.payload = Bytes(3, 0x42);
+    padded.pad_to = 60;            // Ethernet padding is after the IPv4 packet: not counted
+    const auto cap = File().record(frame(shorter)).record(frame(padded)).record(frame({})).load();
+    REQUIRE(cap.packets().size() == 3);
+    CHECK(payload_is(cap.packets()[0], {0xDE, 0xAD}));
+    CHECK(payload_is(cap.packets()[1], Bytes(3, 0x42)));
+    CHECK(cap.counters().udp_shorter_than_ip == 1);
+    CHECK(cap.counters().bad_lengths == 0);
+    CHECK(cap.counters().udp_payloads == 3);
 }
 
 TEST_CASE("truncated capture is counted and skipped") {

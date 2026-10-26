@@ -52,6 +52,9 @@ struct Counters {
     std::uint64_t truncated = 0;          // captured length < original length
     std::uint64_t bad_lengths = 0;        // a header or length field that does not fit
     std::uint64_t trailing_garbage = 0;   // bytes after the last whole record (record cut off at EOF)
+    // Not a skip: datagrams yielded whose UDP length is shorter than the IPv4
+    // payload. The UDP length is trusted and the rest treated as padding.
+    std::uint64_t udp_shorter_than_ip = 0;
 };
 
 struct FileInfo {

@@ -2,7 +2,10 @@
 """pcap_crosscheck: the C++ pcap reader against an independent Python one.
 
 What it does:
-  For every feedA.pcap and feedB.pcap under a data folder, computes the same
+  For every generator set under a data folder (each folder holding an
+  intent.jsonl, manifest.json or feed pcap), checks feedA.pcap and feedB.pcap.
+  A set missing a feed is reported as SKIPPED, never dropped silently. For each
+  file it computes the same
   JSON line cpp_baseline/apps/b3_pcapinfo prints (counters, packets and
   payload bytes per destination group, CRC-32 over timestamp, length and
   payload of every datagram) with the feed generator's independent test
@@ -36,7 +39,9 @@ import pcap_reader  # noqa: E402  (independent reader, no b3gen)
 
 PCAP_MAGIC_NS = 0xA1B23C4D
 COUNTERS = ("frames", "udp_payloads", "payload_bytes", "non_ipv4", "non_udp", "fragments",
-            "truncated", "bad_lengths", "trailing_garbage")
+            "truncated", "bad_lengths", "trailing_garbage", "udp_shorter_than_ip")
+FEEDS = ("feedA.pcap", "feedB.pcap")
+SET_MARKERS = ("intent.jsonl", "manifest.json") + FEEDS
 
 
 class Unsupported(Exception):
@@ -80,6 +85,8 @@ def python_info(path):
         if not 8 <= rec["udp_length"] <= rec["ip_total_length"] - 20:
             counts["bad_lengths"] += 1
             continue
+        if rec["udp_length"] < rec["ip_total_length"] - 20:
+            counts["udp_shorter_than_ip"] += 1   # still yielded: the rest is padding
         payload = rec["payload"]
         counts["udp_payloads"] += 1
         counts["payload_bytes"] += len(payload)
@@ -95,6 +102,11 @@ def python_info(path):
 def group_order(item):
     ip, port = item[0].rsplit(":", 1)
     return tuple(int(x) for x in ip.split(".")), int(port)
+
+
+def find_sets(root):
+    """Every folder under root (root included) that is a generator set."""
+    return sorted({p.parent for marker in SET_MARKERS for p in root.rglob(marker)})
 
 
 def cpp_info(binary, path):
@@ -120,8 +132,21 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     target = Path(args.target)
-    files = [target] if target.is_file() else sorted(
-        p for p in target.rglob("feed[AB].pcap"))
+    skipped = []
+    if target.is_file():
+        sets, files = [], [target]
+    else:
+        sets = find_sets(target)
+        files = []
+        for folder in sets:
+            for feed in FEEDS:
+                path = folder / feed
+                if path.is_file():
+                    files.append(path)
+                else:
+                    skipped.append(path)
+    for path in skipped:
+        print(f"SKIPPED {path.relative_to(target)}: no such file in this set")
     if not files:
         print(f"error: no feedA.pcap or feedB.pcap under {target}", file=sys.stderr)
         return 2
@@ -151,7 +176,8 @@ def main(argv=None):
         else:
             print(f"OK {name}: {want['frames']} frames, {want['udp_payloads']} payloads, "
                   f"{want['payload_bytes']} bytes, {len(want['groups'])} groups")
-    print(f"{len(files) - failed}/{len(files)} files match")
+    where = f" in {len(sets)} sets" if sets else ""
+    print(f"{len(files) - failed}/{len(files)} files match{where}, {len(skipped)} skipped")
     return 1 if failed else 0
 
 
