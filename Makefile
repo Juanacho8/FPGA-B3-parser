@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -71,6 +71,11 @@ cpp-variants: cpp-k16 cpp-k32 cpp-uncapped
 
 pcap-crosscheck: cpp-release
 	$(PYTHON) tools/pcap_crosscheck.py --cpp $(CPP_BUILD)/release/b3_pcapinfo $(B3_DATA)
+
+# The packet decoder and message walker (b3_decode) against intent.jsonl and
+# manifest.json on both feeds of every set under B3_DATA. Fails on any difference.
+decode-crosscheck: cpp-release
+	$(PYTHON) tools/decode_crosscheck.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
 
 cpp-clean:
 	rm -rf $(CPP_BUILD)

@@ -105,11 +105,13 @@ target_compile_definitions(b3 PUBLIC ${B3_PARAM_DEFINES})
 # ---- 6. Apps ----
 add_executable(b3_pcapinfo apps/b3_pcapinfo.cpp)
 target_link_libraries(b3_pcapinfo PRIVATE b3)
+add_executable(b3_decode apps/b3_decode.cpp)
+target_link_libraries(b3_decode PRIVATE b3)
 
 # ---- 7. Tests ----
 enable_testing()
 add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp
-  tests/test_pcap.cpp)
+  tests/test_pcap.cpp tests/test_walker.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # What CMake configured, so the test can check the code saw the same values.

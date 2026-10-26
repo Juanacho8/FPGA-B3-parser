@@ -201,9 +201,35 @@ Port 1 is written in decoder order: packets in the order the decoder accepts the
 
 * **Accepted packets** (sequencing rules from `spec/LAYOUTS.md` 12.1, brief section 6): every packet whose sequenceNumber is the expected one or higher (a gap). The packet holding a SequenceReset is accepted without checking its own sequence fields. A packet whose sequenceNumber is at or below the last accepted one in the same sequenceVersion is a **duplicate**: it produces no records and does not touch the closing state.
 * **Heartbeats** (sequenceNumber 0) produce no records.
-* **Malformed packets** (project policy, not B3): the complete messages before the fault are processed normally (records, closing state). The rest of the packet is discarded. A message is complete when its 12-byte header fits in the datagram, messageLength ≥ 12, messageLength fits in the datagram, encodingType is 0xEB50 and schemaId is 2. A datagram shorter than the 16-byte packet header is discarded and uses up no sequence number.
+* **Malformed packets** (project policy, not B3): the complete messages before the fault are processed normally (records, closing state). The rest of the packet is discarded. Which messages are complete is defined exactly in 3.6.1. A datagram shorter than the 16-byte packet header is discarded and uses up no sequence number.
 * **Schema versions**: fields are read using the message header's blockLength and version. A field exists only if it lies within blockLength and its sinceVersion is at most the header's version. Absent fields follow section 1. Extra root-block bytes are skipped.
 * **Instruments not in the book table** still get port 1 records.
+
+### 3.6.1 Packet and message framing
+
+What the packet decoder and message walker do with each UDP payload, in order (`cpp_baseline/include/b3/packet.hpp`, `walker.hpp`). Counter names are those of `b3_decode`.
+
+1. **Short datagram**: fewer than 16 bytes. Discarded and counted (`short_datagrams`). It never reaches sequencing, so it uses up no sequence number.
+2. **Oversize packet**: more than 1400 bytes, B3's maximum (`spec/LAYOUTS.md` 2). Counted (`oversize_packets`) and otherwise decoded like any packet. A size over B3's limit says nothing about which bytes are wrong, and the message test below still guards every message.
+3. **Header-only packet**: exactly 16 bytes. A valid packet with no messages, counted (`empty_packets`), not malformed. It has a packet header, so it takes part in sequencing (step 6) like any other packet.
+4. **The walk**: from byte 16, one message after another, advancing by messageLength only. Each message must pass the **complete message test**. The tests run in this order, and the first failure names the reason:
+
+| # | Test | Reason when it fails |
+|---|---|---|
+| 1 | At least 12 bytes remain (the message header fits) | `header_truncated` |
+| 2 | messageLength ≠ 0 | `length_zero` |
+| 3 | messageLength ≥ 12 | `length_too_small` |
+| 4 | messageLength ≤ bytes remaining in the datagram | `length_past_end` |
+| 5 | encodingType = 0xEB50 | `bad_encoding` |
+| 6 | schemaId = 2 | `bad_schema_id` |
+| 7 | blockLength ≤ messageLength − 12 | `block_length_past_end` |
+
+   On the first failure the decoder counts the packet once under that reason (`malformed`, `malformed_packets`), stops and discards the rest of the packet. Messages already passed on from that packet stand. The packet itself stays accepted, so sequencing carries on. Tests 2 and 3 are one rule (messageLength ≥ 12), split so that a zero length, which a naive walker would loop on, has its own counter.
+5. **Leftover bytes**: 1 to 11 bytes after the last complete message are malformed (test 1, `header_truncated`), not padding. B3 puts no padding between messages (`spec/LAYOUTS.md` 2).
+6. **Unknown templateId**: a complete message whose templateId is not in the schema is skipped by its messageLength and counted (`unknown_templates`). It is not malformed. The header's version is not checked at this stage; fields are read by blockLength and version (3.6).
+7. **msg_index** counts complete messages from 0 within each packet, unknown templates included, the same as intent.jsonl's `index`.
+
+Groups and var data are not walked here: messageLength already covers them. Bounds inside a message (group entries, var data lengths) are checked when its fields are decoded.
 
 ### 3.7 Feeds and record order
 
@@ -357,6 +383,8 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `intent_to_events.py` | intent.jsonl → expected events.bin (Feed A) |
 | `compare_decode.py` | decode.jsonl vs intent.jsonl, field for field, including null vs absent. First mismatches with packet and message position |
 | `dump_events.py` | events.bin → readable rows (`--hex` for raw bytes) |
+| `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
+| `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
 
 ```sh
 python3 tools/intent_to_events.py data/small/intent.jsonl -o expected/small_events.bin
