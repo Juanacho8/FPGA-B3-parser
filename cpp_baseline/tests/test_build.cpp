@@ -1,4 +1,4 @@
-// test_build.cpp: step 0 tests.
+// test_build.cpp: step 0 tests, and the test runner's main().
 //
 // What it does:
 //   Proves the test harness runs, and that the book parameters the code sees

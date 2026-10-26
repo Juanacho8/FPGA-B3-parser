@@ -173,7 +173,7 @@ inconsistent value fails with the key path, for example
 | Path | What |
 |---|---|
 | `b3gen/` | the generator: flow → engine → publisher → packet → pcap, plus golden (answer keys), scenarios, config, cli |
-| `tools/gen_layouts.py` | regenerates `b3gen/layouts.py` from B3's XML (SHA-256 checked) |
+| `../tools/gen_layouts.py` | regenerates `b3gen/layouts.py` (and the C++ baseline's `layouts.hpp`) from B3's XML, SHA-256 checked. Run from the repo root: `make layouts` |
 | `tests/` | the tests, which decode and rebuild books independently: nothing in `tests/` relies on b3gen to read the output |
 | `../docs/FEED_GENERATOR_CONTEXT.md` | design, decisions and open items |
 | `../spec/LAYOUTS.md` | the wire format and B3's feed rules |

@@ -7,14 +7,30 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean layouts layouts-check cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
 
 sim-all: $(addprefix sim-,$(UNIT_TESTS))
 
-# ---- 3. C++ baseline: one build folder per configuration under cpp_baseline/build ----
+# ---- 3. Generated layouts: one script, one parse of B3's XML, both outputs ----
+PYTHON       ?= python3
+LAYOUT_FILES := feed_generator/b3gen/layouts.py cpp_baseline/include/b3/layouts.hpp
+
+layouts:
+	$(PYTHON) tools/gen_layouts.py
+
+# Regenerate into a temp folder; fail if a checked-in file differs.
+layouts-check:
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	$(PYTHON) tools/gen_layouts.py --out-dir "$$tmp" > /dev/null && \
+	status=0 && \
+	for f in $(LAYOUT_FILES); do diff -u "$$f" "$$tmp/$$f" || status=1; done && \
+	if [ $$status -ne 0 ]; then echo "layouts-check: generated files are stale or hand-edited; run 'make layouts'" >&2; exit 1; fi && \
+	echo "layouts-check: $(LAYOUT_FILES) up to date"
+
+# ---- 4. C++ baseline: one build folder per configuration under cpp_baseline/build ----
 CPP_DIR   := cpp_baseline
 CPP_BUILD := $(CPP_DIR)/build
 
@@ -30,7 +46,7 @@ cpp-release:
 cpp-debug:
 	$(call cpp_build,debug,-DCMAKE_BUILD_TYPE=Debug)
 
-cpp-test: cpp-debug
+cpp-test: layouts-check cpp-debug
 	ctest --test-dir $(CPP_BUILD)/debug --output-on-failure
 
 cpp-k16:
@@ -47,6 +63,6 @@ cpp-variants: cpp-k16 cpp-k32 cpp-uncapped
 cpp-clean:
 	rm -rf $(CPP_BUILD)
 
-# ---- 4. Clean ----
+# ---- 5. Clean ----
 clean: cpp-clean
 	for t in $(UNIT_TESTS); do $(MAKE) -C $(UNIT_DIR)/$$t clean; rm -f $(UNIT_DIR)/$$t/results.xml; done

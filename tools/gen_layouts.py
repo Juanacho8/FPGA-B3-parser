@@ -1,31 +1,58 @@
-"""Generate b3gen/layouts.py from B3's SBE schema.
+"""Generate the field layouts of every B3 template from B3's SBE schema.
 
-Reads spec/b3-market-data-messages-2.3.1.xml, applies the SBE 1.0 layout
-rules listed in spec/LAYOUTS.md ("How the layouts were verified") and writes
-a plain, readable Python module with every template's field offsets, sizes,
-types, presence and null values, plus enums, sets and the header layouts.
+Reads spec/b3-market-data-messages-2.3.1.xml once, applies the SBE 1.0
+layout rules listed in spec/LAYOUTS.md ("How the layouts were verified"),
+and renders the parsed schema into one file per output target:
 
-Usage (from feed_generator/):
+    feed_generator/b3gen/layouts.py      Python module for the feed generator
+    cpp_baseline/include/b3/layouts.hpp  constexpr header for the C++ baseline
 
-    python3 tools/gen_layouts.py
+Each target is one render function in OUTPUTS. A SystemVerilog package for
+the RTL is meant to become a third entry.
 
-The output is checked in. tests/test_layouts.py regenerates it in memory and
-fails if the checked-in file differs, so edit this script, never the output.
-Standard library only.
+Usage (from the repo root):
+
+    python3 tools/gen_layouts.py                 # rewrite both checked-in files
+    python3 tools/gen_layouts.py --out-dir DIR   # write them under DIR instead
+    make layouts / make layouts-check            # the same, via the Makefile
+
+The outputs are checked in. `make layouts-check` (run by `make cpp-test`)
+regenerates into a temporary folder and fails if a checked-in file differs,
+and feed_generator/tests/test_layouts.py does the same for layouts.py. So
+edit this script, never the outputs. Refuses to run unless the XML's SHA-256
+equals the one recorded in spec/LAYOUTS.md. Standard library only.
 """
 
+import argparse
 import hashlib
+import keyword
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-FEED_GENERATOR = REPO / "feed_generator"
 XML_PATH = REPO / "spec" / "b3-market-data-messages-2.3.1.xml"
-OUT_PATH = FEED_GENERATOR / "b3gen" / "layouts.py"
+LAYOUTS_MD = REPO / "spec" / "LAYOUTS.md"
+PY_OUT = Path("feed_generator") / "b3gen" / "layouts.py"
+CPP_OUT = Path("cpp_baseline") / "include" / "b3" / "layouts.hpp"
+OUT_PATH = REPO / PY_OUT   # kept for callers of the old single-output script
 
-# The exact schema file every layout in spec/LAYOUTS.md was verified against.
-EXPECTED_SHA256 = "b055b9a948756ab795f0f6f645a571094cacb85133e091e94440b812e17503c4"
+
+def expected_sha256(layouts_md=LAYOUTS_MD):
+    """The SHA-256 of the exact schema file every layout in spec/LAYOUTS.md
+    was verified against, as LAYOUTS.md records it ("XML SHA-256: `...`")."""
+    text = Path(layouts_md).read_text(encoding="utf-8")
+    found = re.findall(r"^XML SHA-256: `([0-9a-f]{64})`$", text, re.M)
+    if len(found) != 1:
+        raise SchemaError(f"{layouts_md}: expected one 'XML SHA-256: `...`' line, "
+                          f"found {len(found)}")
+    return found[0]
+
+
+# B3 facts with no value in the XML (spec/LAYOUTS.md sections 2 and 4).
+ENCODING_TYPE = 0xEB50       # SBE 1.0 little-endian, framing header encodingType
+MAX_PACKET_SIZE = 1400       # bytes per UDP datagram, packet header included
 
 SBE_NS = {"sbe": "http://fixprotocol.io/2016/sbe"}
 
@@ -183,15 +210,18 @@ def resolve_field(elem, types):
         "deprecated": int(deprecated) if deprecated else None,
     }
 
-    def constant(value):
-        return "constant", {"name": name, "tag": tag, "type_name": type_name, "value": value}
+    def constant(value, primitive):
+        return "constant", {"name": name, "tag": tag, "type_name": type_name, "value": value,
+                            "primitive": primitive}
 
     if type_name in types.simple:
         t = types.simple[type_name]
         # Rule: constants take 0 bytes, whether the field or the type says so.
         if field_presence == "constant" or t["presence"] == "constant":
             ref = elem.get("valueRef")
-            return constant(types.value_ref(ref) if ref else t["const"])
+            if ref:
+                return constant(types.value_ref(ref), types.enums[ref.split(".")[0]]["primitive"])
+            return constant(t["const"], t["primitive"])
         # Rule: presence on the field overrides presence on the type.
         presence = field_presence or t["presence"]
         null = None
@@ -207,7 +237,7 @@ def resolve_field(elem, types):
         is_enum = type_name in types.enums
         t = types.enums[type_name] if is_enum else types.sets[type_name]
         if field_presence == "constant":
-            return constant(types.value_ref(elem.get("valueRef")))
+            return constant(types.value_ref(elem.get("valueRef")), t["primitive"])
         # Rule: presence on the field overrides presence on the type. An
         # enum's own presence is that of its encodingType (e.g. PriceType is
         # encoded as UInt8NULL, so it is optional with null 0).
@@ -343,9 +373,10 @@ def layout_data(elem, types):
 def load_schema(xml_path):
     data = Path(xml_path).read_bytes()
     digest = hashlib.sha256(data).hexdigest()
-    if digest != EXPECTED_SHA256:
+    expected = expected_sha256()
+    if digest != expected:
         raise SchemaError(f"{xml_path}: SHA-256 {digest} does not match the verified "
-                          f"schema {EXPECTED_SHA256}. Refusing to generate.")
+                          f"schema {expected} (spec/LAYOUTS.md). Refusing to generate.")
     root = ET.fromstring(data)
     types = Types(root.find("types"))
 
@@ -385,6 +416,10 @@ def load_schema(xml_path):
         "headers": headers,
         "enums": {n: e["values"] for n, e in types.enums.items()},
         "sets": {n: s["bits"] for n, s in types.sets.items()},
+        # Full enum and set definitions (underlying type, presence, null) for
+        # targets that need more than the values.
+        "enum_types": types.enums,
+        "set_types": types.sets,
     }
 
 
@@ -531,7 +566,11 @@ def render_items(lines, label, items, indent):
 
 def render(xml_path=XML_PATH):
     """Return the full text of layouts.py for the given schema file."""
-    schema = load_schema(xml_path)
+    return render_python(load_schema(xml_path))
+
+
+def render_python(schema):
+    """Target 1: feed_generator/b3gen/layouts.py."""
     lines = [HEADER.format(**schema)]
 
     lines.append("# Header layouts (packet header, framing header, SBE message header).")
@@ -597,13 +636,353 @@ def render(xml_path=XML_PATH):
     return "\n".join(lines)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Target 2: C++ header
+# ---------------------------------------------------------------------------
+
+CPP_TYPES = {
+    "char": "char",
+    "int8": "std::int8_t", "uint8": "std::uint8_t",
+    "int16": "std::int16_t", "uint16": "std::uint16_t",
+    "int32": "std::int32_t", "uint32": "std::uint32_t",
+    "int64": "std::int64_t", "uint64": "std::uint64_t",
+}
+CPP_PRIMITIVES = {"char": "character", "int8": "int8", "uint8": "uint8", "int16": "int16",
+                  "uint16": "uint16", "int32": "int32", "uint32": "uint32", "int64": "int64",
+                  "uint64": "uint64", "composite": "composite"}
+
+# Names the generated namespaces declare themselves; a schema name equal to
+# one of them would collide.
+CPP_TEMPLATE_RESERVED = {"template_id", "name", "block_length", "since_version",
+                         "deprecated_since"}
+CPP_GROUP_RESERVED = {"tag", "dimension_size", "dimension", "block_length"}
+CPP_ENUM_RESERVED = {"underlying_type", "optional", "null_value"}
+CPP_SET_RESERVED = {"underlying_type", "bit", "mask"}
+# C++20 keywords that Python's keyword module does not know.
+CPP_KEYWORDS = set("""alignas alignof and and_eq asm auto bitand bitor bool break case catch
+char char8_t char16_t char32_t class compl concept const consteval constexpr constinit
+const_cast continue co_await co_return co_yield decltype default delete do double
+dynamic_cast else enum explicit export extern false float for friend goto if inline int long
+mutable namespace new noexcept not not_eq nullptr operator or or_eq private protected public
+register reinterpret_cast requires return short signed sizeof static static_assert
+static_cast struct switch template this thread_local throw true try typedef typeid typename
+union unsigned using virtual void volatile wchar_t while xor xor_eq""".split())
+
+
+def cpp_name(name, where, reserved=()):
+    """A schema name used as a C++ identifier, checked."""
+    if (not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name in CPP_KEYWORDS
+            or keyword.iskeyword(name) or name in reserved or "__" in name):
+        raise SchemaError(f"{where}: {name!r} is not usable as a C++ identifier here")
+    return name
+
+
+def cpp_char(value):
+    if value == "\\":
+        return r"'\\'"
+    if value == "'":
+        return r"'\''"
+    if len(value) != 1 or not 32 <= ord(value) < 127:
+        raise SchemaError(f"char constant {value!r} is not one printable ASCII character")
+    return f"'{value}'"
+
+
+def cpp_literal(value, primitive):
+    """A C++ expression of type CPP_TYPES[primitive] for value."""
+    if primitive == "char":
+        if isinstance(value, str):
+            return cpp_char(value) if value else "'\\0'"
+        return str(value)
+    bits = PRIMITIVE_SIZES[primitive] * 8
+    if primitive.startswith("u"):
+        if not 0 <= value < 2 ** bits:
+            raise SchemaError(f"{value} out of range for {primitive}")
+        return f"{value}u" if bits <= 32 else f"{value}ull"
+    if not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1):
+        raise SchemaError(f"{value} out of range for {primitive}")
+    if value == -(2 ** (bits - 1)):
+        return f"std::numeric_limits<{CPP_TYPES[primitive]}>::min()"
+    return str(value)
+
+
+class CppWriter:
+    """Accumulates lines with namespace nesting."""
+
+    def __init__(self):
+        self.lines = []
+        self.depth = 0
+
+    def line(self, text=""):
+        self.lines.append(("    " * self.depth + text) if text else "")
+
+    def const(self, ctype, name, value):
+        self.line(f"inline constexpr {ctype} {name} = {value};")
+
+    def open(self, name, comment=None):
+        self.line(f"namespace {name} {{" + (f"  // {comment}" if comment else ""))
+        self.depth += 1
+
+    def close(self, name):
+        self.depth -= 1
+        self.line(f"}}  // namespace {name}")
+
+
+def cpp_member(w, m, where):
+    """A header or composite member: offset, size, type, null if it has one."""
+    w.open(cpp_name(m["name"], where))
+    w.const("std::uint16_t", "offset", m["offset"])
+    w.const("std::uint16_t", "size", m["size"])
+    w.line(f"using type = {CPP_TYPES[m['primitive']]};")
+    if m["null"] is not None:
+        w.const("type", "null_value", cpp_literal(m["null"], m["primitive"]))
+    w.close(m["name"])
+
+
+def cpp_field(w, f, where):
+    name = cpp_name(f["name"], where)
+    w.open(name)
+    w.const("std::uint16_t", "offset", f["offset"])
+    w.const("std::uint16_t", "size", f["size"])
+    w.const("Primitive", "primitive", f"Primitive::{CPP_PRIMITIVES[f['primitive']]}")
+    if f["primitive"] != "composite":
+        w.line(f"using type = {CPP_TYPES[f['primitive']]};")
+        if f["primitive"] == "char":
+            w.const("std::uint16_t", "length", f["size"])
+    w.const("std::string_view", "type_name", f'"{f["type_name"]}"')
+    w.const("std::uint16_t", "tag", f["tag"])
+    w.const("std::uint16_t", "since_version", f["since_version"] or 0)
+    w.const("bool", "deprecated", "true" if f["deprecated"] is not None else "false")
+    w.const("std::uint16_t", "deprecated_since", f["deprecated"] or 0)
+    w.const("bool", "constant", "false")
+    w.const("bool", "optional", "true" if f["presence"] == "optional" else "false")
+    if f["null"] is not None:
+        w.const("type", "null_value", cpp_literal(f["null"], f["primitive"]))
+    if f["exponent"] is not None:
+        w.const("std::int8_t", "exponent", f["exponent"])
+    if f["members"]:
+        w.open("members", "offsets relative to the field")
+        for m in f["members"]:
+            cpp_member(w, m, f"{where}.{name}")
+        w.close("members")
+    w.close(name)
+
+
+def cpp_constant(w, c, where):
+    name = cpp_name(c["name"], where)
+    w.open(name, "constant: 0 bytes on the wire")
+    w.const("std::uint16_t", "size", 0)
+    w.const("bool", "constant", "true")
+    value, primitive = c["value"], c["primitive"]
+    if primitive == "char" and isinstance(value, str) and len(value) != 1:
+        w.const("std::string_view", "value", f'"{value}"')
+    else:
+        w.const(CPP_TYPES[primitive], "value", cpp_literal(value, primitive))
+    w.const("std::string_view", "type_name", f'"{c["type_name"]}"')
+    w.const("std::uint16_t", "tag", c["tag"])
+    w.close(name)
+
+
+def cpp_fields(w, fields, constants, where, reserved):
+    seen = set(reserved)
+    for f in fields:
+        if f["name"] in seen:
+            raise SchemaError(f"{where}: duplicate or reserved name {f['name']!r}")
+        seen.add(f["name"])
+        cpp_field(w, f, where)
+    for c in constants:
+        if c["name"] in seen:
+            raise SchemaError(f"{where}: duplicate or reserved name {c['name']!r}")
+        seen.add(c["name"])
+        cpp_constant(w, c, where)
+    return seen
+
+
+CPP_BANNER = """\
+// GENERATED FILE. DO NOT EDIT.
+//
+// Generated by tools/gen_layouts.py from spec/b3-market-data-messages-2.3.1.xml
+// (SHA-256 {sha256}).
+// Regenerate with `make layouts`. `make layouts-check` (run by `make cpp-test`)
+// fails when this file is out of date.
+//
+// What it does:
+//   Every B3 template's layout as plain constexpr values in b3::layout:
+//   templateId, blockLength, and per field the offset, size, primitive type,
+//   sinceVersion, deprecated flag and null value (optional fields only).
+//   Constant fields are listed with their value and size 0. Also the schema
+//   constants, the packet and message headers, groups, var data, enums and sets.
+//
+// Conventions (spec/LAYOUTS.md section 1):
+//   * Field offsets are relative to the message body, the byte right after the
+//     12-byte message header. Group field offsets are relative to each entry.
+//   * since_version 0 means the field exists in every version. deprecated_since
+//     is the version that deprecated it (0: not deprecated). Deprecated fields
+//     still occupy their bytes.
+//   * Decimals report the mantissa's type plus the constant exponent.
+//
+// What it must not do:
+//   Hold logic, or replace the header's own blockLength and version: decoders
+//   must still trust those (spec/LAYOUTS.md section 5). These are the schema
+//   version {schema_version} layouts. Nothing here needs a .cpp file.
+"""
+
+
+def render_cpp(schema):
+    """Target 2: cpp_baseline/include/b3/layouts.hpp."""
+    w = CppWriter()
+    w.lines.append(CPP_BANNER.format(**schema))
+    for inc in ("#pragma once", "", "#include <array>", "#include <cstdint>",
+                "#include <limits>", "#include <string_view>", ""):
+        w.lines.append(inc)
+    w.open("b3::layout")
+    w.line()
+
+    w.line("// ---- Schema ----")
+    w.const("std::uint16_t", "schema_id", schema["schema_id"])
+    w.const("std::uint16_t", "schema_version", schema["schema_version"])
+    w.const("std::string_view", "semantic_version", f'"{schema["semantic_version"]}"')
+    w.const("std::string_view", "xml_sha256", f'"{schema["sha256"]}"')
+    w.const("std::uint16_t", "encoding_type", f"0x{ENCODING_TYPE:04X}")
+    w.const("std::uint16_t", "max_packet_size", MAX_PACKET_SIZE)
+    w.line()
+    w.line("enum class Primitive : std::uint8_t {")
+    w.line("    " + ", ".join(dict.fromkeys(CPP_PRIMITIVES.values())) + ",")
+    w.line("};")
+    w.line()
+
+    w.line("// ---- Headers ----")
+    headers = schema["headers"]
+    packet = headers["PacketHeader"]
+    w.open("packet_header", "once per datagram")
+    w.const("std::uint16_t", "size", sum(m["size"] for m in packet))
+    for m in packet:
+        cpp_member(w, m, "PacketHeader")
+    w.close("packet_header")
+    # The 12-byte message header: framing header (SOFH) then SBE message header.
+    framing = headers["FramingHeader"]
+    framing_size = sum(m["size"] for m in framing)
+    sbe = [dict(m, offset=m["offset"] + framing_size) for m in headers["messageHeader"]]
+    w.open("message_header", "once per message: framing header + SBE header")
+    w.const("std::uint16_t", "size", framing_size + sum(m["size"] for m in sbe))
+    w.const("std::uint16_t", "framing_size", framing_size)
+    for m in framing + sbe:
+        cpp_member(w, m, "messageHeader")
+    w.close("message_header")
+    w.line()
+
+    w.line("// ---- Enums: underlying type and values ----")
+    w.open("enums")
+    for name, e in schema["enum_types"].items():
+        w.open(cpp_name(name, "enums"))
+        w.line(f"using underlying_type = {CPP_TYPES[e['primitive']]};")
+        optional = e["presence"] == "optional"
+        w.const("bool", "optional", "true" if optional else "false")
+        if optional:
+            w.const("underlying_type", "null_value", cpp_literal(e["null"], e["primitive"]))
+        for value_name, value in e["values"].items():
+            w.const("underlying_type", cpp_name(value_name, f"enum {name}", CPP_ENUM_RESERVED),
+                    cpp_literal(value, e["primitive"]))
+        w.close(name)
+    w.close("enums")
+    w.line()
+
+    w.line("// ---- Sets: bit positions and masks ----")
+    w.open("sets")
+    for name, st in schema["set_types"].items():
+        w.open(cpp_name(name, "sets"))
+        w.line(f"using underlying_type = {CPP_TYPES[st['primitive']]};")
+        w.open("bit")
+        for bit, choice in sorted(st["bits"].items()):
+            w.const("unsigned", cpp_name(choice, f"set {name}", CPP_SET_RESERVED), bit)
+        w.close("bit")
+        w.open("mask")
+        for bit, choice in sorted(st["bits"].items()):
+            w.const("underlying_type", choice, cpp_literal(1 << bit, st["primitive"]))
+        w.close("mask")
+        w.close(name)
+    w.close("sets")
+    w.line()
+
+    w.line("// ---- Templates (HeaderMessage_0 is excluded: B3 never sends it) ----")
+    ids = [t["id"] for t in schema["templates"]]
+    w.line(f"inline constexpr std::array<std::uint16_t, {len(ids)}> template_ids = {{")
+    w.line("    " + ", ".join(str(i) for i in ids) + ",")
+    w.line("};")
+    for t in schema["templates"]:
+        tname = cpp_name(t["name"], "templates")
+        w.line()
+        w.open(tname)
+        w.const("std::uint16_t", "template_id", t["id"])
+        w.const("std::string_view", "name", f'"{t["name"]}"')
+        w.const("std::uint16_t", "block_length", t["block_length"])
+        w.const("std::uint16_t", "since_version", t["since_version"] or 0)
+        w.const("std::uint16_t", "deprecated_since", t["deprecated"] or 0)
+        seen = cpp_fields(w, t["fields"], t["constants"], tname, CPP_TEMPLATE_RESERVED)
+        for g in t["groups"]:
+            gname = cpp_name(g["name"], tname)
+            if gname in seen:
+                raise SchemaError(f"{tname}: group {gname!r} collides with another name")
+            seen.add(gname)
+            w.open(gname, "repeating group: dimension header, then entries")
+            w.const("std::uint16_t", "tag", g["tag"])
+            w.const("std::uint16_t", "dimension_size", g["dimension_size"])
+            w.const("std::uint16_t", "block_length", g["block_length"])
+            w.open("dimension")
+            for m in g["dimension"]:
+                cpp_member(w, m, f"{tname}.{gname}.dimension")
+            w.close("dimension")
+            cpp_fields(w, g["fields"], g["constants"], f"{tname}.{gname}", CPP_GROUP_RESERVED)
+            w.close(gname)
+        for d in t["var_data"]:
+            dname = cpp_name(d["name"], tname)
+            if dname in seen:
+                raise SchemaError(f"{tname}: var data {dname!r} collides with another name")
+            seen.add(dname)
+            w.open(dname, "var data: length prefix, then that many bytes")
+            w.const("std::uint16_t", "tag", d["tag"])
+            w.const("std::uint16_t", "prefix_size", d["prefix_size"])
+            w.line(f"using prefix_type = {CPP_TYPES[d['prefix_primitive']]};")
+            w.const("std::string_view", "type_name", f'"{d["type_name"]}"')
+            w.close(dname)
+        w.close(tname)
+    w.line()
+    w.close("b3::layout")
+    return "\n".join(w.lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Output targets
+# ---------------------------------------------------------------------------
+
+# (path relative to the repo root, render function taking the parsed schema).
+# A SystemVerilog package for the RTL becomes a third entry here.
+OUTPUTS = (
+    (PY_OUT, render_python),
+    (CPP_OUT, render_cpp),
+)
+
+
+def render_all(xml_path=XML_PATH):
+    """{relative output path: text} for every target, from one parse."""
+    schema = load_schema(xml_path)
+    return {path: render_fn(schema) for path, render_fn in OUTPUTS}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Generate B3 layouts from the SBE schema.")
+    ap.add_argument("--out-dir", type=Path, default=REPO,
+                    help="root to write the outputs under (default: the repo, in place)")
+    args = ap.parse_args(argv)
     try:
-        text = render()
+        outputs = render_all()
     except SchemaError as exc:
         sys.exit(f"gen_layouts: {exc}")
-    OUT_PATH.write_text(text, encoding="utf-8")
-    print(f"wrote {OUT_PATH.relative_to(REPO)}")
+    for rel, text in outputs.items():
+        path = args.out_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # newline="\n": byte-identical output on every OS.
+        path.write_text(text, encoding="utf-8", newline="\n")
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":
