@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 2 (build system, test harness, generated field layouts).
+Status: step 3 (build system, generated field layouts, pcap reader).
 
 ## Requirements
 
@@ -25,6 +25,7 @@ From the repo root:
 | `make cpp-uncapped` | Release, uncapped book | `cpp_baseline/build/uncapped` |
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
+| `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `feed_generator/data`) | `cpp_baseline/build/release` |
 
 All builds use `-Wall -Wextra -Wpedantic -Werror`.
 
@@ -43,6 +44,19 @@ generator's `layouts.py`. Never edit it by hand:
 
 `tests/test_layouts.cpp` checks a few values against numbers copied by hand
 from `spec/LAYOUTS.md`.
+
+## Pcap reader
+
+`include/b3/pcap.hpp`: `b3::pcap::Capture::from_file(path)` reads the whole
+file, then indexes it once into `PacketView`s (frame number, capture time in
+ns, UDP payload pointer and length inside the buffer, destination and source
+address and port). Classic pcap only (ns or µs, either byte order), Ethernet,
+one optional VLAN tag, IPv4 with options, UDP. Frames it skips are counted.
+It never reads the UDP payload.
+
+```
+cpp_baseline/build/release/b3_pcapinfo [--timing] feedA.pcap   # counters as one JSON line
+```
 
 ## Book parameters
 
@@ -74,7 +88,13 @@ ctest --test-dir cpp_baseline/build/k4 --output-on-failure
 CMakeLists.txt
 include/b3/book_params.hpp   book parameters (only place they are set)
 include/b3/layouts.hpp       generated field layouts (do not edit)
+include/b3/wire.hpp          unaligned little/big-endian loads (memcpy)
+include/b3/pcap.hpp          pcap reader
+src/pcap.cpp
+apps/b3_pcapinfo.cpp         pcap -> counters JSON line
 tests/test_build.cpp         doctest main, build parameter tests
 tests/test_layouts.cpp       layouts.hpp against spec/LAYOUTS.md
+tests/test_wire.cpp          both byte orders, every width
+tests/test_pcap.cpp          reader on hand-built pcap bytes
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```

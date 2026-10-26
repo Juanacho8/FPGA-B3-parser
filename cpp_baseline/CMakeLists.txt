@@ -97,14 +97,19 @@ message(STATUS "b3: ${CMAKE_BUILD_TYPE}, N=${B3_PUBLISHED_DEPTH_EFFECTIVE} "
                "K=${B3_TRACKED_DEPTH_EFFECTIVE} instruments=${B3_MAX_INSTRUMENTS_EFFECTIVE} "
                "book=${B3_BOOK}")
 
-# ---- 5. Library target (headers only for now) ----
-add_library(b3 INTERFACE)
-target_include_directories(b3 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(b3 INTERFACE ${B3_PARAM_DEFINES})
+# ---- 5. Library ----
+add_library(b3 STATIC src/pcap.cpp)
+target_include_directories(b3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(b3 PUBLIC ${B3_PARAM_DEFINES})
 
-# ---- 6. Tests ----
+# ---- 6. Apps ----
+add_executable(b3_pcapinfo apps/b3_pcapinfo.cpp)
+target_link_libraries(b3_pcapinfo PRIVATE b3)
+
+# ---- 7. Tests ----
 enable_testing()
-add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp)
+add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp
+  tests/test_pcap.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # What CMake configured, so the test can check the code saw the same values.
