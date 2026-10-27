@@ -114,6 +114,40 @@ TEST_CASE("duplicate: at or below the last accepted, dropped") {
     CHECK(q.c().gaps == 0);
 }
 
+TEST_CASE("late_after_gap: a packet inside a recorded gap is late, not a duplicate") {
+    Seq q;
+    CHECK(q.feed(packet(68, 1, 9)));
+    CHECK(q.feed(packet(68, 1, 11)));        // gap: 10 missing
+    CHECK_FALSE(q.feed(packet(68, 1, 10)));  // 10 arrives late: dropped, counted as late
+    CHECK(q.s.last().kind == b3::packet::SequenceVerdict::Kind::late);
+    CHECK(q.c().late_after_gap == 1);
+    CHECK(q.c().duplicates == 0);
+    CHECK_FALSE(q.feed(packet(68, 1, 11)));  // 11 again: a real duplicate
+    CHECK(q.c().duplicates == 1);
+    CHECK(q.feed(packet(68, 1, 12)));        // the run goes on: late packets touch no state
+    CHECK(q.c().gaps == 1);
+    CHECK(q.feed(packet(70, 1, 10)));        // another channel: its own first packet
+}
+
+TEST_CASE("late_after_gap: only gaps of the same version, the last kRecordedGaps of them") {
+    Seq q;
+    CHECK(q.feed(packet(68, 1, 1)));
+    std::uint32_t n = 1;
+    for (std::size_t g = 0; g < Sequencer::kRecordedGaps + 1; ++g) {   // one gap more than remembered
+        n += 2;
+        CHECK(q.feed(packet(68, 1, n)));
+    }
+    CHECK_FALSE(q.feed(packet(68, 1, 2)));    // the oldest gap was forgotten: a duplicate
+    CHECK(q.c().duplicates == 1);
+    CHECK_FALSE(q.feed(packet(68, 1, n - 1))); // the newest is remembered: late
+    CHECK(q.c().late_after_gap == 1);
+    CHECK(q.feed(packet(68, 1, n + 1)));
+    CHECK(q.feed(packet(68, 1, 50, Body::reset)));
+    CHECK(q.feed(packet(68, 2, 1)));
+    CHECK_FALSE(q.feed(packet(68, 2, 1)));     // new version: no gap of version 2 recorded
+    CHECK(q.c().duplicates == 2);
+}
+
 TEST_CASE("channels are sequenced independently") {
     Seq q;
     CHECK(q.feed(packet(68, 1, 10)));

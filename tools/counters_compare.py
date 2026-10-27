@@ -121,7 +121,8 @@ class Replay:
         self.ch = {}   # channel -> {"seen", "reset", "version", "next"}
         self.seq = dict(sequenced=0, gaps=0, gap_events=0, heartbeats=0, heartbeat_mismatches=0,
                         resets=0, reset_mismatches=0, version_changes=0, seq_reset_not_first=0,
-                        heartbeat_without_sequence=0)
+                        heartbeat_without_sequence=0,
+                        late_after_gap=0)   # the view never holds a late packet: only 0 is derivable
         self.msg_before_rebuild = 0
         self.losses = 0
         self.unknown = 0

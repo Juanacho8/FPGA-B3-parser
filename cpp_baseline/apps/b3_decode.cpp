@@ -136,12 +136,12 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
     std::fprintf(f, "},\"sequencing\":{\"sequenced\":%llu,\"gaps\":%llu,\"gap_events\":%llu,"
                  "\"heartbeats\":%llu,\"heartbeat_mismatches\":%llu,\"resets\":%llu,"
                  "\"reset_mismatches\":%llu,\"version_changes\":%llu,\"seq_reset_not_first\":%llu,"
-                 "\"heartbeat_without_sequence\":%llu},",
+                 "\"heartbeat_without_sequence\":%llu,\"late_after_gap\":%llu},",
                  static_cast<ull>(sq.sequenced), static_cast<ull>(sq.gaps), static_cast<ull>(sq.gap_events),
                  static_cast<ull>(sq.heartbeats), static_cast<ull>(sq.heartbeat_mismatches),
                  static_cast<ull>(sq.resets), static_cast<ull>(sq.reset_mismatches),
                  static_cast<ull>(sq.version_changes), static_cast<ull>(tc.seq_reset_not_first),
-                 static_cast<ull>(sq.heartbeat_without_sequence));
+                 static_cast<ull>(sq.heartbeat_without_sequence), static_cast<ull>(sq.late_after_gap));
     std::fprintf(f, "\"losses\":%llu,\"unknown_instrument_messages\":%llu,\"msg_before_rebuild\":%llu,"
                  "\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.unknown_instrument_messages),
