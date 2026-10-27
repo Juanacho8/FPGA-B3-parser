@@ -116,6 +116,28 @@ inline Block composite_block(const Block& b) noexcept {
     return {b.data + F::offset, F::size, b.version};
 }
 
+// Field Name of a descriptor list, read as an unsigned integer (absent if the
+// list has no such field). Which descriptor is read is resolved at compile
+// time: Name must be a constant (a static constexpr std::string_view).
+template <const std::string_view& Name, class... Fs>
+inline Value<std::uint64_t> get_named(List<Fs...>, const Block& b) noexcept {
+    Value<std::uint64_t> out;
+    (
+        [&] {
+            if constexpr (Fs::name == Name) {
+                const auto v = get<Fs>(b);
+                out = {v.presence, static_cast<std::uint64_t>(v.value)};
+            }
+        }(),
+        ...);
+    return out;
+}
+
+template <const std::string_view& Name, class... Fs>
+constexpr bool has_named(List<Fs...>) noexcept {
+    return ((Fs::name == Name) || ...);
+}
+
 // A constant field: the schema's value, never the wire's.
 template <class C>
 constexpr auto constant() noexcept {

@@ -74,4 +74,18 @@ inline std::optional<Malformed> check(const std::uint8_t* msg, std::size_t remai
     return std::nullopt;
 }
 
+// Complete messages in one datagram, the way the walker counts them (up to
+// kMaxMessagesPerPacket, stopping at the first failed test). Used at load
+// time for an upper bound on output records.
+inline std::size_t count_complete_messages(const std::uint8_t* payload, std::size_t len) noexcept {
+    std::size_t pos = layout::packet_header::size;
+    std::size_t n = 0;
+    MessageHeader h;
+    while (pos < len && n < kMaxMessagesPerPacket && !check(payload + pos, len - pos, h)) {
+        pos += h.length;
+        ++n;
+    }
+    return n;
+}
+
 }  // namespace b3::framing

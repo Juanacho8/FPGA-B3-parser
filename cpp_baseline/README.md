@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 6 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags).
+Status: step 7 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records).
 
 ## Requirements
 
@@ -26,6 +26,8 @@ From the repo root:
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 | `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
+| `make events-compare` | Release and variant builds, then `b3_decode --events` (port 1) against `tools/intent_to_events.py`: Feed A byte-identical, Feed B per channel, identical records in every build | `cpp_baseline/build/*` |
+| `make goldens` | Port 1 goldens for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release` |
 | `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
 | `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
 | `make decode-crosscheck` | Release build, then `b3_decode` against intent.jsonl and manifest.json on both feeds of every set under `B3_DATA` | `cpp_baseline/build/release` |
@@ -94,6 +96,17 @@ and stale flags per table instrument (DESIGN.md 3.6.4).
 cpp_baseline/build/release/b3_decode --instruments instruments.txt --counters counters.json feedA.pcap
 ```
 
+## Port 1
+
+`records.hpp`: the 64-byte event record and the file header (DESIGN.md 2, 3.1).
+`event_sink.hpp`: one record per hot-path message and END_OF_EVENT markers,
+per DESIGN.md 3.4 and 3.5, into a buffer allocated before the loop.
+
+```
+cpp_baseline/build/release/b3_decode --events events.bin feedA.pcap
+python3 tools/dump_events.py events.bin --limit 20
+```
+
 ## Book parameters
 
 Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake:
@@ -137,6 +150,8 @@ include/b3/framing.hpp       the complete message test (walker, sequencer)
 include/b3/walker.hpp        message framing, malformed test, dispatch
 include/b3/instruments.hpp   instrument table: load and lookup
 include/b3/tracker.hpp       rptSeq, stale flags, per-message checks
+include/b3/records.hpp       port 1 record and file header structs
+include/b3/event_sink.hpp    port 1: records, event closing
 src/instruments.cpp
 apps/b3_decode.cpp           pcap -> decode counts JSON (and --list)
 tests/test_build.cpp         doctest main, build parameter tests
@@ -148,5 +163,6 @@ tests/test_decode.cpp        field access, groups, var data, body faults, writer
 tests/test_sequencer.cpp     sequencing rules
 tests/test_tracker.cpp       rptSeq, stale flags, unknown instruments
 tests/test_instruments.cpp   table loading and lookup
+tests/test_events.cpp        port 1 per kind, event closing, DESIGN.md hex examples
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```
