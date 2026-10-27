@@ -283,7 +283,7 @@ TEST_CASE("closing: closer on port 1, non-port-1 closer, standalone closer") {
     CHECK_FALSE(p.sink.event_open(68));
 }
 
-TEST_CASE("closing: channels apart; a SequenceReset does not close (DESIGN.md 3.5), counted") {
+TEST_CASE("closing: channels apart; a SequenceReset arriving with an event open clears it") {
     Port1 p;
     p.feed(packet(68, 1, {message(55, summary())}));
     CHECK(p.sink.event_open(68));
@@ -291,13 +291,27 @@ TEST_CASE("closing: channels apart; a SequenceReset does not close (DESIGN.md 3.
     p.feed(packet(70, 1, {message(56, stats(0x80, 5))}));     // other channel: standalone, nothing
     CHECK(p.records().size() == 1);
     p.feed(packet(68, 2, {message(1, {})}));                   // reset packet
-    CHECK(p.sink.event_open(68));                              // the state changes only on messages
+    CHECK_FALSE(p.sink.event_open(68));                        // cleared, nothing emitted but SEQ_RESET
     CHECK(p.sink.counters().resets_with_event_open == 1);
-    p.feed(packet(68, 1, {message(56, stats(0x80, 6))}, 2));   // next version: closes with a marker
+    p.feed(packet(68, 1, {message(56, stats(0x80, 6))}, 2));   // standalone now: no marker
     const auto rs = p.records();
-    REQUIRE(rs.size() == 3);
+    REQUIRE(rs.size() == 2);
     CHECK(rs[1].kind == K::SEQ_RESET);
-    CHECK(rs[2].kind == K::END_OF_EVENT);
+}
+
+TEST_CASE("closing: a ChannelReset arriving with an event open clears it") {
+    Port1 p;
+    Bytes reset(12, 0);
+    put(reset, 0, 0x20, 1);                                    // RecoveryMsg, no EndOfEvent
+    put(reset, 4, 88, 8);
+    p.feed(packet(68, 1, {message(55, summary()), message(11, reset)}));
+    CHECK_FALSE(p.sink.event_open(68));                        // without the rule, mEI 0x20 would keep it open
+    p.feed(packet(68, 2, {message(56, stats(0x80, 6))}));      // standalone: no marker
+    const auto rs = p.records();
+    REQUIRE(rs.size() == 2);
+    CHECK(rs[1].kind == K::CLEAR_CHANNEL);
+    CHECK(rs[1].flags == 0x02);
+    CHECK(p.sink.counters().resets_with_event_open == 1);
 }
 
 TEST_CASE("closing: a duplicate packet produces nothing") {

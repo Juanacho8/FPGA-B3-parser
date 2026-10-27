@@ -12,8 +12,9 @@
 //     * EndOfEvent with no event open and no port 1 record: nothing
 //     * matchEventIndicator without EndOfEvent, or an ExecutionSummary: the
 //       channel's event is open
-//     * no matchEventIndicator (SequenceReset, heartbeats, unknown templates):
-//       no state change
+//     * no matchEventIndicator (heartbeats, unknown templates): no state change
+//     * SequenceReset or ChannelReset: its own record, then the channel's
+//       event state is cleared (IDLE), with nothing else emitted
 //   Duplicates and discarded tails never reach a sink, so they produce nothing.
 //   Records go into a buffer allocated by the caller before the loop, with a
 //   capacity from a counting pass at load time; a record past it is counted
@@ -213,7 +214,7 @@ struct EventCounters {
     std::uint64_t records = 0;            // stored
     std::uint64_t markers = 0;            // END_OF_EVENT markers among them
     std::uint64_t overflow = 0;           // records past the buffer's capacity: dropped, counted
-    std::uint64_t resets_with_event_open = 0;   // SequenceReset or ChannelReset on a channel with an event open
+    std::uint64_t resets_with_event_open = 0;   // SequenceReset or ChannelReset that cleared an open event
 };
 
 class EventSink {
@@ -227,7 +228,17 @@ public:
         R::EventRecord r;
         const bool on_port1 = fill<Id>(m, r);
         if constexpr (Id == L::SequenceReset_1::template_id || Id == L::ChannelReset_11::template_id) {
-            if (open_[ch]) ++counters_.resets_with_event_open;   // DESIGN.md 3.5: no forced close
+            // DESIGN.md 3.5: a reset clears the channel's event state and emits
+            // nothing but its own record (flags from its matchEventIndicator).
+            if (open_[ch]) ++counters_.resets_with_event_open;
+            open_[ch] = false;
+            identity(m, r);
+            if constexpr (decode::has_named<kMatchEventIndicator>(typename T::fields{})) {
+                const auto v = decode::get_named<kMatchEventIndicator>(typename T::fields{}, decode::root(m));
+                r.flags = v.absent() ? 0 : flags_of(static_cast<std::uint8_t>(v.value));
+            }
+            emit(r);
+            return;
         }
         bool has_mei = false;
         std::uint8_t mei = 0;

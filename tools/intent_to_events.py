@@ -35,6 +35,7 @@ RECOVERY_BIT = 0x20       # bit 5
 IMPLIED_BIT = 0x10        # bit 4
 
 MD_NEW, MD_CHANGE, MD_DELETE_THRU = 0, 1, 3
+RESETS = {1, 11}   # SequenceReset, ChannelReset: clear the channel's event state
 
 # Templates with a matchEventIndicator field. Not: 1, 2, 12, 30, 55, 71 and
 # unknown templates (55 never ends an event, LAYOUTS.md 12.4).
@@ -168,6 +169,13 @@ class Closer:
         event = to_event(row)
         mei = match_event_indicator(row)
         ch = row["channel"]
+        if row["templateId"] in RESETS:
+            # A SequenceReset or ChannelReset clears the channel's event state
+            # and emits nothing but its own record (DESIGN.md 3.5).
+            self.open[ch] = False
+            if event:
+                yield event
+            return
         if mei is None:
             # No matchEventIndicator. ExecutionSummary always starts an event.
             if row["templateId"] == 55:
