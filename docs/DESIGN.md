@@ -256,6 +256,41 @@ On the first failure the decoder counts it by reason, keeps what it decoded befo
 * a **group** is a list of entries, each `{"fields": {...}, "null": [...], "absent": [...]}`
 * a **multi-member composite** (MaturityMonthYear) is an object of its members' wire values, listed in `null` when optional and every member holds its null
 
+### 3.6.3 Sequencing
+
+Per channel, on every packet that passed the packet decoder (`cpp_baseline/include/b3/packet.hpp`, `Sequencer`), following `spec/LAYOUTS.md` 12.1 and `feed_generator/tests/book_builder.py`. A short datagram never gets here (3.6.1); a malformed packet does, so it uses up its sequence number. State is a fixed array of 256 channels, each: `seen`, `reset_pending`, `version` (u16), `next` (u32, the expected sequenceNumber).
+
+**The decision is made once per packet, before any message is dispatched, from two things only**: the 16-byte packet header, and the header of the packet's first message. The first message makes a **reset packet** when it passes the complete message test (3.6.1) and its templateId is 1 (SequenceReset). Nothing else in the packet is looked at, so the RTL can decide while the first message header streams in.
+
+| Packet (checked in this order) | Rule |
+|---|---|
+| sequenceNumber 0 | **Heartbeat**: not sequenced, accepted. Its nextSeqNo is checked when its Sequence message is dispatched (below) |
+| Reset packet | Accepted without checking its own sequenceNumber or version. `reset_pending` is set |
+| `reset_pending` is set | Cleared. The packet should be (version + 1, 1), with version 65534 followed by 1; if not, a **reset mismatch** is counted. The channel then expects (version + 1, 1) and the packet is judged by the rows below, so a higher number is a gap |
+| First sequenced packet on the channel | Accepted. Sets version and `next` = its sequenceNumber + 1 |
+| sequenceVersion ≠ the channel's | Accepted, counted as a **version change**, and followed (sets version and `next`) |
+| sequenceNumber = `next` | Accepted |
+| sequenceNumber > `next` | Accepted. A **gap** of sequenceNumber − `next` packets is counted, starting at `next` (the stale point, 3.6.4) |
+| sequenceNumber < `next` | **Duplicate**: dropped. Not dispatched, so it touches no counter, event state, stale flag or book |
+
+On dispatch (`cpp_baseline/include/b3/tracker.hpp`):
+
+* a **Sequence** message in a heartbeat packet: nextSeqNo must equal the channel's `next`, or 1 when `reset_pending` is set; otherwise a **heartbeat mismatch** is counted. Before the channel's first sequenced packet there is nothing to check.
+* a **SequenceReset** that is not its packet's first message is counted (`seq_reset_not_first`) and is otherwise an ordinary message: it does not make a reset packet.
+
+### 3.6.4 rptSeq and stale flags
+
+Per table instrument (4.4), on dispatch (`Tracker`). Flags only: there is no book yet (step 8 adds it).
+
+* **rptSeq**: every message with a securityID in the table and an rptSeq field. It must be the previous + 1, or 1 on the message after the instrument's EmptyBook. A jump is counted (`rpt_seq_gaps`) and marks **that instrument** stale, at the packet holding the message. The first message seen sets the starting value. A ChannelReset does not touch rptSeq; in every generator set each instrument's first message after a ChannelReset (or a SequenceReset) is its own EmptyBook, which restarts it.
+* **Losses** mark **every table instrument of the channel** stale: a sequence gap (stale point: channel, sequenceVersion and the first missing sequenceNumber) and a discarded tail (a malformed packet, or messages past msg_index 255; stale point: the packet itself). A decoder cannot know what the lost bytes held, so a loss is assumed to have held a message for each instrument of the channel, or a channel-wide one. A gap is marked before the packet that reveals it is dispatched; a discarded tail after the packet's complete messages.
+* **Clearing**: an instrument's **EmptyBook** clears its stale flag; a **ChannelReset** clears it for every table instrument of its channel. Nothing else does.
+* Reported per instrument: rptSeq gaps, the number of times it went stale, whether it is stale at the end, and its **first stale point** (channel, sequenceVersion, sequenceNumber), kept even after a clear.
+* **No snapshot recovery** in v1. A loss with no later EmptyBook or ChannelReset leaves the instruments stale to the end of the file.
+* securityID not in the table: counted (`unknown_instrument_messages`), not tracked. A null securityID (a market-wide News) is not counted.
+
+The generator's `unreliable_books` (manifest.json) comes from the contents of the lost packets and covers packets missing from both feeds only. The rule above uses only what a decoder sees, so it flags at least as much and at the same point or earlier: `tools/counters_compare.py` derives the decoder's expected flags independently and also checks every `unreliable_books` entry against them.
+
 ### 3.7 Feeds and record order
 
 events.bin describes one feed's pcap, decoded alone (A/B arbitration comes in step 11).
@@ -390,10 +425,19 @@ Flags:
 
 At each close of a channel's event (3.5), one record per instrument in `touched[ch]` that is in the book table and not stale, in order of first touch within the event. CLEAR_CHANNEL touches every instrument of that channel in the book table, in table order. An instrument is touched when it receives a book-changing record (ADD, MODIFY, DELETE, CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL), even if the change falls in the untracked region and the published levels do not change. Nothing is written mid-event (brief open item E).
 
-### 4.4 Decided in step 8
+### 4.4 Instrument table
 
-* **Instrument lookup**: how securityID maps to a book slot (runtime table, loaded from a config file) and how the RTL loads it.
-* **Table-full behavior**: what happens to an instrument that does not fit in MAX_INSTRUMENTS.
+The instruments the decoder tracks (rptSeq and stale flags now, books from step 8), as a plain-text file loaded once at startup, outside timed code (`b3_decode --instruments FILE`, `cpp_baseline/include/b3/instruments.hpp`).
+
+* **Format**: one instrument per line, `securityID channel`, both decimal. `#` starts a comment, blank lines are ignored. An instrument's **slot** is its position among the instrument lines, from 0. `tools/gen_instruments.py` writes the file from the feed generator's `config.toml`.
+* **Load errors** (the decoder refuses to start, naming the line): a line that is not two unsigned integers, a channel above 255, a securityID already in the table, or more instruments than MAX_INSTRUMENTS. So the table-full case never reaches the decoder: a table that does not fit is rejected whole.
+* **Lookup**: the software scans the table in order and takes the matching slot. The RTL does the same lookup as one parallel compare of the securityID against every entry. securityIDs are unique, so both find the same slot.
+* **Not in the table**: the message is still decoded and still goes to port 1 (3.6), but its instrument gets no rptSeq tracking and no book. It is counted.
+* The channel column says which instruments a loss on a channel marks stale, and which a ChannelReset clears (3.6.4). The lookup itself is by securityID only.
+
+### 4.5 Future items
+
+* **Snapshot recovery**: rebuilding a stale instrument from the snapshot recovery stream (`spec/LAYOUTS.md` 12.6, 12.8), which would clear its stale flag. Not in v1: a stale instrument stays stale until its EmptyBook or a ChannelReset (3.6.4).
 
 ---
 
@@ -409,6 +453,8 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `compare_decode.py` | decode.jsonl vs intent.jsonl, field for field, including null vs absent. First mismatches with packet and message position |
 | `dump_events.py` | events.bin → readable rows (`--hex` for raw bytes) |
 | `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
+| `counters_compare.py` | `b3_decode --counters` against counters derived from manifest.json and intent.jsonl: sequencing, rptSeq, stale flags and points, every other counter, both feeds (`make counters-compare`) |
+| `gen_instruments.py` | The instrument table (4.4) from the feed generator's config.toml |
 | `decode_compare.py` | `b3_decode --decode` against intent.jsonl with `compare_decode.py --strict`, both feeds of every set, the schema set's features and B3's sample packet (`make decode-compare`) |
 | `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
 

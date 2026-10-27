@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -82,6 +82,12 @@ decode-crosscheck: cpp-release
 # features and B3's sample packet. Fails on any difference.
 decode-compare: cpp-release
 	$(PYTHON) tools/decode_compare.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
+
+# Sequencing, rptSeq, stale flags and every other counter of b3_decode
+# --counters against values derived from manifest.json and intent.jsonl,
+# both feeds of every set under B3_DATA. Fails on any difference.
+counters-compare: cpp-release
+	$(PYTHON) tools/counters_compare.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
 
 cpp-clean:
 	rm -rf $(CPP_BUILD)
