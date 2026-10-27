@@ -249,7 +249,9 @@ What the field decoder does with one complete message (`cpp_baseline/include/b3/
 | 3 | The var data length prefix fits | `var_data_length_past_end` |
 | 4 | The var data bytes fit | `var_data_past_end` |
 
-On the first failure the decoder counts it by reason, keeps what it decoded before it (the root block, earlier groups, the entries that fit, earlier var data), stops decoding that message, and **carries on with the next message**: messageLength still frames it. The full decode row gets `"body_fault": {"reason", "at"}` (`at` names the group or var data field) and `"undecoded"`: that group or field and every later one. A News part with a body fault produces no reassembled `news` and ends the reassembly open on its channel. The hot path reads no group or var data field today, so body faults only exist in the full decode.
+On the first failure the decoder counts it by reason, keeps what it decoded before it (the root block, earlier groups, the entries that fit, earlier var data), stops decoding that message, and **carries on with the next message**: messageLength still frames it. The full decode row gets `"body_fault": {"reason", "at"}` (`at` names the group or var data field) and `"undecoded"`: that group or field and every later one. A News part with a body fault produces no reassembled `news` and ends the reassembly open on its channel.
+
+**Body faults are a software-only counter.** Groups and var data are walked only by the software counters (`b3_decode --counters`) and the full decode (`--decode`). The decode path that is timed (step 10), like the FPGA, never reads a message past its root block: a message's fields are read at their fixed offsets inside blockLength, and the walker steps over the rest by messageLength. No port 1 record or event-closing decision needs a group or var data field.
 
 **Full decode format** (`b3_decode --decode`). One JSON line per message, in the shape of intent.jsonl, values as intent.jsonl writes them: numbers for integers, enums, sets, prices (raw mantissas) and timestamps; strings for char, char[N] (`""` for NUL) and var data; `"news"` on a News's last part with the parts' text joined (parts 1 to partCount, in order, on one channel); `{"body": "<hex>"}` for an unknown template. No `instrument`: it is a name from the generator's config. Two formats intent.jsonl has no precedent for (the generator never writes groups or multi-member composites):
 
@@ -264,7 +266,7 @@ Per channel, on every packet that passed the packet decoder (`cpp_baseline/inclu
 
 | Packet (checked in this order) | Rule |
 |---|---|
-| sequenceNumber 0 | **Heartbeat**: not sequenced, accepted. Its nextSeqNo is checked when its Sequence message is dispatched (below) |
+| sequenceNumber 0 | **Heartbeat**: not sequenced, accepted. Its nextSeqNo is checked when its Sequence message is dispatched (below). If its first message is not a complete Sequence, `heartbeat_without_sequence` is counted |
 | Reset packet | Accepted without checking its own sequenceNumber or version. `reset_pending` is set |
 | `reset_pending` is set | Cleared. The packet should be (version + 1, 1), with version 65534 followed by 1; if not, a **reset mismatch** is counted. The channel then expects (version + 1, 1) and the packet is judged by the rows below, so a higher number is a gap |
 | First sequenced packet on the channel | Accepted. Sets version and `next` = its sequenceNumber + 1 |
@@ -285,6 +287,7 @@ Per table instrument (4.4), on dispatch (`Tracker`). Flags only: there is no boo
 * **rptSeq**: every message with a securityID in the table and an rptSeq field. It must be the previous + 1, or 1 on the message after the instrument's EmptyBook. A jump is counted (`rpt_seq_gaps`) and marks **that instrument** stale, at the packet holding the message. The first message seen sets the starting value. A ChannelReset does not touch rptSeq; in every generator set each instrument's first message after a ChannelReset (or a SequenceReset) is its own EmptyBook, which restarts it.
 * **Losses** mark **every table instrument of the channel** stale: a sequence gap (stale point: channel, sequenceVersion and the first missing sequenceNumber) and a discarded tail (a malformed packet, or messages past msg_index 255; stale point: the packet itself). A decoder cannot know what the lost bytes held, so a loss is assumed to have held a message for each instrument of the channel, or a channel-wide one. A gap is marked before the packet that reveals it is dispatched; a discarded tail after the packet's complete messages.
 * **Clearing**: an instrument's **EmptyBook** clears its stale flag; a **ChannelReset** clears it for every table instrument of its channel. Nothing else does.
+* **Before the rebuild**: after a ChannelReset, a message for a table instrument of that channel arriving before the instrument's own EmptyBook is counted (`msg_before_rebuild`). B3 may interleave such messages (generator open item J); the generator never does, and no rule here depends on it.
 * Reported per instrument: rptSeq gaps, the number of times it went stale, whether it is stale at the end, and its **first stale point** (channel, sequenceVersion, sequenceNumber), kept even after a clear.
 * **No snapshot recovery** in v1. A loss with no later EmptyBook or ChannelReset leaves the instruments stale to the end of the file.
 * securityID not in the table: counted (`unknown_instrument_messages`), not tracked. A null securityID (a market-wide News) is not counted.

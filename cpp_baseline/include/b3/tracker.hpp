@@ -12,8 +12,14 @@
 //   * EmptyBook clears its instrument's stale flag; ChannelReset clears it
 //     for every table instrument of its channel. rptSeq is not touched by a
 //     ChannelReset: each instrument's EmptyBook restarts it.
-//   * groups and var data are bounds-checked (decode::walk_body) and body
-//     faults counted.
+//   * with walk_bodies on (--counters and --decode runs only), groups and
+//     var data are bounds-checked (decode::walk_body) and body faults
+//     counted. Off, no message body past its root block is read: the path
+//     step 10 times, like the FPGA, steps over every message by messageLength.
+//     Body faults are a software-only counter (DESIGN.md 3.6.2).
+//   * a message for a table instrument after a ChannelReset on its channel
+//     and before that instrument's EmptyBook is counted (msg_before_rebuild,
+//     generator open item J).
 //   on_loss() marks every table instrument of a channel stale: the caller
 //   reports a sequence gap (at its first missing number) or a discarded
 //   malformed tail (at the faulted packet). Flags only; there is no book yet.
@@ -74,6 +80,7 @@ struct InstrumentState {
     std::uint32_t last_rpt = 0;   // 0 after EmptyBook: the next must be 1
     bool stale = false;
     bool ever_stale = false;
+    bool awaiting_rebuild = false; // ChannelReset seen, its EmptyBook not yet
     StalePoint first_stale{};     // where it first went stale
     std::uint64_t rpt_seq_gaps = 0;
     std::uint64_t stale_events = 0;    // times it went from fresh to stale
@@ -82,14 +89,16 @@ struct InstrumentState {
 struct TrackerCounters {
     std::uint64_t unknown_instrument_messages = 0;   // securityID present, not in the table
     std::uint64_t seq_reset_not_first = 0;
+    std::uint64_t msg_before_rebuild = 0;             // after a ChannelReset, before its EmptyBook
     std::uint64_t losses = 0;                         // on_loss calls (gaps and discarded tails)
     std::array<std::uint64_t, decode::kBodyFaults> body_faults{};
 };
 
 class Tracker {
 public:
-    Tracker(const instruments::Table& table, packet::Sequencer& sequencer) noexcept
-        : table_(table), sequencer_(sequencer) {}
+    Tracker(const instruments::Table& table, packet::Sequencer& sequencer,
+            bool walk_bodies = false) noexcept
+        : table_(table), sequencer_(sequencer), walk_bodies_(walk_bodies) {}
 
     // A loss on a channel: every table instrument on it goes stale at point.
     void on_loss(const StalePoint& point) noexcept {
@@ -112,7 +121,10 @@ public:
             if (m.msg_index > 0) ++counters_.seq_reset_not_first;
         } else if constexpr (TemplateId == L::ChannelReset_11::template_id) {
             for (std::size_t slot = 0; slot < table_.size(); ++slot) {
-                if (table_[slot].channel == m.packet.channel) state_[slot].stale = false;
+                if (table_[slot].channel == m.packet.channel) {
+                    state_[slot].stale = false;
+                    state_[slot].awaiting_rebuild = true;
+                }
             }
         }
         if constexpr (has_named<kSecurityID>(typename T::fields{})) {
@@ -124,19 +136,25 @@ public:
                     ++counters_.unknown_instrument_messages;
                 } else if constexpr (TemplateId == L::EmptyBook_9::template_id) {
                     InstrumentState& st = state_[slot];
+                    st.awaiting_rebuild = false;
                     st.stale = false;      // rebuilt from here
                     st.have_rpt = true;
                     st.last_rpt = 0;       // rptSeq restarts at 1 with the next message
-                } else if constexpr (has_named<kRptSeq>(typename T::fields{})) {
-                    const auto rpt = get_named<kRptSeq>(typename T::fields{}, root);
-                    if (rpt.present()) track_rpt(slot, static_cast<std::uint32_t>(rpt.value), m);
+                } else {
+                    if (state_[slot].awaiting_rebuild) ++counters_.msg_before_rebuild;
+                    if constexpr (has_named<kRptSeq>(typename T::fields{})) {
+                        const auto rpt = get_named<kRptSeq>(typename T::fields{}, root);
+                        if (rpt.present()) track_rpt(slot, static_cast<std::uint32_t>(rpt.value), m);
+                    }
                 }
             }
         }
         if constexpr (!std::is_same_v<typename T::groups, decode::List<>> ||
                       !std::is_same_v<typename T::var_data, decode::List<>>) {
-            BodyCheck body{counters_};
-            decode::walk_body<T>(m, body);
+            if (walk_bodies_) {
+                BodyCheck body{counters_};
+                decode::walk_body<T>(m, body);
+            }
         }
     }
 
@@ -179,6 +197,7 @@ private:
 
     const instruments::Table& table_;
     packet::Sequencer& sequencer_;
+    bool walk_bodies_;
     std::array<InstrumentState, kMaxInstruments> state_{};
     TrackerCounters counters_;
 };

@@ -73,7 +73,8 @@ struct Fixture {
     b3::instruments::Table table = b3::instruments::Table::parse(
         "200000001 68\n200000002 68\n100000001 70\n");
     b3::packet::Sequencer seq;
-    b3::tracker::Tracker t{table, seq};
+    b3::tracker::Tracker t;
+    explicit Fixture(bool walk_bodies = false) : t(table, seq, walk_bodies) {}
 
     template <std::uint16_t Id>
     void run(const Msg& m) { t.on<Id>(m.view()); }
@@ -167,10 +168,27 @@ TEST_CASE("SequenceReset not first in its packet is counted") {
     CHECK(f.t.counters().seq_reset_not_first == 1);
 }
 
-TEST_CASE("body fault counted") {
-    Fixture f;
+TEST_CASE("body faults: counted only when bodies are walked (software only)") {
     Bytes news(36, 0);
     put(news, 0, PETR4, 8);
-    f.run<5>(make(5, news, 70, 1, 0, {1, 0, 'H', 50, 0}));   // text says 50 bytes, none follow
-    CHECK(f.t.counters().body_faults[3] == 1);                // var_data_past_end
+    const auto bad = make(5, news, 70, 1, 0, {1, 0, 'H', 50, 0});   // text says 50 bytes, none follow
+    Fixture counting(true);
+    counting.run<5>(bad);
+    CHECK(counting.t.counters().body_faults[3] == 1);                // var_data_past_end
+    Fixture timed;                                                   // the path step 10 times
+    timed.run<5>(bad);
+    for (const auto n : timed.t.counters().body_faults) CHECK(n == 0);
+}
+
+TEST_CASE("msg_before_rebuild: a message after ChannelReset, before its EmptyBook") {
+    Fixture f;
+    f.run<50>(order(WIN, 10, 68, 1));
+    f.run<11>(channel_reset(68, 2));
+    f.run<50>(order(WIN, 11, 68, 3));          // WIN not rebuilt yet: counted
+    f.run<9>(empty_book(DOL, 68, 3));          // DOL rebuilt
+    f.run<50>(order(DOL, 1, 68, 4));           // after its EmptyBook: fine
+    f.run<9>(empty_book(WIN, 68, 4));
+    f.run<50>(order(WIN, 1, 68, 5));
+    f.run<50>(order(PETR4, 3, 70, 1));         // other channel: not affected
+    CHECK(f.t.counters().msg_before_rebuild == 1);
 }

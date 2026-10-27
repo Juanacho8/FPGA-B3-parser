@@ -60,12 +60,15 @@ inline PacketHeader read_header(const std::uint8_t* p) noexcept {
 
 // ---- Sequencing (DESIGN.md 3.6.3) ----
 
-// True when the packet's first message is complete (framing.hpp's test) and
-// is a SequenceReset. The only look past the packet header: one message header.
-inline bool first_is_sequence_reset(const std::uint8_t* payload, std::size_t len) noexcept {
+// The templateId of the packet's first message when it is complete
+// (framing.hpp's test), else kNoFirstMessage. The only look past the packet
+// header: one message header.
+inline constexpr std::uint32_t kNoFirstMessage = 0x10000;
+
+inline std::uint32_t first_template(const std::uint8_t* payload, std::size_t len) noexcept {
     framing::MessageHeader h;
-    return len > ph::size && !framing::check(payload + ph::size, len - ph::size, h) &&
-           h.template_id == layout::SequenceReset_1::template_id;
+    if (len <= ph::size || framing::check(payload + ph::size, len - ph::size, h)) return kNoFirstMessage;
+    return h.template_id;
 }
 
 struct SequencerCounters {
@@ -75,6 +78,7 @@ struct SequencerCounters {
     std::uint64_t duplicates = 0;           // dropped: sequenceNumber at or below the last accepted
     std::uint64_t heartbeats = 0;           // sequenceNumber 0
     std::uint64_t heartbeat_mismatches = 0; // a heartbeat's nextSeqNo != the next expected number
+    std::uint64_t heartbeat_without_sequence = 0;  // a heartbeat whose first message is not a Sequence
     std::uint64_t resets = 0;               // packets whose first message is a SequenceReset
     std::uint64_t reset_mismatches = 0;     // packet after a reset packet not (version + 1, 1)
     std::uint64_t version_changes = 0;      // sequenceVersion changed without a reset packet
@@ -99,15 +103,17 @@ public:
         using K = SequenceVerdict::Kind;
         Channel& c = channels_[h.channel];
         last_ = SequenceVerdict{};
+        const std::uint32_t first = first_template(payload, len);
         if (h.seq_num == 0) {
             // Heartbeat: not sequenced; its nextSeqNo is checked when its
             // Sequence message is dispatched (check_heartbeat).
             ++counters_.heartbeats;
+            if (first != layout::Sequence_2::template_id) ++counters_.heartbeat_without_sequence;
             last_.kind = K::heartbeat;
             return true;
         }
         ++counters_.sequenced;
-        if (first_is_sequence_reset(payload, len)) {
+        if (first == layout::SequenceReset_1::template_id) {
             // Accepted without checking its own sequenceNumber or version.
             ++counters_.resets;
             c.reset_pending = true;

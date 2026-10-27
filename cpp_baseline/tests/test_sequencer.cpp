@@ -168,6 +168,19 @@ TEST_CASE("SequenceReset wraps from version 65534 to 1") {
     CHECK(bad.c().reset_mismatches == 1);
 }
 
+TEST_CASE("heartbeat_without_sequence: a heartbeat whose first message is not a Sequence") {
+    Seq q;
+    CHECK(q.feed(packet(68, 1, 3)));
+    CHECK(q.feed(packet(68, 1, 0, Body::heartbeat, 4), 4));
+    CHECK(q.c().heartbeat_without_sequence == 0);
+    CHECK(q.feed(packet(68, 1, 0, Body::order)));      // sequenceNumber 0, an Order inside
+    CHECK(q.c().heartbeat_without_sequence == 1);
+    Bytes header_only = packet(68, 1, 0, Body::order);
+    header_only.resize(16);
+    CHECK(q.feed(header_only));                        // no message at all
+    CHECK(q.c().heartbeat_without_sequence == 2);
+}
+
 TEST_CASE("a SequenceReset that is not the first message does not make a reset packet") {
     Seq q;
     CHECK(q.feed(packet(68, 1, 1)));
