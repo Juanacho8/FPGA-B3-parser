@@ -82,6 +82,7 @@ class RunConfig:
     feed_b: scenarios.FeedBParams = scenarios.FeedBParams()
     loss: scenarios.BurstParams = scenarios.BurstParams(0.01, 3)
     gap: scenarios.BurstParams = scenarios.BurstParams(0.001, 2)
+    reorder: scenarios.ReorderParams = scenarios.ReorderParams(0.005, 3)
     idle: scenarios.IdleParams | None = None  # pause the flow once (idle scenario)
     idle_ns: int = 3_500_000_000  # the idle scenario's pause
     resets: tuple = ()            # scenarios.Reset
@@ -169,7 +170,7 @@ class ScenarioResult:
     run_config: RunConfig = None  # the config the run actually used
 
 
-SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle") + scenarios.RESET_KINDS + \
+SCENARIOS = ("clean", "loss", "gap", "gap_one", "reorder", "idle") + scenarios.RESET_KINDS + \
     ("edge", "rare", "schema", "malformed")
 MALFORMED_MESSAGES = 1500         # the malformed file is small
 EXTENDED_BLOCK = 8                # schema evolution: bytes added to the root block
@@ -216,7 +217,7 @@ def _finish_feeds(config, name, result, packetized, feeds, unreliable, extra=Non
     pcap.write_pcap(feed_b_path, feeds.b, channel_map=config.channel_map_b,
                     src_ip=config.src_ip, src_port=config.src_port)
     params = {"feed_b": dataclasses.asdict(config.feed_b), "loss": None, "gap": None,
-              "idle": None, "gap_packets": None}
+              "reorder": None, "idle": None, "gap_packets": None}
     params.update((extra or {}).pop("params", {}))
     manifest = {"scenario": name, "seed": config.seed,
                 "target_messages": config.target_messages,
@@ -224,6 +225,7 @@ def _finish_feeds(config, name, result, packetized, feeds, unreliable, extra=Non
                 "params": params,
                 "missing": {"A": [list(k) for k in feeds.missing_a],
                             "B": [list(k) for k in feeds.missing_b]},
+                "reordered": {"A": list(feeds.reordered_a), "B": list(feeds.reordered_b)},
                 "unreliable_books": {n: list(k) for n, k in sorted(unreliable.items())},
                 "resets": [_reset_record(r, packetized) for r in result.resets],
                 "injections": [_injection_record(r, packetized) for r in result.injections]}
@@ -258,6 +260,7 @@ def run_scenario(config, name):
     config = dataclasses.replace(config, out_dir=Path(config.out_dir) / name)
     loss = config.loss if name == "loss" else None
     gap = config.gap if name == "gap" else None
+    reorder = config.reorder if name == "reorder" else None
 
     result, published, packetized, checkpoints = _generate(config)
     on_channel = {}
@@ -272,7 +275,8 @@ def run_scenario(config, name):
     except ValueError as e:
         raise scenarios.ScenarioError(f"scenario gap_one: {e}; raise the message target") from e
     feeds = scenarios.build_feeds(packetized, config.seed, feed_b=config.feed_b,
-                                  loss=loss, gap=gap, gap_positions=chosen)
+                                  loss=loss, gap=gap, gap_positions=chosen,
+                                  reorder_params=reorder)
     _require_scenario(name, config, result, feeds)
     _write(config, result, published, packetized, checkpoints, feeds.a)
     unreliable = scenarios.unreliable_books(feeds.gap_positions, packetized, published,
@@ -281,6 +285,7 @@ def run_scenario(config, name):
         unreliable = scenarios.unreliable_from_lost(lost, packetized, published, on_channel)
     extra = {"params": {"loss": dataclasses.asdict(loss) if loss else None,
                         "gap": dataclasses.asdict(gap) if gap else None,
+                        "reorder": dataclasses.asdict(reorder) if reorder else None,
                         "idle": dataclasses.asdict(config.idle) if config.idle else None,
                         "gap_packets": [list(k) for k in feeds.missing_b] if chosen else None}}
     if faults is not None:
@@ -289,6 +294,15 @@ def run_scenario(config, name):
             "Process the complete messages before the fault, discard the rest of the "
             "packet, carry on with sequencing. A datagram shorter than the 16-byte packet "
             "header is discarded and uses up no sequence number.")
+    if name == "reorder":
+        extra["expected_client_behavior"] = (
+            "Nothing is lost. On each feed, every packet in reordered arrives after the "
+            "depth later packets of its channel (at most max_depth) and takes the pcap time of "
+            "the packet it follows. "
+            "A client that holds packets above the expected sequenceNumber for max_depth "
+            "packets per channel and applies them in sequence order rebuilds every book: it "
+            "matches the book key everywhere. A client without that buffer sees a gap where "
+            "each late packet was due and drops the late packet as a duplicate.")
     if name == "schema":
         extra["expected_client_behavior"] = (
             "Decode the known fields using the header's blockLength and version, skip the "
@@ -307,6 +321,8 @@ def _require_scenario(name, config, result, feeds):
         fail("no packet was lost (burst_rate too low for so few packets)")
     if name == "gap" and not feeds.missing_b:
         fail("no packet was dropped (burst_rate too low for so few packets)")
+    if name == "reorder" and not (feeds.reordered_a and feeds.reordered_b):
+        fail("no packet arrived late on one of the feeds (rate too low for so few packets)")
     if name == "idle" and not result.heartbeats:
         fail("the pause produced no heartbeats")
 

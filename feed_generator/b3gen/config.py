@@ -85,6 +85,7 @@ SCHEMA = {
     "feed_b": {"base_delay_ns": int, "jitter_ns": int},
     "loss": BURST,
     "gap": BURST,
+    "reorder": {"rate": float, "max_depth": int},
     "idle": {"duration_ns": int},
 }
 
@@ -277,6 +278,8 @@ def _validate(c, fail):
         probability(f"{section}.burst_rate", c[section]["burst_rate"])
         if c[section]["mean_burst"] < 1:
             fail(f"{section}.mean_burst", "must be >= 1")
+    probability("reorder.rate", c["reorder"]["rate"])
+    positive("reorder.max_depth", c["reorder"]["max_depth"])
     positive("idle.duration_ns", c["idle"]["duration_ns"])
 
 
@@ -325,6 +328,7 @@ def _run_config(c):
         book_key_every=c["sets"]["book_key_every"],
         feed_b=scenarios.FeedBParams(**c["feed_b"]),
         loss=scenarios.BurstParams(**c["loss"]), gap=scenarios.BurstParams(**c["gap"]),
+        reorder=scenarios.ReorderParams(**c["reorder"]),
         idle_ns=c["idle"]["duration_ns"])
 
 

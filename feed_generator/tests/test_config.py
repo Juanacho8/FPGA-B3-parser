@@ -66,6 +66,7 @@ CASES = [
     (("spike = 960_000 }", "spike = 960_000, storm = 1 }"), "instruments[0].rates.storm: unknown key"),
     (("p_new = 0.55", "p_new = 1.5"), "flow.p_new: must be between 0 and 1"),
     (("mean_burst = 3.0", "mean_burst = 0.5"), "loss.mean_burst: must be >= 1"),
+    (("max_depth = 3", "max_depth = 0"), "reorder.max_depth: must be > 0"),
     (("session_open_utc = \"13:00\"", "session_open_utc = \"1pm\""),
      "session_open_utc: expected HH:MM"),
     (("session_date = 2026-10-19", "session_date = \"2026-10-19\""),
