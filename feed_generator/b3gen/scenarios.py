@@ -22,6 +22,13 @@ Built so far (step 7a):
   could not name them.
 * Idle: a pause in the order flow (main.py, via OrderFlow.pause), so the
   packetizer sends heartbeats on both feeds.
+* Reorder: packets that arrive late on one feed, each feed on its own
+  (f"{seed}:reorderA", f"{seed}:reorderB"). At each sequenced packet of a
+  channel, with probability rate, the packet arrives right after the next
+  depth sequenced packets of its channel, depth uniform in 1..max_depth,
+  and takes the pcap time of the packet it now follows. Moves never
+  overlap and never cross a sequenceVersion change. Nothing is lost: only
+  the arrival order and the pcap timestamp change.
 
 Step 7b: Reset describes a restart or reset that main.py drives through the
 normal layers (publisher.sequence_reset/channel_reset/rebuild, packetizer
@@ -84,6 +91,12 @@ class FeedBParams:
 class BurstParams:
     burst_rate: float      # chance a burst starts at a given sequenced packet
     mean_burst: float      # mean burst length in packets (geometric, >= 1)
+
+
+@dataclass(frozen=True)
+class ReorderParams:
+    rate: float            # chance a given sequenced packet arrives late
+    max_depth: int         # it arrives after 1..max_depth later packets of its channel
 
 
 @dataclass(frozen=True)
@@ -155,6 +168,8 @@ class Feeds:
     missing_a: list        # (channel, sequenceVersion, sequenceNumber), wire order
     missing_b: list
     gap_positions: list    # packet positions missing from both feeds
+    reordered_a: list = ()  # {"packet", "after", "depth"} per late packet, arrival order
+    reordered_b: list = ()
 
 
 def burst_positions(packetized, params, rng):
@@ -185,6 +200,47 @@ def burst_positions(packetized, params, rng):
     return dropped
 
 
+def reorder(entries, keys, params, rng):
+    """Late packets on one feed.
+
+    entries: [(time_ns, channel, bytes)] in arrival order; keys: the
+    (channel, sequenceVersion, sequenceNumber) of each. Returns (entries
+    with the late packets moved, [{"packet", "after", "depth"}] in arrival
+    order)."""
+    if params is None:
+        return entries, []
+    if params.max_depth < 1 or not 0 <= params.rate <= 1:
+        raise ValueError(f"bad reorder parameters {params}")
+    per_channel = {}
+    for i, (channel, _, seq) in enumerate(keys):
+        if seq not in (HEARTBEAT_SEQUENCE_NUMBER, None):  # None: a stray datagram
+            per_channel.setdefault(channel, []).append(i)
+    late_after = {}  # index of the packet a late one now follows -> (late index, depth)
+    for channel in sorted(per_channel):
+        indices = per_channel[channel]
+        i = 0
+        while i < len(indices):
+            if rng.random() < params.rate:
+                depth = rng.randint(1, params.max_depth)
+                span = indices[i:i + depth + 1]
+                if len(span) == depth + 1 and len({keys[j][1] for j in span}) == 1:
+                    late_after[span[-1]] = (span[0], depth)
+                    i += depth + 1  # the packets it waits behind stay in place
+                    continue
+            i += 1
+    late = {j for j, _ in late_after.values()}
+    out, moves = [], []
+    for i, entry in enumerate(entries):
+        if i in late:
+            continue
+        out.append(entry)
+        if i in late_after:
+            j, depth = late_after[i]
+            out.append((entry[0], entries[j][1], entries[j][2]))
+            moves.append({"packet": list(keys[j]), "after": list(keys[i]), "depth": depth})
+    return out, moves
+
+
 def feed_b_times(packetized, params, rng):
     """Feed B time for every packet, in Feed A wire order."""
     last = {}
@@ -212,8 +268,9 @@ def single_instrument_packet(packetized, published):
 
 
 def build_feeds(packetized, seed, *, feed_b=FeedBParams(), loss=None, gap=None,
-                gap_positions=()):
-    """gap_positions: packets missing from both feeds besides the random gaps."""
+                gap_positions=(), reorder_params=None):
+    """gap_positions: packets missing from both feeds besides the random gaps.
+    reorder_params: late packets on each feed, after loss and Feed B timing."""
     lost = burst_positions(packetized, loss, random.Random(f"{seed}:loss"))
     gapped = burst_positions(packetized, gap, random.Random(f"{seed}:gap")) | set(gap_positions)
     b_times = feed_b_times(packetized, feed_b, random.Random(f"{seed}:feedB"))
@@ -222,17 +279,25 @@ def build_feeds(packetized, seed, *, feed_b=FeedBParams(), loss=None, gap=None,
         version, seq = packetized.headers[position]
         return (packetized.packets[position][1], version, seq)
 
-    a, b = [], []
+    a, a_keys, b = [], [], []
     for position, (t, channel, data) in enumerate(packetized.packets):
         if position not in lost and position not in gapped:
             a.append((t, channel, data))
+            a_keys.append(position)
         if position not in gapped:
             b.append((b_times[position], position, channel, data))
     b.sort()  # merge channels by time; ties keep Feed A order
-    return Feeds(a=a, b=[(t, channel, data) for t, _, channel, data in b],
+    b_keys = [position for _, position, _, _ in b]
+    b = [(t, channel, data) for t, _, channel, data in b]
+    if reorder_params is not None:  # streamed sets keep no headers, and never reorder
+        a_keys, b_keys = [key(p) for p in a_keys], [key(p) for p in b_keys]
+    a, reordered_a = reorder(a, a_keys, reorder_params, random.Random(f"{seed}:reorderA"))
+    b, reordered_b = reorder(b, b_keys, reorder_params, random.Random(f"{seed}:reorderB"))
+    return Feeds(a=a, b=b,
                  missing_a=[key(p) for p in sorted(lost | gapped)],
                  missing_b=[key(p) for p in sorted(gapped)],
-                 gap_positions=sorted(gapped))
+                 gap_positions=sorted(gapped),
+                 reordered_a=reordered_a, reordered_b=reordered_b)
 
 
 def unreliable_books(gap_positions, packetized, published, channel_instruments):

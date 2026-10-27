@@ -12,7 +12,7 @@ import pytest
 
 from b3gen import main
 import sbe_decoder
-from wire import read_packets
+from wire import in_sequence_order, read_packets
 
 EOE, RECOVERY = 0x80, 0x20
 RECOVERY_TEMPLATES = {50, 9, 11}   # Order_MBO, EmptyBook, ChannelReset
@@ -35,7 +35,7 @@ def test_one_time_per_event(runs, name):
         pytest.skip("events cut by missing or faulty packets")
     open_event = {}  # channel -> event times so far
     events = multi = 0
-    for p in read_packets(path):
+    for p in in_sequence_order(read_packets(path)):  # the reorder scenario's late packets
         if not p["seq"]:
             continue  # heartbeat
         for data in p["messages"]:
