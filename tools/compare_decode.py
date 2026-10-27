@@ -17,6 +17,11 @@ What it does:
       does not read
     * no other keys: a key the decode row has and intent.jsonl does not
       (body_fault, undecoded, ...) is a mismatch
+  One named, expected difference: intent.jsonl puts the reassembled "news"
+  on a News's last part even when this feed lost an earlier part (the
+  manifest's missing packets). A decoder of the feed cannot reassemble it,
+  so that row must have no "news"; it is reported as EXPECTED, not as a
+  mismatch (and a decode that does have "news" there is a mismatch).
   Rows are matched per channel, in order. That is the order both feeds keep,
   so the same check works for a decode of Feed A or Feed B. Heartbeats
   (sequenceNumber 0, index 0) are matched in order too. For Feed A, whose
@@ -58,8 +63,37 @@ def same(a, b):
     return a == b
 
 
-def diff_rows(want, got, strict=False):
-    """Differences between an intent row and a decode row: [str]."""
+NEWS_TEMPLATE = 5
+
+
+def unreachable_news(intent_path, manifest, feed):
+    """{row key of a News's last part: [packet keys of its parts this feed lost]}
+    for every News whose last part the feed carries but some earlier part it
+    does not. Parts are grouped per channel, part 1 to partCount, in order
+    (LAYOUTS.md 12.10)."""
+    keep = b3intent.feed_filter(manifest, feed)
+    open_news = {}   # channel -> [(row, kept)]
+    out = {}
+    for _, row in b3intent.read_jsonl(intent_path):
+        if row["templateId"] != NEWS_TEMPLATE:
+            continue
+        f = row["fields"]
+        parts = open_news.setdefault(row["channel"], [])
+        if f.get("partNumber") == 1:
+            parts.clear()
+        parts.append((row, keep(row)))
+        if f.get("partNumber") == f.get("partCount"):
+            lost = [b3intent.packet_key(r) for r, kept in parts if not kept]
+            if lost and parts[-1][1] and "news" in row:
+                out[b3intent.row_key(row)] = lost
+            parts.clear()
+    return out
+
+
+def diff_rows(want, got, strict=False, news_lost=None):
+    """Differences between an intent row and a decode row: [str]. news_lost
+    (the packets this feed lost, for a row whose news cannot be reassembled)
+    turns the "news" check into: the decode must not have it."""
     out = []
     for k in HEADER_KEYS:
         if k not in got:
@@ -92,6 +126,10 @@ def diff_rows(want, got, strict=False):
     for k in CONFIG_KEYS:
         if k in got and not same(want.get(k), got[k]):
             out.append(f"{k}: want {want.get(k)!r}, got {got[k]!r}")
+    if news_lost is not None:
+        if "news" in got:
+            out.append(f"news: decode has it, but parts were lost in this feed {news_lost}")
+        want = {k: v for k, v in want.items() if k != "news"}
     for k in REASSEMBLED_KEYS:
         if k in got or (strict and k in want):
             if k not in got:
@@ -118,8 +156,10 @@ class _Matcher:
     """Matches intent rows with decode rows per channel, in order, holding
     only a short window of each channel in memory."""
 
-    def __init__(self, strict, max_report):
+    def __init__(self, strict, max_report, news_lost=None, notes=None):
         self.strict, self.max_report = strict, max_report
+        self.news_lost = news_lost or {}
+        self.notes = notes if notes is not None else []
         self.want, self.got = {}, {}       # channel -> deque of (line number, row)
         self.compared, self.problems = 0, []
 
@@ -146,7 +186,11 @@ class _Matcher:
                         got.popleft()
                     continue
                 self.compared += 1
-                for d in diff_rows(w, g, self.strict):
+                lost = self.news_lost.get(b3intent.row_key(w))
+                if lost is not None and "news" not in g:
+                    self.notes.append(f"{where(w)}: news not reassembled, as expected: this feed "
+                                      f"lost part(s) in packet(s) {lost}")
+                for d in diff_rows(w, g, self.strict, lost):
                     self.report(f"{where(w)}: {d} (intent line {wl}, decode line {gl})")
                 want.popleft()
                 got.popleft()
@@ -157,10 +201,10 @@ class _Matcher:
                     self.report(f"{where(g)}: extra row in decode (decode line {gl})")
 
 
-def compare(expected, decoded, strict=False, max_report=10):
+def compare(expected, decoded, strict=False, max_report=10, news_lost=None, notes=None):
     """expected, decoded: iterables of (line number, row). Returns
     (rows compared, [mismatch text]), at most max_report of them."""
-    m = _Matcher(strict, max_report)
+    m = _Matcher(strict, max_report, news_lost, notes)
     expected, decoded = iter(expected), iter(decoded)
     live_e = live_d = True
     while (live_e or live_d) and not m.full():
@@ -210,8 +254,12 @@ def main(argv=None):
 
     manifest = b3intent.load_manifest(args.intent, args.manifest)
     expected = b3intent.feed_rows(args.intent, manifest, args.feed)
+    notes = []
     compared, problems = compare(expected, b3intent.read_jsonl(args.decode),
-                                 args.strict, args.max_report)
+                                 args.strict, args.max_report,
+                                 unreachable_news(args.intent, manifest, args.feed), notes)
+    for note in notes:
+        print(f"EXPECTED {note}")
     if args.feed == "A" and not problems:
         problems = order_difference(b3intent.feed_rows(args.intent, manifest, "A"),
                                     b3intent.read_jsonl(args.decode))

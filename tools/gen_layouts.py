@@ -1141,9 +1141,26 @@ OUTPUTS = (
 )
 
 
+# The decode writer reassembles a News from these var data fields
+# (cpp_baseline/include/b3/decode_writer.hpp, DESIGN.md 3.6.2).
+NEWS_TEMPLATE_ID = 5
+NEWS_REASSEMBLED = ("headline", "text")
+
+
+def check_news_var_data(schema):
+    """Refuses a schema whose News lacks the var data the writer reassembles."""
+    news = next((t for t in schema["templates"] if t["id"] == NEWS_TEMPLATE_ID), None)
+    found = [d["name"] for d in news["var_data"]] if news else None
+    if found is None or not set(NEWS_REASSEMBLED) <= set(found):
+        raise SchemaError(f"News (template {NEWS_TEMPLATE_ID}) var data is {found}; the decode "
+                          f"writer reassembles {list(NEWS_REASSEMBLED)}: update "
+                          f"decode_writer.hpp and NEWS_REASSEMBLED together")
+
+
 def render_all(xml_path=XML_PATH):
     """{relative output path: text} for every target, from one parse."""
     schema = load_schema(xml_path)
+    check_news_var_data(schema)
     return {path: render_fn(schema) for path, render_fn in OUTPUTS}
 
 

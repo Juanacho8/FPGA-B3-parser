@@ -68,3 +68,19 @@ def test_cpp_literals():
     assert gen.cpp_literal(0, "char") == "0"
     with pytest.raises(gen.SchemaError):
         gen.cpp_literal(256, "uint8")
+
+
+def test_news_var_data_guard(tmp_path, monkeypatch):
+    """A schema whose News var data is renamed is refused, naming what it found."""
+    xml = gen.XML_PATH.read_text(encoding="utf-8")
+    news_start = xml.index('name="News_5"')
+    renamed = xml[:news_start] + xml[news_start:].replace('name="headline"', 'name="title"', 1)
+    assert renamed != xml
+    path = tmp_path / "schema.xml"
+    path.write_text(renamed, encoding="utf-8")
+    # The SHA-256 guard would refuse the edited copy first; point it at the copy.
+    import hashlib
+    monkeypatch.setattr(gen, "expected_sha256",
+                        lambda *a: hashlib.sha256(path.read_bytes()).hexdigest())
+    with pytest.raises(gen.SchemaError, match=r"var data is \['title', 'text', 'uRLLink'\]"):
+        gen.render_all(path)

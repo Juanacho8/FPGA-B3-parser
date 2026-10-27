@@ -164,3 +164,56 @@ def test_every_generated_set_against_itself(needs_data):
                                             b3intent.feed_rows(intent, manifest, feed))
             assert not problems, (name, feed, problems)
             assert compared > 0
+
+
+# ---- A News part lost in this feed: a named, expected difference ----
+def lost_news_part(needs_data, tmp_path):
+    """A copy of the rare set in which Feed A lost the packet holding part 2
+    of the 3-part News; returns (intent path, last part's row key, lost packet)."""
+    from conftest import generated_sets
+    import b3intent
+    src = dict(generated_sets())["scenarios/rare"]
+    rows = [r for _, r in b3intent.read_jsonl(src / "intent.jsonl")]
+    parts = [r for r in rows if r["templateId"] == 5 and r["fields"]["partCount"] == 3]
+    assert [p["fields"]["partNumber"] for p in parts] == [1, 2, 3]
+    lost = b3intent.packet_key(parts[1])
+    manifest = json.loads((src / "manifest.json").read_text())
+    manifest["missing"]["A"].append(list(lost))
+    folder = tmp_path / "rare"
+    folder.mkdir()
+    (folder / "manifest.json").write_text(json.dumps(manifest))
+    (folder / "intent.jsonl").write_text((src / "intent.jsonl").read_text())
+    return folder / "intent.jsonl", b3intent.row_key(parts[2]), lost
+
+
+def decoder_view(intent, drop_news_at=None):
+    """What a correct decoder of Feed A writes: the per-feed rows, no instrument,
+    and no news where a part was lost."""
+    import b3intent
+    manifest = b3intent.load_manifest(intent)
+    out = []
+    for _, r in b3intent.feed_rows(intent, manifest, "A"):
+        r = {k: v for k, v in r.items() if k != "instrument"}
+        if b3intent.row_key(r) == drop_news_at:
+            r.pop("news")
+        out.append(r)
+    return out
+
+
+def test_lost_news_part_is_an_expected_difference(needs_data, tmp_path, capsys):
+    intent, last, lost = lost_news_part(needs_data, tmp_path)
+    decode = tmp_path / "decode.jsonl"
+    decode.write_text("".join(json.dumps(r) + "\n" for r in decoder_view(intent, last)))
+    assert cd.main([str(decode), str(intent), "--strict"]) == 0
+    out = capsys.readouterr().out
+    assert f"EXPECTED channel {last[0]} v{last[1]} packet {last[2]} message {last[3]}: " \
+           f"news not reassembled, as expected: this feed lost part(s) in packet(s) [{lost}]" in out
+    assert "OK:" in out
+
+
+def test_lost_news_part_with_news_in_decode_fails(needs_data, tmp_path, capsys):
+    intent, last, lost = lost_news_part(needs_data, tmp_path)
+    decode = tmp_path / "decode.jsonl"
+    decode.write_text("".join(json.dumps(r) + "\n" for r in decoder_view(intent)))
+    assert cd.main([str(decode), str(intent), "--strict"]) == 1
+    assert "news: decode has it, but parts were lost in this feed" in capsys.readouterr().out
