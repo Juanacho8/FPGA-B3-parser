@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -22,7 +22,7 @@ data:
 	cd feed_generator && $(PYTHON) -m b3gen build --out $(abspath $(B3_DATA))
 
 # ---- 4. Generated layouts: one script, one parse of B3's XML, both outputs ----
-LAYOUT_FILES := feed_generator/b3gen/layouts.py cpp_baseline/include/b3/layouts.hpp
+LAYOUT_FILES := feed_generator/b3gen/layouts.py cpp_baseline/include/b3/layouts.hpp cpp_baseline/include/b3/fields.hpp
 
 layouts:
 	$(PYTHON) tools/gen_layouts.py
@@ -76,6 +76,12 @@ pcap-crosscheck: cpp-release
 # manifest.json on both feeds of every set under B3_DATA. Fails on any difference.
 decode-crosscheck: cpp-release
 	$(PYTHON) tools/decode_crosscheck.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
+
+# The full decode (b3_decode --decode) against intent.jsonl in compare_decode
+# --strict mode, both feeds of every set under B3_DATA, plus the schema set's
+# features and B3's sample packet. Fails on any difference.
+decode-compare: cpp-release
+	$(PYTHON) tools/decode_compare.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
 
 cpp-clean:
 	rm -rf $(CPP_BUILD)

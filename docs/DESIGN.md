@@ -228,8 +228,33 @@ What the packet decoder and message walker do with each UDP payload, in order (`
 5. **Leftover bytes**: 1 to 11 bytes after the last complete message are malformed (test 1, `header_truncated`), not padding. B3 puts no padding between messages (`spec/LAYOUTS.md` 2).
 6. **Unknown templateId**: a complete message whose templateId is not in the schema is skipped by its messageLength and counted (`unknown_templates`). It is not malformed. The header's version is not checked at this stage; fields are read by blockLength and version (3.6).
 7. **msg_index** counts complete messages from 0 within each packet, unknown templates included, the same as intent.jsonl's `index`.
+8. **msg_index overflow**: port 1 stores msg_index in one byte, so a message that would get index 256 or more is not passed on. The packet is counted once (`msg_index_overflow`, not malformed) and the rest of it discarded. A real feed cannot get there: the Ethernet MTU caps a UDP payload at 1472 bytes, which holds at most (1472 − 16) / 12 = 121 messages, and B3's own limit is 1400 bytes.
 
-Groups and var data are not walked here: messageLength already covers them. Bounds inside a message (group entries, var data lengths) are checked when its fields are decoded.
+Groups and var data are not walked here: messageLength already covers them. Bounds inside a message (group entries, var data lengths) are checked when its fields are decoded (3.6.2).
+
+### 3.6.2 Message body: fields, groups, var data
+
+What the field decoder does with one complete message (`cpp_baseline/include/b3/decode.hpp`; descriptors in the generated `fields.hpp`).
+
+**Root-block fields.** A field is **present** when offset + size ≤ the header's blockLength and its sinceVersion ≤ the header's version. Otherwise it is **absent**: the message's version does not have it. A present field whose wire value equals its schema null is **null**. Null and absent are different answers and are reported separately, as intent.jsonl does (`null`, `absent`). Bytes of the root block past the last known field (a newer version's additions) are skipped. Constant fields take their value from the schema, never from the wire. A char[N] value is its bytes up to the first trailing NUL; an optional char or char[N] with no characters is null.
+
+**Groups** start at offset 12 + blockLength of the message header, not at the schema's block size. Each group has a dimension header (blockLength uint16, numInGroup uint8), then numInGroup entries of the **wire's** entry blockLength. Entry fields follow the same presence rule, with the entry blockLength in place of the root's. **Var data** follows the groups, each a length prefix (its size from the schema) and that many bytes. Bytes after the last var data, still inside messageLength, are skipped.
+
+**Body faults.** The message framing (3.6.1) is intact, but a group or var data field runs past messageLength. Every read is checked against messageLength, in wire order:
+
+| # | Check | Reason when it fails |
+|---|---|---|
+| 1 | The group's dimension header fits | `group_header_past_end` |
+| 2 | Each entry, at the wire's entry blockLength, fits | `group_entry_past_end` |
+| 3 | The var data length prefix fits | `var_data_length_past_end` |
+| 4 | The var data bytes fit | `var_data_past_end` |
+
+On the first failure the decoder counts it by reason, keeps what it decoded before it (the root block, earlier groups, the entries that fit, earlier var data), stops decoding that message, and **carries on with the next message**: messageLength still frames it. The full decode row gets `"body_fault": {"reason", "at"}` (`at` names the group or var data field) and `"undecoded"`: that group or field and every later one. A News part with a body fault produces no reassembled `news` and ends the reassembly open on its channel. The hot path reads no group or var data field today, so body faults only exist in the full decode.
+
+**Full decode format** (`b3_decode --decode`). One JSON line per message, in the shape of intent.jsonl, values as intent.jsonl writes them: numbers for integers, enums, sets, prices (raw mantissas) and timestamps; strings for char, char[N] (`""` for NUL) and var data; `"news"` on a News's last part with the parts' text joined (parts 1 to partCount, in order, on one channel); `{"body": "<hex>"}` for an unknown template. No `instrument`: it is a name from the generator's config. Two formats intent.jsonl has no precedent for (the generator never writes groups or multi-member composites):
+
+* a **group** is a list of entries, each `{"fields": {...}, "null": [...], "absent": [...]}`
+* a **multi-member composite** (MaturityMonthYear) is an object of its members' wire values, listed in `null` when optional and every member holds its null
 
 ### 3.7 Feeds and record order
 
@@ -384,6 +409,7 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `compare_decode.py` | decode.jsonl vs intent.jsonl, field for field, including null vs absent. First mismatches with packet and message position |
 | `dump_events.py` | events.bin → readable rows (`--hex` for raw bytes) |
 | `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
+| `decode_compare.py` | `b3_decode --decode` against intent.jsonl with `compare_decode.py --strict`, both feeds of every set, the schema set's features and B3's sample packet (`make decode-compare`) |
 | `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
 
 ```sh

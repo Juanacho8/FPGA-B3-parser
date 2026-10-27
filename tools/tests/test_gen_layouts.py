@@ -22,7 +22,7 @@ gen = load()
 
 def test_checked_in_outputs_are_current():
     outputs = gen.render_all()
-    assert set(outputs) == {gen.PY_OUT, gen.CPP_OUT}
+    assert set(outputs) == {gen.PY_OUT, gen.CPP_OUT, gen.FIELDS_OUT}
     for rel, text in outputs.items():
         assert (REPO / rel).read_bytes() == text.encode("utf-8"), (
             f"{rel} is stale or hand-edited; run make layouts")
@@ -31,7 +31,7 @@ def test_checked_in_outputs_are_current():
 def test_out_dir_writes_both_files(tmp_path):
     subprocess.run([sys.executable, str(TOOLS / "gen_layouts.py"), "--out-dir", str(tmp_path)],
                    check=True, capture_output=True)
-    for rel in (gen.PY_OUT, gen.CPP_OUT):
+    for rel in (gen.PY_OUT, gen.CPP_OUT, gen.FIELDS_OUT):
         assert (tmp_path / rel).read_bytes() == (REPO / rel).read_bytes()
 
 
