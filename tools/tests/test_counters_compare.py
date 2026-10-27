@@ -94,3 +94,20 @@ def test_unreliable_books_shape_guard():
 def test_nothing_checked_fails(tmp_path, capsys):
     assert cc.main([str(tmp_path), "--cpp", "/bin/false"]) == 2
     assert "run make data" in capsys.readouterr().err
+
+
+def test_late_packets_expect_no_gap_and_the_manifest_list(tmp_path):
+    # 68:2 arrives after 68:3 on Feed A: with the window there is no gap, no
+    # duplicate and no stale book, and "reordered" is the manifest's list.
+    rows_ = [o(7, 1, 1), o(7, 2, 2), o(7, 3, 3), o(9, 1, 1, ch=70)]
+    (tmp_path / "intent.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows_))
+    m = manifest()
+    m["reordered"] = {"A": [{"packet": [68, 1, 2], "after": [68, 1, 3], "depth": 1}], "B": []}
+    (tmp_path / "manifest.json").write_text(json.dumps(m))
+    m = b3intent.load_manifest(tmp_path / "intent.jsonl")
+    want, _ = cc.expected_counters(tmp_path, m, "A", TABLE)
+    assert want["sequencing"]["gaps"] == 0 and want["duplicates"] == 0 and want["losses"] == 0
+    assert want["reordered"] == [[68, 1, 2]]
+    assert all(v["first_stale"] is None for v in want["instruments"].values())
+    want_b, _ = cc.expected_counters(tmp_path, m, "B", TABLE)
+    assert "reordered" not in want_b  # nothing late on B: the key is not expected yet

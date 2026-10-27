@@ -304,7 +304,7 @@ The generator's `unreliable_books` (manifest.json) comes from the contents of th
 
 events.bin describes one feed's pcap, decoded alone (A/B arbitration comes in step 11).
 
-* **Feed A**: the generator's intent.jsonl is in Feed A wire order. `tools/intent_to_events.py` produces the expected events.bin for every set.
+* **Feed A**: the generator's intent.jsonl is in Feed A wire order. `tools/intent_to_events.py` produces the expected events.bin for every set. In the `reorder` scenario the keys follow the reorder window's release order instead (`docs/CPP_BASELINE_CONTEXT.md` section 6, `tools/b3intent.py` feed_rows), an expected failure until step 11.
 * **Feed B** carries the same packets as A (minus `missing.B`), in the same order *within each channel*. But it merges the channels by its own jittered pcap timestamps, which intent.jsonl does not record. So the cross-channel order of a Feed B events.bin cannot be derived from the answer keys, and the converter refuses `--feed B`. Per channel, Feed B's records equal Feed A's records with `missing.B` removed instead of `missing.A`. A Feed B check needs either the generator to record B's packet order, or a comparison done per channel.
 * `tools/compare_decode.py` matches rows per channel, so it checks a decode of either feed.
 
