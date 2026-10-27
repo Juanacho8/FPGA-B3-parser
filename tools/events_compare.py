@@ -16,7 +16,8 @@ What it does:
   The first difference is reported with its packet and message position, in
   dump_events.py's format. The C++'s counts of SequenceReset/ChannelReset
   arriving with an event open are reported (DESIGN.md 3.5 does not close an
-  event on them).
+  event on them). Sets in b3intent.EXPECTED_FAILURES are reported XFAIL
+  when they differ, and fail as XPASS when they match.
 
 What it must not do:
   Change or reimplement intent_to_events.py: it is the answer key. Import b3gen.
@@ -90,7 +91,7 @@ def main(argv=None):
     if not sets:
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
-    checked = failed = 0
+    checked = failed = xfailed = 0
     reset_notes = []
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -145,7 +146,16 @@ def main(argv=None):
                 for build, recs in records_by_build.items():
                     if recs != records_by_build[base_build]:
                         problems.append(f"records of build {build} differ from {base_build}")
-                if problems:
+                reason = b3intent.expected_failure(manifest)
+                if problems and reason:
+                    xfailed += 1
+                    print(f"XFAIL {name}/{pcap.name}: {reason} ({len(problems)} differences, "
+                          f"first: {problems[0]})")
+                elif reason:
+                    failed += 1
+                    print(f"XPASS {name}/{pcap.name}: matches, but is expected to fail ({reason}); "
+                          f"remove it from b3intent.EXPECTED_FAILURES")
+                elif problems:
                     failed += 1
                     print(f"MISMATCH {name}/{pcap.name}")
                     for p in problems[:12]:
@@ -157,7 +167,8 @@ def main(argv=None):
                           f"{len(builds)} builds ({', '.join(b for b, _ in builds)})")
     for note in reset_notes:
         print(f"note: SequenceReset/ChannelReset with an event open: {note}")
-    print(f"{checked} build runs on {len(sets)} sets, {failed} files with differences")
+    print(f"{checked} build runs on {len(sets)} sets, {failed} files with differences, "
+          f"{xfailed} expected failures")
     if checked == 0:
         print("error: nothing was checked", file=sys.stderr)
         return 1

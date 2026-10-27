@@ -187,6 +187,15 @@ Per channel (rules in `spec/LAYOUTS.md` 12.1, matching `feed_generator/tests/boo
 * rptSeq per instrument: previous + 1, or 1 on the message after an EmptyBook.
 * Counters: packets, messages per template, gaps (packets), duplicates, rptSeq gaps per instrument, resets, malformed, unknown templates. Written to a counters JSON at the end of a run and compared with `manifest.json`.
 
+**Reorder window** (decided 2026-10-27; built in step 11, since filling a hole from either feed is the same mechanism as A/B arbitration). UDP gives no ordering guarantee, and the generator's `reorder` scenario delivers packets late on each feed. A window sits in front of the sequencer, whose contract above (and `docs/DESIGN.md` 3.6.3) stays strict:
+* In-order packets pass straight through, with no wait.
+* A packet above the expected number opens the window on its channel. It and the channel's later packets are held.
+* The window closes when the hole fills: the missing packet and everything held go to the sequencer at once, in sequence order.
+* Otherwise it closes at whichever comes first: `max_depth` packets held, or a timeout in pcap time. If the hole is still open, a gap is counted and what was held is released.
+* A copy of the missing packet arriving after that is counted as **late**, not as a duplicate.
+
+Answer keys for the `reorder` scenario (`tools/b3intent.py` reads the manifest's `reordered`): gaps 0, duplicates 0, `reordered` = the manifest's late packets for the feed, no stale books. Feed A's records come out in the window's release order. Until step 11 the set is an **expected failure**, reason "reorder window not built yet" (`b3intent.EXPECTED_FAILURES`), in decode-crosscheck, decode-compare, counters-compare, events-compare and goldens (expected file only). A match there reports XPASS and fails, so the entry is removed when the window lands.
+
 **Malformed policy** (project policy from the generator's `malformed` manifest, not B3): process the complete messages before the fault, discard the rest of the packet, carry on with sequencing. A datagram shorter than the 16-byte packet header is discarded and uses up no sequence number.
 
 **Schema evolution** (`schema` scenario): decode known fields using the header's blockLength and version. A field exists only if it lies within blockLength and its sinceVersion is at most the header's version (the scenario mixes versions 14, 15, 17 and 18). Skip extra root bytes. Skip unknown templates by messageLength. The book still matches the key.
@@ -221,7 +230,7 @@ Per channel (rules in `spec/LAYOUTS.md` 12.1, matching `feed_generator/tests/boo
 | 8 | Depth-limited book + book sink (port 2), parameters in `book_params.hpp` | Unit tests pass for K = 4, 16 and 32 (truncation paths covered). Matches `book_key.jsonl` at every checkpoint on every set and scenario, stale flags match `unreliable_books`. **Second RTL golden, one per (N, K)** |
 | 9 | MBO book behind a flag | Its top N equals the depth-limited book after every event whenever the side is not depth incomplete. Delete and CHANGE consistency checks (stored price, size, prevSize) all pass. Depth-incomplete statistics reported for K = 16 and K = 32 |
 | 10 | Benchmark harness | Reproducible percentiles for both measurements on `large/` and `burst/` |
-| 11 | A/B arbitration | `loss` scenario: merged A + B gives the same outputs as `clean`-style complete data and matches the book key everywhere. `gap`: matches except `unreliable_books` |
+| 11 | A/B arbitration and the reorder window (section 6) | `loss` scenario: merged A + B gives the same outputs as `clean`-style complete data and matches the book key everywhere. `gap`: matches except `unreliable_books`. `reorder`: each feed alone passes every compare target, and its entry leaves `b3intent.EXPECTED_FAILURES` |
 
 Steps 7 and 8 unblock the RTL.
 
@@ -276,8 +285,10 @@ tools/                 repo level: gen_layouts.py, contract converters, comparis
 | A | Final field lists of both records | Proposals in section 4, finalize in step 1 |
 | B | How an event closed by a non-port-1 message is signalled on port 1 | Decide in step 1 |
 | C | K = 16 or 32 | Decided by RTL timing plus the depth-incomplete statistics from step 9 |
-| D | A/B arbitration wait window for a missing packet | Decide in step 11 |
+| D | A/B arbitration wait window for a missing packet. The same window as the reorder window (section 6) | Decide in step 11 |
 | E | Whether port 2 also emits on mid-event changes (with a flag) | Default no |
 | F | Deep-book data set from the feed generator (more levels per side, sweeps through several levels) so K actually gets exercised | Request for the generator, outside this build's folders |
 | G | Host refill of a depth-incomplete side from the software MBO book | Out of scope for v1 |
 | H | One parameter file generating both `book_params.hpp` and the RTL's SystemVerilog package | Desirable, decide when the RTL book starts |
+| I | Reorder window limits (section 6): `max_depth` (packets held) and the timeout. The keys expect no gap for any generator late packet, so the window must hold the generator's `max_depth` (3) packets without closing (it closes when one more would be held), and the timeout must cover the longest hold: 2.9 ms of pcap time in the default `reorder` set (a depth-1 late packet takes the pcap time of the packet it follows, so most holds are 0) | Decide in step 11, with D |
+| J | What b3_decode reports for late packets: `reordered` (packets that filled a hole, in arrival order, `[channel, sequenceVersion, sequenceNumber]`) and the late count (after a window closed). counters-compare expects `reordered` only where the manifest's list is not empty until the window reports it on every file | Decide in step 11 |

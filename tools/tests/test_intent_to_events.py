@@ -113,8 +113,19 @@ def test_channels_are_independent():
 def test_messages_without_mei_do_not_change_state():
     unknown = row(999, {"body": "00"})
     assert kinds([heartbeat(), unknown, stats()]) == []
-    assert kinds([order(0, mei=0), heartbeat(), row(1, {}), unknown, stats(index=1)]) == \
-        [(c.ADD, 0), (c.SEQ_RESET, 0), (c.END_OF_EVENT, 1)]
+    assert kinds([order(0, mei=0), heartbeat(), unknown, stats(index=1)]) == \
+        [(c.ADD, 0), (c.END_OF_EVENT, 1)]
+
+
+def test_sequence_reset_clears_an_open_event():
+    # The reset emits its own record only; the later statistic is standalone.
+    assert kinds([order(0, mei=0), row(1, {}), stats(index=1)]) == [(c.ADD, 0), (c.SEQ_RESET, 0)]
+
+
+def test_channel_reset_clears_an_open_event():
+    reset = row(11, {"matchEventIndicator": 0x20, "mDEntryTimestamp": 3})   # RecoveryMsg, no EndOfEvent
+    out = list(ie.convert([summary(), reset, stats(index=1)]))
+    assert [(e.kind, e.flags) for e in out] == [(c.EXEC_SUMMARY, 0), (c.CLEAR_CHANNEL, c.FLAG_RECOVERY)]
 
 
 def test_non_port1_message_without_eoe_opens_an_event():
@@ -163,6 +174,56 @@ def test_malformed_tail_is_discarded(tmp_path):
 def test_heartbeats_are_never_dropped(tmp_path):
     path = write_set(tmp_path, [heartbeat()], {"missing": {"A": [[68, 1, 0]], "B": []}})
     assert len(list(b3intent.feed_rows(path, b3intent.load_manifest(path), "A"))) == 1
+
+
+def late(packet, depth):
+    return {"packet": packet, "after": packet[:2] + [packet[2] + depth], "depth": depth}
+
+
+def test_late_packets_come_out_in_the_windows_release_order(tmp_path):
+    # Wire order 68:1 70:1 68:2 70:2 68:3 68:4 70:3. On Feed A, 68:2 arrives
+    # after 68:4: the window holds 68:3 and 68:4, then releases 68:2..68:4
+    # together at 68:4's place. The other channel keeps its own order.
+    wire = [(68, 1), (70, 1), (68, 2), (70, 2), (68, 3), (68, 4), (70, 3)]
+    data = []
+    for ch, seq in wire:
+        data += [order(0, mei=0, seq=seq, channel=ch, index=0),
+                 order(0, seq=seq, channel=ch, index=1)]
+    path = write_set(tmp_path, data, {"missing": {"A": [], "B": []},
+                                      "reordered": {"A": [late([68, 1, 2], 2)], "B": []}})
+    m = b3intent.load_manifest(path)
+    got = [(r["channel"], r["sequenceNumber"], r["index"])
+           for _, r in b3intent.feed_rows(path, m, "A")]
+    released = [(68, 1), (70, 1), (70, 2), (68, 2), (68, 3), (68, 4), (70, 3)]
+    assert got == [(ch, seq, i) for ch, seq in released for i in (0, 1)]
+    # Feed B has no late packets here: wire order.
+    got_b = [(r["channel"], r["sequenceNumber"]) for _, r in b3intent.feed_rows(path, m, "B")]
+    assert got_b[::2] == wire
+
+
+def test_a_late_packet_waiting_forever_is_refused(tmp_path):
+    path = write_set(tmp_path, [order(0, seq=1), order(0, seq=2)],
+                     {"missing": {"A": [], "B": []},
+                      "reordered": {"A": [late([68, 1, 2], 3)], "B": []}})
+    with pytest.raises(b3intent.ManifestError, match="never comes"):
+        list(b3intent.feed_rows(path, b3intent.load_manifest(path), "A"))
+
+
+@pytest.mark.parametrize("reordered", [
+    [], {"A": []}, {"A": [{"packet": [68, 1, 2]}], "B": []},
+    {"A": [{"packet": [68, 1, 2], "after": [68, 1, 5], "depth": 2}], "B": []},
+    {"A": [{"packet": [68, 1, 2], "after": [70, 1, 4], "depth": 2}], "B": []},
+    {"A": [{"packet": [68, 1, 2], "after": [68, 1, 2], "depth": 0}], "B": []},
+])
+def test_reordered_shape_guard(reordered):
+    with pytest.raises(b3intent.ManifestError, match="reordered"):
+        b3intent.validate_manifest({"missing": {"A": [], "B": []}, "reordered": reordered})
+
+
+def test_reorder_is_an_expected_failure_until_the_window_exists():
+    assert b3intent.expected_failure({"scenario": "reorder"}) == "reorder window not built yet"
+    assert b3intent.expected_failure({"scenario": "loss"}) is None
+    assert b3intent.expected_failure({}) is None
 
 
 # ---- 4. Command line ----

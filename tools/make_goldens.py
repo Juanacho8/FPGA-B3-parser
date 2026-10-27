@@ -10,7 +10,10 @@ What it does:
                          SHA-256 and recorded generator commit), the build
                          parameters, and the SHA-256 of every file above
   It refuses to write a set whose Feed A files differ (make events-compare
-  says where). There is no expected_feedB.bin: Feed B's cross-channel record
+  says where). A set in b3intent.EXPECTED_FAILURES (the reorder scenario,
+  until the reorder window exists) keeps only expected_feedA.bin, in the
+  window's release order (tools/b3intent.py), with the reason in its
+  provenance; it fails as XPASS if the C++ matches. There is no expected_feedB.bin: Feed B's cross-channel record
   order is not in the intent log (docs/DESIGN.md 3.7); events-compare checks
   cpp_feedB.bin per channel against the key instead.
   data/ is gitignored; the goldens are reproducible with make data && make goldens.
@@ -33,6 +36,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import b3contract as c   # noqa: E402
+import b3intent          # noqa: E402
 
 
 def sha256(path):
@@ -59,7 +63,7 @@ def main(argv=None):
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
     commit = repo_commit()
-    failed = 0
+    failed = xfailed = 0
     for folder in sets:
         name = folder.relative_to(root)
         out = root / "golden" / name
@@ -77,8 +81,22 @@ def main(argv=None):
             subprocess.run([str(args.cpp), "--events", str(path), str(pcap)], check=True,
                            stdout=subprocess.DEVNULL)
             files[path.name] = path
-        if "cpp_feedA.bin" in files and \
-                files["cpp_feedA.bin"].read_bytes() != files["expected_feedA.bin"].read_bytes():
+        reason = b3intent.expected_failure(b3intent.load_manifest(folder / "intent.jsonl"))
+        matches = "cpp_feedA.bin" in files and \
+            files["cpp_feedA.bin"].read_bytes() == files["expected_feedA.bin"].read_bytes()
+        if reason and matches:
+            print(f"XPASS {name}: cpp_feedA.bin matches, but is expected to fail ({reason}); "
+                  f"remove it from b3intent.EXPECTED_FAILURES")
+            for f in files.values():
+                f.unlink()
+            failed += 1
+            continue
+        if reason:
+            for n in ("cpp_feedA.bin", "cpp_feedB.bin"):
+                if n in files:
+                    files.pop(n).unlink()
+            xfailed += 1
+        elif "cpp_feedA.bin" in files and not matches:
             print(f"FAIL {name}: cpp_feedA.bin differs from expected_feedA.bin (run make events-compare)")
             for f in files.values():
                 f.unlink()
@@ -100,9 +118,13 @@ def main(argv=None):
             "note": "no expected_feedB.bin: Feed B's cross-channel order is not in intent.jsonl "
                     "(docs/DESIGN.md 3.7); events-compare checks cpp_feedB.bin per channel",
         }
+        if reason:
+            provenance["expected_failure"] = f"{reason}: no cpp_feed*.bin, the C++ does not match yet"
         (out / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")
-        print(f"OK {name}: {', '.join(sorted(files))}")
-    print(f"{len(sets) - failed}/{len(sets)} sets written under {root / 'golden'}")
+        print(f"{'XFAIL' if reason else 'OK'} {name}: {', '.join(sorted(files))}"
+              + (f" ({reason})" if reason else ""))
+    print(f"{len(sets) - failed}/{len(sets)} sets written under {root / 'golden'}, "
+          f"{xfailed} expected failures (expected file only)")
     return 1 if failed else 0
 
 

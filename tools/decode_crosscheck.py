@@ -213,7 +213,7 @@ def main(argv=None):
     if not sets:
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
-    checked = failed = skipped = 0
+    checked = failed = skipped = xfailed = 0
     for folder in sets:
         name = folder.relative_to(root)
         try:
@@ -245,7 +245,16 @@ def main(argv=None):
                 continue
             got_counts, got_list = run_cpp(args.cpp, pcap)
             problems = compare(want_counts, want_list, got_counts, got_list, feed)
-            if problems:
+            reason = b3intent.expected_failure(manifest)
+            if problems and reason:
+                xfailed += 1
+                print(f"XFAIL {name}/{pcap.name}: {reason} ({len(problems)} differences, "
+                      f"first: {problems[0]})")
+            elif reason:
+                failed += 1
+                print(f"XPASS {name}/{pcap.name}: matches, but is expected to fail ({reason}); "
+                      f"remove it from b3intent.EXPECTED_FAILURES")
+            elif problems:
                 failed += 1
                 print(f"MISMATCH {name}/{pcap.name}")
                 for p in problems:
@@ -257,7 +266,8 @@ def main(argv=None):
                       + (f", {bad} malformed, {want_counts['short_datagrams']} short" if bad else "")
                       + (f", {want_counts['unknown_templates']} unknown"
                          if want_counts["unknown_templates"] else ""))
-    print(f"{checked - failed}/{checked} files match in {len(sets)} sets, {skipped} skipped")
+    print(f"{checked - failed - xfailed}/{checked} files match in {len(sets)} sets, "
+          f"{xfailed} expected failures, {skipped} skipped")
     if checked == 0:
         print("error: no pcap was checked", file=sys.stderr)
         return 1

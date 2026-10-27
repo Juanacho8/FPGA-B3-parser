@@ -39,6 +39,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import compare_decode  # noqa: E402
+import b3intent        # noqa: E402
 
 SAMPLE = REPO / "feed_generator" / "tests" / "fixtures" / "b3_sample_packet"
 # spec/LAYOUTS.md section 6: blockLength of the templates the schema checks use.
@@ -144,10 +145,11 @@ def main(argv=None):
     if not sets:
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
-    checked = failed = skipped = 0
+    checked = failed = skipped = xfailed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for folder in sets:
             name = folder.relative_to(root)
+            reason = b3intent.expected_failure(b3intent.load_manifest(folder / "intent.jsonl"))
             for feed in ("A", "B"):
                 if not (folder / f"feed{feed}.pcap").is_file():
                     print(f"SKIPPED {name}/feed{feed}.pcap: no such file in this set")
@@ -160,7 +162,15 @@ def main(argv=None):
                     problems += schema_problems
                     if not schema_problems:
                         print(f"    schema set: {summary}")
-                if problems:
+                if problems and reason:
+                    xfailed += 1
+                    print(f"XFAIL {name}/feed{feed}.pcap: {reason} ({len(problems)} differences, "
+                          f"first: {problems[0]})")
+                elif reason:
+                    failed += 1
+                    print(f"XPASS {name}/feed{feed}.pcap: matches, but is expected to fail "
+                          f"({reason}); remove it from b3intent.EXPECTED_FAILURES")
+                elif problems:
                     failed += 1
                     print(f"MISMATCH {name}/feed{feed}.pcap")
                     for p in problems[:12]:
@@ -177,8 +187,8 @@ def main(argv=None):
                 print(f"    {p}")
         else:
             print("OK B3 sample packet: matches decoded.json")
-    print(f"{checked - failed}/{checked} checks pass ({len(sets)} sets, sample packet), "
-          f"{skipped} skipped")
+    print(f"{checked - failed - xfailed}/{checked} checks pass ({len(sets)} sets, sample packet), "
+          f"{xfailed} expected failures, {skipped} skipped")
     if checked <= 1:
         print("error: no generator pcap was checked", file=sys.stderr)
         return 1

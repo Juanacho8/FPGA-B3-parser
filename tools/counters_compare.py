@@ -25,6 +25,14 @@ What it does:
   as undetectable (nothing follows them).
   Cross-check: every instrument in the manifest's unreliable_books must be
   flagged stale at its point or earlier (on the same channel).
+  Late packets (manifest reordered, reorder scenario): the replay runs in
+  the reorder window's release order (tools/b3intent.py), so it expects no
+  gap, no duplicate and no stale book, and "reordered" = the manifest's
+  late packets for the feed, [channel, sequenceVersion, sequenceNumber] in
+  arrival order. That key is expected only where the list is not empty,
+  until b3_decode reports it on every file (the reorder window).
+  Sets in b3intent.EXPECTED_FAILURES are reported XFAIL when they differ,
+  and fail as XPASS when they match.
   Fails if a manifest key read here is missing or changes shape, or if
   nothing was checked.
 
@@ -239,6 +247,9 @@ def expected_counters(folder, manifest, feed, table):
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
+    late = [r["packet"] for r in (manifest.get("reordered") or {}).get(feed, [])]
+    if late:
+        exp["reordered"] = late
     exp["instruments"] = {
         str(sid): {"slot": slot, "channel": ch, "rpt_seq_gaps": st["gaps"], "stale_events": st["events"],
                    "stale_at_end": st["stale"], "first_stale": st["first"]}
@@ -294,7 +305,7 @@ def main(argv=None):
     if not sets:
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
-    checked = failed = skipped = 0
+    checked = failed = skipped = xfailed = 0
     with tempfile.TemporaryDirectory() as tmp:
         table_path = Path(tmp) / "instruments.txt"
         table_path.write_text(gen_instruments.table_text(args.config))
@@ -334,7 +345,16 @@ def main(argv=None):
                 stale = {k: v["first_stale"] for k, v in want["instruments"].items() if v["first_stale"]}
                 note = f"; {len(undetectable)} missing packets after the channel's last (undetectable)" \
                     if undetectable else ""
-                if problems:
+                reason = b3intent.expected_failure(manifest)
+                if problems and reason:
+                    xfailed += 1
+                    print(f"XFAIL {name}/{pcap.name}: {reason} ({len(problems)} differences, "
+                          f"first: {problems[0]})")
+                elif reason:
+                    failed += 1
+                    print(f"XPASS {name}/{pcap.name}: matches, but is expected to fail ({reason}); "
+                          f"remove it from b3intent.EXPECTED_FAILURES")
+                elif problems:
                     failed += 1
                     print(f"MISMATCH {name}/{pcap.name}")
                     for p in problems[:12]:
@@ -342,7 +362,8 @@ def main(argv=None):
                 else:
                     print(f"OK {name}/{pcap.name}: gaps {want['sequencing']['gaps']}, losses "
                           f"{want['losses']}, stale {stale or '{}'}{note}")
-    print(f"{checked - failed}/{checked} files match in {len(sets)} sets, {skipped} skipped")
+    print(f"{checked - failed - xfailed}/{checked} files match in {len(sets)} sets, "
+          f"{xfailed} expected failures, {skipped} skipped")
     if checked == 0:
         print("error: nothing was checked", file=sys.stderr)
         return 1
