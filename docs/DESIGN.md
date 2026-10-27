@@ -152,6 +152,7 @@ An event is open on a channel from its first message until the message with EndO
 * If it is not on port 1, the decoder writes an **END_OF_EVENT marker** in its place, but only when an event is open on that channel. The marker carries the closing message's identity, venue_msg_type = its templateId, exch_time = its time field, flags bit 0 plus its RecoveryMsg and Implied bits. Everything else is 0.
 * A message that carries EndOfEvent with no event open (statistics, bands, phases and News, which B3 sends each with EndOfEvent on its own) produces no marker.
 * EndOfEvent closes the event for **every instrument touched since the last close on that channel**: one close per channel, not per instrument (a firm's mass cancel is one event across instruments).
+* A **SequenceReset** or a **ChannelReset** clears the channel's event state: after its own record (SEQ_RESET or CLEAR_CHANNEL, flags as usual) the channel is IDLE and its touched set empty, whatever was open, and nothing else is emitted (no marker, no port 2 update for the cleared event).
 
 **State machine.** One instance per channel, two states. It runs on every message the decoder accepts (3.6), in decoder order, whether or not the message is on port 1.
 
@@ -163,13 +164,17 @@ for each accepted message m on channel ch:
     rec  = port-1 record of m, or none                      (3.2)
     mei  = m.matchEventIndicator, or none if the template has none
 
+    if m is SequenceReset or ChannelReset:
+        emit rec                                            (SEQ_RESET / CLEAR_CHANNEL)
+        state[ch] = IDLE; touched[ch] = empty               (nothing else: no marker, no close)
+        continue with the next message
     if rec: emit rec                                        (with flag bit 0 = mei.bit7)
     if rec changes a book: touched[ch] += rec.instrument   (ADD, MODIFY, DELETE,
                                                             CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL)
     if mei is none:
         if m is ExecutionSummary: state[ch] = OPEN
-        else: no change                                     (SequenceReset, heartbeat,
-                                                             SecurityDefinition, unknown template)
+        else: no change                                     (heartbeat, SecurityDefinition,
+                                                             unknown template)
     elif mei.bit7 (EndOfEvent):
         if not rec and state[ch] == OPEN: emit END_OF_EVENT marker for m
         close(ch)                                           (port 2: one update per touched
@@ -185,13 +190,14 @@ for each accepted message m on channel ch:
 | IDLE | not on port 1, EndOfEvent | nothing | IDLE |
 | IDLE | has matchEventIndicator, no EndOfEvent | the record, if on port 1 | OPEN |
 | IDLE | ExecutionSummary | the record | OPEN |
-| IDLE or OPEN | no matchEventIndicator (other than 55) | the record, if on port 1 (SEQ_RESET) | unchanged |
+| IDLE or OPEN | SequenceReset or ChannelReset | its record (SEQ_RESET, CLEAR_CHANNEL) | IDLE, touched set empty |
+| IDLE or OPEN | no matchEventIndicator (other than 55 and 1) | nothing (not on port 1) | unchanged |
 | OPEN | on port 1, EndOfEvent | the record, bit 0 set | IDLE |
 | OPEN | not on port 1, EndOfEvent | END_OF_EVENT marker | IDLE |
 | OPEN | has matchEventIndicator, no EndOfEvent, or ExecutionSummary | the record, if on port 1 | OPEN |
 
 Consequences, all deliberate:
-* The state changes only on messages. A packet gap, a duplicate, a SequenceReset or a ChannelReset does not force a close. If the packet holding an event's EndOfEvent is lost, the event stays open, and the channel's next EndOfEvent closes it (a standalone statistic then produces a marker). The stale flags (port 2) cover the book's correctness in that case.
+* The state changes only on messages. A packet gap or a duplicate does not force a close; a SequenceReset or ChannelReset clears the state without a close (no marker). If the packet holding an event's EndOfEvent is lost, the event stays open, and the channel's next EndOfEvent closes it (a standalone statistic then produces a marker), unless a reset clears it first. The stale flags cover the book's correctness in that case.
 * The records of an event and its close are always on the same channel, because B3 events never span channels.
 * Every close a port 1 consumer can see appears on port 1 exactly once, as one record with flag bit 0: the closing message's own record, or its marker, never both. The only closes missing from port 1 are those with no event open and no port 1 record, which close nothing a port 1 consumer saw.
 
