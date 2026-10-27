@@ -141,6 +141,7 @@ Not emitted for now: SecurityStatus (v1 has no per-instrument status changes: ev
 * Two separate pcaps: `feedA.pcap`, `feedB.pcap`.
 * Feed B carries the same packets, byte for byte, with a small extra delay. Per B3 circular OC 131/2023, Feed A is the faster one.
 * In loss scenarios, Feed A drops some packets that Feed B still carries.
+* In the reorder scenario, each feed delivers some packets late, independently of the other (UDP gives no ordering guarantee, LAYOUTS.md 11).
 * **Feed B timing** (decided in step 7a): B time = A time + base delay (default 20 µs) + uniform jitter in [0, 10 µs] from `random.Random(f"{seed}:feedB")`, clamped so B never reorders a channel. Only the pcap timestamp moves: the header sendingTime stays Feed A's, byte for byte. B has its own multicast groups (`channel_map_b`).
 
 ## 8. Order flow and timing
@@ -185,6 +186,7 @@ Step 7a decisions (loss, gaps, idle):
 * **Idle:** the flow's arrival clock is paused (`OrderFlow.pause`) before the engine, so transactTime, insert times and sendingTime all move together; nothing already encoded is shifted. Default: once half the target messages are published, 3.5 s, giving 3 heartbeats per channel on both feeds.
 * **Manifest:** `missing` lists `[channel, sequenceVersion, sequenceNumber]` missing from each feed; `unreliable_books` maps each instrument to the first packet missing from both feeds that held one of its messages. A message with no instrument (SecurityGroupPhase) makes every instrument on its channel unreliable from that packet. A book stays unreliable until a snapshot (v2).
 * The intent log and book key always describe everything published, whatever a feed lost.
+* **Reorder** (added after step 8): `run_scenario(config, "reorder")` runs the clean session. On each feed on its own (RNGs `f"{seed}:reorderA"`, `f"{seed}:reorderB"`), at each sequenced packet of a channel, with probability `rate` (default 0.5%), the packet arrives right after the next `depth` sequenced packets of its channel, `depth` uniform in 1..`max_depth` (default 3). It takes the pcap time of the packet it now follows, so pcap times never go back. Moves never overlap, never cross a sequenceVersion change, and never move or count heartbeats. Nothing is lost and no book is unreliable. The manifest's `reordered.A` / `reordered.B` list each late packet with the packet it follows and its depth. A client that buffers `max_depth` packets per channel and applies them in sequence order matches the book key everywhere. A client that sequences strictly sees a gap where each late packet was due and drops the late packet as a duplicate. Jitter alone still never reorders a channel on Feed B.
 
 Step 7b decisions (restart and reset scenarios, `run_scenario` kinds `failover`, `channel_reset`, `instrument_reset`, `session_change`, `weekly_start`; each at half the target message count):
 
@@ -220,7 +222,7 @@ Step 7c decisions (`edge`, `rare`, `schema`, `malformed`; injections at half the
 
 * securityIDs, starting prices, multicast addresses and ports are invented, and so is which channel carries which instrument (B3's real assignment is in its Market Data Channels Definition, not in spec/).
 * All of it lives in the config file (`feed_generator/config.toml`, decided in step 8), so B3's real channel definitions can be swapped in later.
-* Also in config: seed, message targets per set, packet window, heartbeat interval, regime and flow parameters (spike included), Feed B delay and jitter, loss/gap/idle parameters, session date.
+* Also in config: seed, message targets per set, packet window, heartbeat interval, regime and flow parameters (spike included), Feed B delay and jitter, loss/gap/reorder/idle parameters, session date.
 * **Config file (step 8):** TOML, read with `tomllib`. Every value carries a comment labelling it [B3] (from spec/), [B3 market] (a real convention not in spec/, such as ticks and lots), [inferred], [invented] or [stress]. Validation is strict: unknown keys, missing keys, wrong types and inconsistent values raise with the key path. The default file gives exactly `main.default_config()`.
 * **CLI (step 8):** `python -m b3gen build` builds `small`, `large`, `burst` (spike_every 50 ms, 200k messages, about 100 spikes) and every scenario folder from one config; `--seed` and `--messages` override every set chosen (malformed keeps 1,500). Every folder has both feeds, the keys, a manifest and `provenance.json` (config text and SHA-256, seed, git commit and dirty flag, schema XML SHA-256, command line). A scenario that cannot place what it promises within its target fails with a clear error.
 * **Streaming (step 8):** the packetizer hands over each packet once no channel can still produce an earlier one; Feed A's pcap and the intent log are written then, and the messages forgotten. Output is byte-identical to the in-memory writer. 1M messages: 2.20 GB peak and 40.9 s before, 214 MB and 42.6 s after (Feed A, intent log, book key).
