@@ -109,7 +109,7 @@ Not on port 1: statistics (15, 17, 21, 22, 24, 25, 28, 29, 56), News (5), heartb
 
 The record size depends on N, so every `book.bin` starts with a small file header (magic, format version, N, K, instrument capacity). Tools and cocotb testbenches read the layout from it instead of assuming N = 5.
 
-Emitted when an event that changed an instrument's book completes, only for instruments not stale. A completed event that touched several instruments (a firm mass cancel across instruments) emits one update per instrument touched.
+Emitted when an event that changed an instrument's book completes; when a book that is not CLEAN is published, see port 2 book state, DESIGN.md. A completed event that touched several instruments (a firm mass cancel across instruments) emits one update per instrument touched.
 
 ## 5. Price-level book (same algorithm as the RTL)
 
@@ -230,7 +230,9 @@ Answer keys for the `reorder` scenario (`tools/b3intent.py` reads the manifest's
 | 8 | Depth-limited book + book sink (port 2), parameters in `book_params.hpp` | Unit tests pass for K = 4, 16 and 32 (truncation paths covered). Matches `book_key.jsonl` at every checkpoint on every set and scenario, stale flags match `unreliable_books`. **Second RTL golden, one per (N, K)** |
 | 9 | MBO book behind a flag | Its top N equals the depth-limited book after every event whenever the side is not depth incomplete. Delete and CHANGE consistency checks (stored price, size, prevSize) all pass. Depth-incomplete statistics reported for K = 16 and K = 32 |
 | 10 | Benchmark harness | Reproducible percentiles for both measurements on `large/` and `burst/` |
-| 11 | A/B arbitration and the reorder window (section 6) | `loss` scenario: merged A + B gives the same outputs as `clean`-style complete data and matches the book key everywhere. `gap`: matches except `unreliable_books`. `reorder`: each feed alone passes every compare target, and its entry leaves `b3intent.EXPECTED_FAILURES` |
+| 11 | A/B arbitration with a per-channel hold window: in-order packets pass straight through; packets after a gap are held until the hole is filled from either feed or the window expires, then the channel goes STALE. The same window is the reorder window (section 6) | `loss` scenario: merged A + B gives the same outputs as `clean`-style complete data and matches the book key everywhere. `gap`: matches except `unreliable_books`. `reorder`: each feed alone passes every compare target, and its entry leaves `b3intent.EXPECTED_FAILURES` |
+
+| 12 | Snapshot recovery: software rebuilds STALE books from the snapshot stream (`spec/LAYOUTS.md` 12.6, 12.8), plus host refill of FPGA slots (open item G). Needs the generator's snapshot stream | A gap scenario recovers every STALE book from the snapshot and then matches the book key |
 
 Steps 7 and 8 unblock the RTL.
 
@@ -274,7 +276,7 @@ tools/                 repo level: gen_layouts.py, contract converters, comparis
 | Event scope | Hot path only on port 1. Statistics and News in the full decode |
 | Records | Fixed width, venue-neutral kinds, B3 templateId as a detail |
 | Book storage | Depth-limited sorted levels (K slots per side) with a truncated flag and a depth-incomplete flag. Replaces the earlier price-array idea, which needed about 100 KB per futures instrument |
-| Publish rule | At EndOfEvent, only when not stale |
+| Publish rule | At EndOfEvent; see port 2 book state, DESIGN.md |
 | Offsets | Generated from B3's XML by a shared repo-level script |
 | A/B arbitration | Last core step. Take the first copy of each (channel, sequenceVersion, sequenceNumber) |
 
@@ -285,10 +287,12 @@ tools/                 repo level: gen_layouts.py, contract converters, comparis
 | A | Final field lists of both records | Proposals in section 4, finalize in step 1 |
 | B | How an event closed by a non-port-1 message is signalled on port 1 | Decide in step 1 |
 | C | K = 16 or 32 | Decided by RTL timing plus the depth-incomplete statistics from step 9 |
-| D | A/B arbitration wait window for a missing packet. The same window as the reorder window (section 6) | Decide in step 11 |
+| D | The hold window size (step 11), chosen from the measured lag between Feed A and Feed B. The same window as the reorder window (section 6, item I) | Decide in step 11 |
 | E | Whether port 2 also emits on mid-event changes (with a flag) | Default no |
 | F | Deep-book data set from the feed generator (more levels per side, sweeps through several levels) so K actually gets exercised | Request for the generator, outside this build's folders |
-| G | Host refill of a depth-incomplete side from the software MBO book | Out of scope for v1 |
+| G | Host refill of a depth-incomplete side from the software MBO book | Step 12 (host refill of FPGA slots) |
 | H | One parameter file generating both `book_params.hpp` and the RTL's SystemVerilog package | Desirable, decide when the RTL book starts |
 | I | Reorder window limits (section 6): `max_depth` (packets held) and the timeout, both config values. The keys expect no gap for any generator late packet, so the window must hold the generator's `max_depth` (3) packets without closing (it closes when one more would be held). Single-feed tests need a timeout of at least 3 ms: the longest hold in the default `reorder` set is 2.9 ms of pcap time (a depth-1 late packet takes the pcap time of the packet it follows, so most holds are 0). With A/B arbitration a hole normally fills from the other feed within the A/B skew (20 to 30 µs in our data), so that is the practical timeout for the arbitrated design | Decide in step 11, with D |
 | J | What b3_decode reports for late packets: `reordered` (packets that filled a hole, in arrival order, `[channel, sequenceVersion, sequenceNumber]`) and the late count (after a window closed). Once the window lands, b3_decode reports `reordered` on every set (an empty list where nothing was late) and counters-compare requires it everywhere. Until then it is expected only where the manifest's list is not empty | Decide in step 11 |
+| K | Generator requests: a Feed B per-packet order file (so a Feed B events.bin can be checked in full order, not per channel); a deep-book set (item F); a gap followed by a ChannelReset (stale cleared by the reset); within-channel reordering (delivered: the `reorder` scenario, 68b3213) | Requests to the feed generator, outside this build's folders |
+| L | A tradable gate on the future order path that blocks orders for instruments whose book is not CLEAN | Future: the order path is not part of this build |
