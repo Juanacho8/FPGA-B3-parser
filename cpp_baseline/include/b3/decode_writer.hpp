@@ -165,8 +165,10 @@ struct BodyJson {
         close_group();
         j.key(D::name);
         append_string(j.out, bytes);
-        if (D::name == "headline") headline = bytes;
-        if (D::name == "text") text = bytes;
+        // By descriptor type, not by name: a renamed field stops the build here
+        // (and tools/gen_layouts.py refuses a schema without them).
+        if constexpr (std::is_same_v<D, fields::News_5::headline>) headline = bytes;
+        if constexpr (std::is_same_v<D, fields::News_5::text>) text = bytes;
     }
     template <class Where>
     void on_body_fault(decode::BodyFault reason) {
