@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 4 (build system, generated field layouts, pcap reader, packet decoder and message walker).
+Status: step 5 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding and the full decode writer).
 
 ## Requirements
 
@@ -26,6 +26,7 @@ From the repo root:
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 | `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
+| `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
 | `make decode-crosscheck` | Release build, then `b3_decode` against intent.jsonl and manifest.json on both feeds of every set under `B3_DATA` | `cpp_baseline/build/release` |
 | `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `data/`, filled by `make data`) | `cpp_baseline/build/release` |
 
@@ -41,8 +42,8 @@ generator's `layouts.py`. Never edit it by hand:
 
 | Target | What it does |
 |---|---|
-| `make layouts` | Regenerates both files |
-| `make layouts-check` | Regenerates into a temp folder, fails if either checked-in file differs. Run by `make cpp-test` |
+| `make layouts` | Regenerates the three files |
+| `make layouts-check` | Regenerates into a temp folder, fails if any checked-in file differs. Run by `make cpp-test` |
 
 `tests/test_layouts.cpp` checks a few values against numbers copied by hand
 from `spec/LAYOUTS.md`.
@@ -69,8 +70,15 @@ messageLength, applies the complete-message test of `docs/DESIGN.md` 3.6.1
 (stopping at the first failure, counted by reason), and dispatches each
 message by a switch on templateId to a sink given as a template parameter.
 
+`include/b3/decode.hpp`: `decode::get<F>(view)` reads field `F` (a
+descriptor from the generated `include/b3/fields.hpp`, for example
+`b3::fields::Order_MBO_50::mDEntryPx`) as present, null or absent, by the
+rules of `docs/DESIGN.md` 3.6.2; `walk_body` walks groups and var data with
+bounds checks. `include/b3/decode_writer.hpp` is the full decode writer (not
+for timed code).
+
 ```
-cpp_baseline/build/release/b3_decode [--list FILE] feedA.pcap   # counts as one JSON line
+cpp_baseline/build/release/b3_decode [--list FILE] [--decode FILE.jsonl] feedA.pcap
 ```
 
 ## Book parameters
@@ -103,6 +111,10 @@ ctest --test-dir cpp_baseline/build/k4 --output-on-failure
 CMakeLists.txt
 include/b3/book_params.hpp   book parameters (only place they are set)
 include/b3/layouts.hpp       generated field layouts (do not edit)
+include/b3/fields.hpp        generated field descriptors over layouts.hpp (do not edit)
+include/b3/decode.hpp        field accessors, presence rules, groups and var data
+include/b3/decode_writer.hpp full decode writer (JSON Lines, debug only)
+src/decode_writer.cpp
 include/b3/wire.hpp          unaligned little/big-endian loads (memcpy)
 include/b3/pcap.hpp          pcap reader
 src/pcap.cpp
@@ -115,5 +127,6 @@ tests/test_layouts.cpp       layouts.hpp against spec/LAYOUTS.md
 tests/test_wire.cpp          both byte orders, every width
 tests/test_pcap.cpp          reader on hand-built pcap bytes
 tests/test_walker.cpp        packet decoder and walker on hand-built packets
+tests/test_decode.cpp        field access, groups, var data, body faults, writer
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```

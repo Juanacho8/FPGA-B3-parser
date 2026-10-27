@@ -299,3 +299,23 @@ TEST_CASE("CountingSink: 256 slots, larger ids only in the unknown counter") {
     for (const auto n : sink.per_template) total += n;
     CHECK(total == 2);                              // 50 and 4; 999 has no slot
 }
+
+TEST_CASE("msg_index overflow: more than 256 messages, nothing after index 255") {
+    // 300 SequenceReset messages (12 bytes each): an oversize packet no real
+    // feed can send (DESIGN.md 3.6.1), walked to exercise the guard.
+    Bytes d = packet_header();
+    for (int i = 0; i < 300; ++i) add(d, Msg{1, 0, 0});
+    Run r(std::move(d));
+    REQUIRE(r.sink.seen.size() == 256);
+    CHECK(r.sink.seen.back().msg_index == 255);
+    CHECK(r.walker.counters().msg_index_overflow == 1);
+    CHECK(r.walker.counters().malformed_packets == 0);
+    CHECK(r.walker.counters().messages == 256);
+
+    // Exactly 256 messages fit: indices 0..255, no overflow.
+    Bytes ok = packet_header();
+    for (int i = 0; i < 256; ++i) add(ok, Msg{1, 0, 0});
+    Run fits(std::move(ok));
+    CHECK(fits.sink.seen.size() == 256);
+    CHECK(fits.walker.counters().msg_index_overflow == 0);
+}

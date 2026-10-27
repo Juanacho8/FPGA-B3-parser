@@ -10,11 +10,17 @@ What it does:
     * fields: same names, same values, same JSON types (1 is not "1" or 1.0)
     * null and absent, as sets: a null field and an absent field are
       different answers ("absent" missing from a row means none)
-    * instrument and news only when the decode row has the key, since they
-      need the instrument table and News reassembly; --strict requires them
+    * news (the reassembled text on a News's last part): compared when the
+      decode row has it; --strict requires it wherever intent.jsonl has it
+    * instrument: compared only when the decode row has it, never required.
+      It is a name from the generator's config, which a decoder of the wire
+      does not read
+    * no other keys: a key the decode row has and intent.jsonl does not
+      (body_fault, undecoded, ...) is a mismatch
   Rows are matched per channel, in order. That is the order both feeds keep,
   so the same check works for a decode of Feed A or Feed B. Heartbeats
-  (sequenceNumber 0, index 0) are matched in order too.
+  (sequenceNumber 0, index 0) are matched in order too. For Feed A, whose
+  wire order intent.jsonl follows, the order across channels is checked too.
   Prints the first mismatches with packet and message position, and exits
   1 if there are any.
 
@@ -36,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import b3intent   # noqa: E402
 
 HEADER_KEYS = ("sendingTime", "templateId", "blockLength", "version")
-OPTIONAL_KEYS = ("instrument", "news")
+PLACEMENT_KEYS = ("channel", "sequenceVersion", "sequenceNumber", "index")
+CONFIG_KEYS = ("instrument",)    # from the generator's config: never required
+REASSEMBLED_KEYS = ("news",)     # required by --strict
 
 
 def same(a, b):
@@ -79,12 +87,22 @@ def diff_rows(want, got, strict=False):
             if g - w:
                 parts.append(f"extra {sorted(g - w)}")
             out.append(f"{k}: {', '.join(parts)}")
-    for k in OPTIONAL_KEYS:
+    if "null" not in got:
+        out.append("null: missing from decode")
+    for k in CONFIG_KEYS:
+        if k in got and not same(want.get(k), got[k]):
+            out.append(f"{k}: want {want.get(k)!r}, got {got[k]!r}")
+    for k in REASSEMBLED_KEYS:
         if k in got or (strict and k in want):
             if k not in got:
                 out.append(f"{k}: missing from decode")
             elif not same(want.get(k), got[k]):
                 out.append(f"{k}: want {want.get(k)!r}, got {got[k]!r}")
+    known = set(PLACEMENT_KEYS) | set(HEADER_KEYS) | {"fields", "null", "absent"} | \
+        set(CONFIG_KEYS) | set(REASSEMBLED_KEYS)
+    for k in got:
+        if k not in known or (k in REASSEMBLED_KEYS and k not in want):
+            out.append(f"{k}: not in intent (got {got[k]!r:.120})")
     return out
 
 
@@ -169,6 +187,15 @@ def compare(expected, decoded, strict=False, max_report=10):
     return m.compared, m.problems
 
 
+def order_difference(expected, decoded):
+    """Feed A: the decode's rows in intent.jsonl's order, across channels."""
+    for n, ((wl, w), (gl, g)) in enumerate(zip(expected, decoded)):
+        if b3intent.row_key(w) != b3intent.row_key(g):
+            return [f"row {n}: wire order differs: intent line {wl} is {where(w)}, "
+                    f"decode line {gl} is {where(g)}"]
+    return []
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("decode", help="decode.jsonl from the decoder")
@@ -177,7 +204,7 @@ def main(argv=None):
     ap.add_argument("--feed", default="A", choices=("A", "B"),
                     help="which feed's pcap was decoded")
     ap.add_argument("--strict", action="store_true",
-                    help="also require instrument and news on every row that has them")
+                    help="also require news on every row of intent.jsonl that has it")
     ap.add_argument("--max-report", type=int, default=10)
     args = ap.parse_args(argv)
 
@@ -185,6 +212,9 @@ def main(argv=None):
     expected = b3intent.feed_rows(args.intent, manifest, args.feed)
     compared, problems = compare(expected, b3intent.read_jsonl(args.decode),
                                  args.strict, args.max_report)
+    if args.feed == "A" and not problems:
+        problems = order_difference(b3intent.feed_rows(args.intent, manifest, "A"),
+                                    b3intent.read_jsonl(args.decode))
     if problems:
         for p in problems:
             print(p)

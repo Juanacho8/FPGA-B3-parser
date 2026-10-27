@@ -13,6 +13,9 @@
 //     7. blockLength <= messageLength - 12     else block_length_past_end
 //   On the first failure it counts the reason, stops and discards the rest
 //   of the packet. Messages already dispatched from that packet stand.
+//   Port 1 stores msg_index in one byte, so a packet with a message past
+//   index 255 is counted (msg_index_overflow) and nothing after message 255
+//   is dispatched. A real feed cannot get there (DESIGN.md 3.6.1).
 //   A complete message goes to the sink by a switch on templateId: one case
 //   per template in the schema, sink.on<templateId>(view). Any other
 //   templateId goes to sink.on_unknown(view) and is counted; it is skipped by
@@ -62,6 +65,9 @@ enum class Malformed : std::uint8_t {
     block_length_past_end,
 };
 inline constexpr std::size_t kMalformedReasons = 7;
+// msg_index values port 1 can hold (one byte, DESIGN.md 3.1).
+inline constexpr std::size_t kMaxMessagesPerPacket = 256;
+
 inline constexpr std::array<std::string_view, kMalformedReasons> kMalformedNames = {
     "header_truncated", "length_zero", "length_too_small", "length_past_end",
     "bad_encoding", "bad_schema_id", "block_length_past_end",
@@ -73,6 +79,7 @@ struct WalkCounters {
     std::uint64_t messages = 0;           // complete messages dispatched, unknown included
     std::uint64_t unknown_templates = 0;  // of those, templateId not in the schema
     std::uint64_t malformed_packets = 0;  // walks stopped by a failed test
+    std::uint64_t msg_index_overflow = 0; // packets with a message past msg_index 255 (not malformed)
     std::array<std::uint64_t, kMalformedReasons> malformed{};  // by reason
 };
 
@@ -139,6 +146,10 @@ public:
         }
         std::uint16_t index = 0;
         while (pos < len) {
+            if (index >= kMaxMessagesPerPacket) {
+                ++counters_.msg_index_overflow;   // stop: msg_index would not fit in a byte
+                return;
+            }
             const std::size_t remaining = len - pos;
             const std::uint8_t* msg = payload + pos;
             // 1. The 12-byte message header fits.

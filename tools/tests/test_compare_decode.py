@@ -99,19 +99,46 @@ def test_channel_interleaving_does_not_matter(tmp_path):
     """Feed B merges channels in another order; per channel order is what counts."""
     rows = base_rows()
     reordered = [r for r in rows if r["channel"] == 68] + [r for r in rows if r["channel"] == 70]
-    assert run(tmp_path, reordered) == 0
+    assert run(tmp_path, reordered, extra=["--feed", "B"]) == 0
+    # Feed A follows intent.jsonl's wire order across channels too.
+    assert rows != reordered
+    assert run(tmp_path, reordered) == 1
 
 
-def test_optional_keys(tmp_path):
+def test_instrument_is_never_required(tmp_path):
     rows = base_rows()
     stripped = copy.deepcopy(rows)
     for r in stripped:
         r.pop("instrument", None)
     assert run(tmp_path, stripped) == 0
-    assert run(tmp_path, stripped, extra=["--strict"]) == 1
+    assert run(tmp_path, stripped, extra=["--strict"]) == 0
     wrong = copy.deepcopy(rows)
     wrong[0]["instrument"] = "VALE3"
-    assert run(tmp_path, wrong) == 1
+    assert run(tmp_path, wrong) == 1      # compared when present
+
+
+def test_news_is_required_by_strict(tmp_path):
+    rows = base_rows()
+    rows[-1]["news"] = {"headline": "h", "text": "t"}
+    without = copy.deepcopy(rows)
+    del without[-1]["news"]
+    assert run(tmp_path, rows, rows, extra=["--strict"]) == 0
+    assert run(tmp_path, without, rows) == 0
+    assert run(tmp_path, without, rows, extra=["--strict"]) == 1
+    wrong = copy.deepcopy(rows)
+    wrong[-1]["news"]["text"] = "x"
+    assert run(tmp_path, wrong, rows) == 1
+
+
+def test_keys_intent_does_not_have_fail(tmp_path, capsys):
+    rows = base_rows()
+    extra = copy.deepcopy(rows)
+    extra[1]["body_fault"] = {"reason": "var_data_past_end", "at": "text"}
+    assert run(tmp_path, extra) == 1
+    assert "body_fault: not in intent" in capsys.readouterr().out
+    no_null = copy.deepcopy(rows)
+    del no_null[0]["null"]
+    assert run(tmp_path, no_null) == 1
 
 
 def test_feed_filter_applies(tmp_path):

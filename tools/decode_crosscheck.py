@@ -152,6 +152,7 @@ def expected(intent, manifest, feed):
     counts = {"datagrams": packets + short, "short_datagrams": short, "packets": packets,
               "oversize_packets": 0, "empty_packets": 0, "messages": len(listing),
               "unknown_templates": sum(n for t, n in templates.items() if t not in SCHEMA_TEMPLATES),
+              "msg_index_overflow": 0,
               "malformed_packets": sum(malformed.values()), "malformed": malformed,
               "templates": {str(t): n for t, n in sorted(templates.items()) if t < TEMPLATE_SLOTS}}
     return counts, listing
