@@ -112,10 +112,13 @@ class Replay:
                         for f in manifest.get("faults") or [] if f["fault"] != "short"}
         self.ch = {}   # channel -> {"seen", "reset", "version", "next"}
         self.seq = dict(sequenced=0, gaps=0, gap_events=0, heartbeats=0, heartbeat_mismatches=0,
-                        resets=0, reset_mismatches=0, version_changes=0, seq_reset_not_first=0)
+                        resets=0, reset_mismatches=0, version_changes=0, seq_reset_not_first=0,
+                        heartbeat_without_sequence=0)
+        self.msg_before_rebuild = 0
         self.losses = 0
         self.unknown = 0
-        self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0) for _ in table]
+        self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
+                      for _ in table]
         self.gap_packets = set()
 
     # ---- sequencer ----
@@ -125,6 +128,8 @@ class Replay:
         c = self.ch.setdefault(ch, dict(seen=False, reset=False, version=0, next=0))
         if num == 0:
             self.seq["heartbeats"] += 1
+            if first["templateId"] != SEQUENCE:
+                self.seq["heartbeat_without_sequence"] += 1
         else:
             self.seq["sequenced"] += 1
             if first["templateId"] == SEQUENCE_RESET:
@@ -191,7 +196,7 @@ class Replay:
         elif t == CHANNEL_RESET:
             for slot, (_, tch) in enumerate(self.table):
                 if tch == ch:
-                    self.state[slot]["stale"] = False
+                    self.state[slot].update(stale=False, rebuild=True)
         sid = f.get("securityID")
         if sid is None or "securityID" in row["null"]:
             return
@@ -201,8 +206,11 @@ class Replay:
             return
         st = self.state[slot]
         if t == EMPTY_BOOK:
-            st.update(stale=False, have=True, last=0)
-        elif "rptSeq" in f and "rptSeq" not in row.get("absent", []):
+            st.update(stale=False, have=True, last=0, rebuild=False)
+            return
+        if st["rebuild"]:
+            self.msg_before_rebuild += 1   # after a ChannelReset, before its EmptyBook (open item J)
+        if "rptSeq" in f and "rptSeq" not in row.get("absent", []):
             if st["have"] and f["rptSeq"] != st["last"] + 1:
                 st["gaps"] += 1
                 self.stale(slot, (ch, row["sequenceVersion"], row["sequenceNumber"]))
@@ -229,7 +237,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "empty_packets", "messages", "unknown_templates",
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
-               unknown_instrument_messages=replay.unknown,
+               unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
     exp["instruments"] = {
         str(sid): {"slot": slot, "channel": ch, "rpt_seq_gaps": st["gaps"], "stale_events": st["events"],
