@@ -45,6 +45,7 @@ namespace flag {
 inline constexpr std::uint8_t END_OF_EVENT = 0x01;   // matchEventIndicator bit 7
 inline constexpr std::uint8_t RECOVERY = 0x02;       // bit 5, RecoveryMsg
 inline constexpr std::uint8_t IMPLIED = 0x04;        // bit 4
+inline constexpr std::uint8_t BOOK_NOT_CLEAN = 0x08; // its table instrument is not CLEAN (today: STALE)
 }  // namespace flag
 
 // ---- Side, byte 10 ----

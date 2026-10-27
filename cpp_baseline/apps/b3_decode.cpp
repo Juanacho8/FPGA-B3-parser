@@ -237,8 +237,6 @@ int main(int argc, char** argv) {
                 capacity += b3::framing::count_complete_messages(p.payload, p.payload_len);
             }
             event_buffer.resize(capacity);
-            event_sink = std::make_unique<b3::event_sink::EventSink>(event_buffer.data(), event_buffer.size());
-            sink->events = event_sink.get();
         }
         b3::packet::PacketDecoder<> decoder;
         b3::walker::Walker walker;
@@ -246,6 +244,12 @@ int main(int argc, char** argv) {
         const bool walk_bodies = !counters_path.empty() || !decode_path.empty();
         auto tracker = std::make_unique<b3::tracker::Tracker>(instruments, decoder.sequencer(), walk_bodies);
         sink->tracker = tracker.get();
+        if (!events_path.empty()) {
+            // After the tracker: the "book not clean" bit reads its state (DESIGN.md 3.3).
+            event_sink = std::make_unique<b3::event_sink::EventSink>(event_buffer.data(), event_buffer.size(),
+                                                                     tracker.get());
+            sink->events = event_sink.get();
+        }
 
         // ---- The loop ----
         b3::packet::PacketHeader header;

@@ -41,13 +41,27 @@ import b3contract as c      # noqa: E402
 import b3intent             # noqa: E402
 import dump_events          # noqa: E402
 import intent_to_events     # noqa: E402
+import b3replay             # noqa: E402
+import gen_instruments      # noqa: E402
 
 HEADER = c.FILE_HEADER.size
+_TABLE = []
+
+
+def table_path():
+    """The generator config's instrument table as a file, written once: the
+    table the converter uses by default, given to the C++ too."""
+    if not _TABLE:
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        f.write(gen_instruments.table_text(REPO / "feed_generator" / "config.toml"))
+        f.close()
+        _TABLE.append(f.name)
+    return _TABLE[0]
 
 
 def run_cpp(binary, pcap, out):
-    res = subprocess.run([str(binary), "--events", str(out), str(pcap)], check=True,
-                         capture_output=True, text=True)
+    res = subprocess.run([str(binary), "--instruments", table_path(), "--events", str(out), str(pcap)],
+                         check=True, capture_output=True, text=True)
     return json.loads(res.stdout)["events"]
 
 
@@ -74,7 +88,8 @@ def per_channel(events):
 
 def expected_feed_b(intent, manifest, header):
     rows = (row for _, row in b3intent.feed_rows(intent, manifest, "B"))
-    return header, list(intent_to_events.convert(rows))
+    replay = b3replay.Replay(b3replay.read_table(table_path()), manifest, "B")
+    return header, list(intent_to_events.convert(rows, replay))
 
 
 def main(argv=None):

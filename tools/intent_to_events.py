@@ -26,8 +26,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import dataclasses       # noqa: E402
+
 import b3contract as c   # noqa: E402
 import b3intent          # noqa: E402
+import b3replay          # noqa: E402
 
 # ---- 1. B3 facts used (spec/LAYOUTS.md) ----
 END_OF_EVENT_BIT = 0x80   # matchEventIndicator bit 7
@@ -165,8 +168,12 @@ class Closer:
     def __init__(self):
         self.open = {}   # channel -> True while an event is open
 
-    def process(self, row):
+    def process(self, row, replay=None):
         event = to_event(row)
+        if event and replay is not None and event.instrument_id and replay.is_stale(event.instrument_id):
+            # Bit 3: the record's table instrument is not CLEAN, in the state
+            # the message left (DESIGN.md 3.3, 3.6.4).
+            event = dataclasses.replace(event, flags=event.flags | c.FLAG_BOOK_NOT_CLEAN)
         mei = match_event_indicator(row)
         ch = row["channel"]
         if row["templateId"] in RESETS:
@@ -204,11 +211,19 @@ def end_of_event_marker(row, mei):
                    exch_time=field(row, TIME_FIELD[t]) if t in TIME_FIELD else 0)
 
 
-def convert(rows):
-    """Port 1 records for decoded rows, in order."""
+def convert(rows, replay=None):
+    """Port 1 records for decoded rows, in order. With replay (a
+    b3replay.Replay for the rows' feed), records of stale table instruments
+    carry the "book not clean" flag."""
     closer = Closer()
-    for row in rows:
-        yield from closer.process(row)
+    if replay is None:
+        for row in rows:
+            yield from closer.process(row)
+        return
+    for pkt in b3replay.packets(rows):
+        out = []
+        replay.packet(pkt, on_row=lambda row: out.extend(closer.process(row, replay)))
+        yield from out
 
 
 # ---- 4. Command line ----
@@ -222,6 +237,8 @@ def main(argv=None):
     ap.add_argument("--tracked-depth", type=int, default=c.DEFAULT_TRACKED_DEPTH,
                     help="K recorded in the file header (0 = uncapped)")
     ap.add_argument("--max-instruments", type=int, default=c.DEFAULT_MAX_INSTRUMENTS)
+    ap.add_argument("--instruments", help="instrument table (default: the generator config's, as "
+                                          "tools/gen_instruments.py writes it)")
     args = ap.parse_args(argv)
 
     if args.feed == "B":
@@ -231,11 +248,13 @@ def main(argv=None):
         return 2
     manifest = b3intent.load_manifest(args.intent, args.manifest)
     rows = (row for _, row in b3intent.feed_rows(args.intent, manifest, args.feed))
+    table = b3replay.read_table(args.instruments) if args.instruments else b3replay.default_table()
+    replay = b3replay.Replay(table, manifest, args.feed)
     header = c.events_header(args.published_depth, args.tracked_depth, args.max_instruments)
     count = 0
     with open(args.out, "wb") as out:
         out.write(header.pack())
-        for event in convert(rows):
+        for event in convert(rows, replay):
             out.write(event.pack())
             count += 1
     print(f"{args.out}: {count} records")

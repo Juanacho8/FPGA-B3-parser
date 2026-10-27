@@ -25,9 +25,10 @@ SIDE = {0: "-", 1: "BID", 2: "OFFER"}
 
 def fmt_flags(flags):
     names = [n for bit, n in ((c.FLAG_END_OF_EVENT, "EOE"), (c.FLAG_RECOVERY, "REC"),
-                              (c.FLAG_IMPLIED, "IMP")) if flags & bit]
-    if flags & ~0x07:
-        names.append(f"0x{flags & ~0x07:02x}?")
+                              (c.FLAG_IMPLIED, "IMP"), (c.FLAG_BOOK_NOT_CLEAN, "NCLEAN"))
+             if flags & bit]
+    if flags & ~0x0F:
+        names.append(f"0x{flags & ~0x0F:02x}?")
     return "|".join(names) or "-"
 
 

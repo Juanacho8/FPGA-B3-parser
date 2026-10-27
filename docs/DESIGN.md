@@ -99,7 +99,8 @@ Default header (N = 5, K = 16, 64 instruments), events.bin:
 | 0 | END_OF_EVENT | matchEventIndicator bit 7. Always 1 on an END_OF_EVENT marker |
 | 1 | RECOVERY | matchEventIndicator bit 5 (RecoveryMsg) |
 | 2 | IMPLIED | matchEventIndicator bit 4 |
-| 3–7 | reserved, 0 | |
+| 3 | BOOK_NOT_CLEAN | The record's instrument is a table instrument (4.4) whose state is not CLEAN (today: STALE, 3.6.4) once this message has been applied: a gap is marked before the packet that reveals it, so its records carry the bit; an rptSeq jump marks its own message; an instrument's EmptyBook and a ChannelReset clear it first, so their records do not. Records with no table instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET, END_OF_EVENT, or a securityID not in the table) have 0 |
+| 4–7 | reserved, 0 | |
 
 A message without a matchEventIndicator (ExecutionSummary, SequenceReset) has flags 0. An END_OF_EVENT marker takes bits 1 and 2 from the closing message's matchEventIndicator.
 

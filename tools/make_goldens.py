@@ -36,6 +36,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import b3contract as c   # noqa: E402
+import events_compare     # noqa: E402  (the same instrument table as events-compare)
 import b3intent          # noqa: E402
 
 
@@ -78,7 +79,8 @@ def main(argv=None):
                 print(f"SKIPPED {name}/{pcap.name}: no such file in this set")
                 continue
             path = out / f"cpp_feed{feed}.bin"
-            subprocess.run([str(args.cpp), "--events", str(path), str(pcap)], check=True,
+            subprocess.run([str(args.cpp), "--instruments", events_compare.table_path(), "--events", str(path),
+                            str(pcap)], check=True,
                            stdout=subprocess.DEVNULL)
             files[path.name] = path
         reason = b3intent.expected_failure(b3intent.load_manifest(folder / "intent.jsonl"))
