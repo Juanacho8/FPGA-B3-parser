@@ -112,9 +112,11 @@ target_link_libraries(b3_decode PRIVATE b3)
 enable_testing()
 add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp
   tests/test_pcap.cpp tests/test_walker.cpp tests/test_decode.cpp
-  tests/test_sequencer.cpp tests/test_instruments.cpp tests/test_tracker.cpp)
+  tests/test_sequencer.cpp tests/test_instruments.cpp tests/test_tracker.cpp tests/test_events.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+# The repository root: tests read docs/DESIGN.md's hex examples and B3's sample packet.
+target_compile_definitions(b3_tests PRIVATE B3_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/..")
 # What CMake configured, so the test can check the code saw the same values.
 target_compile_definitions(b3_tests PRIVATE
   B3_EXPECT_PUBLISHED_DEPTH=${B3_PUBLISHED_DEPTH_EFFECTIVE}

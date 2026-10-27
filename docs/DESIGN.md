@@ -195,6 +195,12 @@ Consequences, all deliberate:
 * The records of an event and its close are always on the same channel, because B3 events never span channels.
 * Every close a port 1 consumer can see appears on port 1 exactly once, as one record with flag bit 0: the closing message's own record, or its marker, never both. The only closes missing from port 1 are those with no event open and no port 1 record, which close nothing a port 1 consumer saw.
 
+### 3.5.1 Implementations
+
+* Python, the answer key: `tools/intent_to_events.py` (from intent.jsonl).
+* C++: `cpp_baseline/include/b3/records.hpp` (the record and file header as structs, every offset `static_assert`ed, little-endian hosts only) and `event_sink.hpp` (the per-kind fields of 3.4 and the state machine above). `b3_decode --events FILE` writes the file. Its record buffer is allocated before the decode loop with one slot per complete message, counted at load time (a message gives at most one record: its own or a marker); a record past that capacity is counted, never stored.
+* `make events-compare` checks the C++ against the converter on every set: Feed A byte for byte, Feed B record by record within each channel (3.7), in the release, k16, k32 and uncapped builds, whose records must be identical (only the header's N and K differ). `make goldens` writes the RTL goldens (section 5).
+
 ### 3.6 Which messages reach port 1
 
 Port 1 is written in decoder order: packets in the order the decoder accepts them, then messages in packet order.
@@ -308,7 +314,7 @@ Statistics, News, heartbeats and unknown templates appear in decode.jsonl and th
 
 ### 3.9 Worked examples
 
-The bytes below are produced by `tools/intent_to_events.py`, and `tools/tests/test_design_examples.py` checks them against this file. Each record is 64 bytes, shown as four rows of 16.
+The bytes below are produced by `tools/intent_to_events.py`, and checked against this file twice: by `tools/tests/test_design_examples.py` (the Python converter) and by `cpp_baseline/tests/test_events.cpp` (the C++ event sink, which parses the blocks from this file the same way). This file is the shared ground truth; the RTL's testbench is meant to read the same blocks. Each record is 64 bytes, shown as four rows of 16.
 
 #### Example 1: B3's sample packet (Message Reference section 6)
 
@@ -458,6 +464,8 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
 | `counters_compare.py` | `b3_decode --counters` against counters derived from manifest.json and intent.jsonl: sequencing, rptSeq, stale flags and points, every other counter, both feeds (`make counters-compare`) |
 | `gen_instruments.py` | The instrument table (4.4) from the feed generator's config.toml |
+| `events_compare.py` | `b3_decode --events` against `intent_to_events.py`: Feed A byte-identical, Feed B per channel, every build (`make events-compare`) |
+| `make_goldens.py` | Port 1 goldens for the RTL (`make goldens`, below) |
 | `decode_compare.py` | `b3_decode --decode` against intent.jsonl with `compare_decode.py --strict`, both feeds of every set, the schema set's features and B3's sample packet (`make decode-compare`) |
 | `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
 
@@ -468,6 +476,8 @@ python3 tools/compare_decode.py out/small/decode.jsonl data/small/intent.jsonl
 python3 -m pytest tools/tests
 make data && python3 -m pytest tools/tests   # data tests fail until make data has run
 ```
+
+**Goldens** (`make data && make goldens`): for every set, `data/golden/<set>/` holds `expected_feedA.bin` (the converter), `cpp_feedA.bin` and `cpp_feedB.bin` (the C++, release build), and `provenance.json` with the repo commit (and whether the tree was dirty), the SHA-256 and recorded commit of the set's generator `provenance.json`, the build parameters, and each file's SHA-256 and size. A set whose Feed A files differ is not written. There is no expected Feed B file: Feed B's cross-channel order is not in intent.jsonl (3.7). `data/` is gitignored; the goldens are rebuilt, not committed.
 
 `intent_to_events.py` writes N, K and MAX_INSTRUMENTS into the header (defaults 5, 16, 64, matching `book_params.hpp`). For a golden file matched against another build, pass `--tracked-depth 32` (or `0` for uncapped) and so on.
 

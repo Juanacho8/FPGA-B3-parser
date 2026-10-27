@@ -48,26 +48,8 @@ namespace b3::tracker {
 inline constexpr std::string_view kSecurityID = "securityID";
 inline constexpr std::string_view kRptSeq = "rptSeq";
 
-// Field Name of the descriptor list, read as an unsigned integer (absent if
-// the template has no such field). Resolved at compile time.
-template <const std::string_view& Name, class... Fs>
-inline decode::Value<std::uint64_t> get_named(decode::List<Fs...>, const decode::Block& b) noexcept {
-    decode::Value<std::uint64_t> out;
-    (
-        [&] {
-            if constexpr (Fs::name == Name) {
-                const auto v = decode::get<Fs>(b);
-                out = {v.presence, static_cast<std::uint64_t>(v.value)};
-            }
-        }(),
-        ...);
-    return out;
-}
-
-template <const std::string_view& Name, class... Fs>
-constexpr bool has_named(decode::List<Fs...>) noexcept {
-    return ((Fs::name == Name) || ...);
-}
+using decode::get_named;
+using decode::has_named;
 
 struct StalePoint {
     std::uint8_t channel = 0;

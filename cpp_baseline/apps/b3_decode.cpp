@@ -22,11 +22,15 @@
 //   Packets go through the sequencer (DESIGN.md 3.6.3); duplicates are not
 //   dispatched. The tracker (DESIGN.md 3.6.4) follows rptSeq and stale flags
 //   for table instruments.
+//   --events FILE writes port 1 (DESIGN.md 3): the file header, then one
+//   64-byte record per hot-path message and END_OF_EVENT marker, from a
+//   buffer sized before the loop by a counting pass over the capture.
 //   --counters FILE writes every counter as one JSON object, with each
 //   instrument's first stale point and the build parameters, for
 //   tools/counters_compare.py.
 //
-// Usage: b3_decode [--instruments FILE] [--counters FILE] [--list FILE] [--decode FILE] FILE.pcap
+// Usage: b3_decode [--instruments FILE] [--events FILE] [--counters FILE] [--list FILE]
+//                  [--decode FILE] FILE.pcap
 
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +40,8 @@
 #include <vector>
 
 #include "b3/decode_writer.hpp"
+#include "b3/event_sink.hpp"
+#include "b3/records.hpp"
 #include "b3/book_params.hpp"
 #include "b3/instruments.hpp"
 #include "b3/tracker.hpp"
@@ -61,6 +67,7 @@ struct DecodeSink {
     std::vector<ListEntry>* list = nullptr;   // reserved before the loop
     b3::decode_writer::DecodeWriter* writer = nullptr;
     b3::tracker::Tracker* tracker = nullptr;
+    b3::event_sink::EventSink* events = nullptr;
 
     void record(const b3::walker::MessageView& m) noexcept {
         if (list != nullptr) {
@@ -73,12 +80,14 @@ struct DecodeSink {
         counts.on<TemplateId>(m);
         record(m);
         tracker->on<TemplateId>(m);
+        if (events != nullptr) events->on<TemplateId>(m);
         if (writer != nullptr) writer->on<TemplateId>(m);
     }
     void on_unknown(const b3::walker::MessageView& m) {
         counts.on_unknown(m);
         record(m);
         tracker->on_unknown(m);
+        if (events != nullptr) events->on_unknown(m);
         if (writer != nullptr) writer->on_unknown(m);
     }
 };
@@ -163,7 +172,12 @@ int main(int argc, char** argv) {
     std::string decode_path;
     std::string instruments_path;
     std::string counters_path;
+    std::string events_path;
     for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--events") == 0 && i + 1 < argc) {
+            events_path = argv[++i];
+            continue;
+        }
         if (std::strcmp(argv[i], "--instruments") == 0 && i + 1 < argc) {
             instruments_path = argv[++i];
             continue;
@@ -184,8 +198,8 @@ int main(int argc, char** argv) {
         }
     }
     if (path.empty()) {
-        std::fprintf(stderr, "usage: b3_decode [--instruments FILE] [--counters FILE] [--list FILE] "
-                             "[--decode FILE] FILE.pcap\n");
+        std::fprintf(stderr, "usage: b3_decode [--instruments FILE] [--events FILE] [--counters FILE] "
+                             "[--list FILE] [--decode FILE] FILE.pcap\n");
         return 2;
     }
 
@@ -212,6 +226,19 @@ int main(int argc, char** argv) {
             }
             writer = std::make_unique<b3::decode_writer::DecodeWriter>(decode_out);
             sink->writer = writer.get();
+        }
+        // Port 1 buffer: at most one record per complete message (a record or
+        // a marker, never both), counted once over the loaded capture.
+        std::vector<b3::records::EventRecord> event_buffer;
+        std::unique_ptr<b3::event_sink::EventSink> event_sink;
+        if (!events_path.empty()) {
+            std::size_t capacity = 0;
+            for (const auto& p : capture.packets()) {
+                capacity += b3::framing::count_complete_messages(p.payload, p.payload_len);
+            }
+            event_buffer.resize(capacity);
+            event_sink = std::make_unique<b3::event_sink::EventSink>(event_buffer.data(), event_buffer.size());
+            sink->events = event_sink.get();
         }
         b3::packet::PacketDecoder<> decoder;
         b3::walker::Walker walker;
@@ -282,7 +309,30 @@ int main(int argc, char** argv) {
             }
             std::printf("}");
         }
+        if (event_sink) {
+            const auto& ec = event_sink->counters();
+            std::printf(",\"events\":{\"records\":%llu,\"markers\":%llu,\"capacity\":%zu,\"overflow\":%llu,"
+                        "\"resets_with_event_open\":%llu}",
+                        static_cast<ull>(ec.records), static_cast<ull>(ec.markers), event_buffer.size(),
+                        static_cast<ull>(ec.overflow), static_cast<ull>(ec.resets_with_event_open));
+        }
         std::printf("}\n");
+
+        if (event_sink) {
+            std::FILE* out = std::fopen(events_path.c_str(), "wb");
+            const auto header = b3::records::events_header();
+            const bool ok = out != nullptr && std::fwrite(&header, sizeof header, 1, out) == 1 &&
+                            std::fwrite(event_sink->data(), sizeof(b3::records::EventRecord), event_sink->size(),
+                                        out) == event_sink->size();
+            if (out != nullptr && std::fclose(out) != 0) {
+                std::fprintf(stderr, "b3_decode: cannot write %s\n", events_path.c_str());
+                return 1;
+            }
+            if (!ok) {
+                std::fprintf(stderr, "b3_decode: cannot write %s\n", events_path.c_str());
+                return 1;
+            }
+        }
 
         if (!counters_path.empty() &&
             !write_counters(counters_path, path, pc, sq, wc, sink->counts, *tracker)) {

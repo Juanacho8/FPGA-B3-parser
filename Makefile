@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare goldens cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -88,6 +88,19 @@ decode-compare: cpp-release
 # both feeds of every set under B3_DATA. Fails on any difference.
 counters-compare: cpp-release
 	$(PYTHON) tools/counters_compare.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
+
+# Port 1: b3_decode --events against tools/intent_to_events.py (Feed A byte
+# for byte, Feed B per channel) in the release and variant builds; records
+# must be identical across builds. Fails on any difference.
+EVENT_BUILDS := $(foreach b,release k16 k32 uncapped,--build $(b):$(CPP_BUILD)/$(b)/b3_decode)
+
+events-compare: cpp-release cpp-variants
+	$(PYTHON) tools/events_compare.py $(B3_DATA) $(EVENT_BUILDS)
+
+# Goldens: each set's expected and C++ events.bin under $(B3_DATA)/golden/,
+# with provenance.json. Reproducible from make data && make goldens.
+goldens: cpp-release
+	$(PYTHON) tools/make_goldens.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
 
 cpp-clean:
 	rm -rf $(CPP_BUILD)
