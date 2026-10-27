@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 5 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding and the full decode writer).
+Status: step 6 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags).
 
 ## Requirements
 
@@ -26,6 +26,7 @@ From the repo root:
 | `make cpp-variants` | The three variants above | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 | `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
+| `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
 | `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
 | `make decode-crosscheck` | Release build, then `b3_decode` against intent.jsonl and manifest.json on both feeds of every set under `B3_DATA` | `cpp_baseline/build/release` |
 | `make pcap-crosscheck` | Release build, then `b3_pcapinfo` against the generator's independent Python pcap reader on every `feedA/feedB.pcap` under `B3_DATA` (default `data/`, filled by `make data`) | `cpp_baseline/build/release` |
@@ -81,6 +82,18 @@ for timed code).
 cpp_baseline/build/release/b3_decode [--list FILE] [--decode FILE.jsonl] feedA.pcap
 ```
 
+## Sequencing, instruments, stale flags
+
+`packet.hpp`'s `Sequencer` decides each packet from its header and its first
+message's header (`docs/DESIGN.md` 3.6.3). `instruments.hpp` loads the
+instrument table (`securityID channel` per line, DESIGN.md 4.4; write it with
+`tools/gen_instruments.py -o instruments.txt`). `tracker.hpp` follows rptSeq
+and stale flags per table instrument (DESIGN.md 3.6.4).
+
+```
+cpp_baseline/build/release/b3_decode --instruments instruments.txt --counters counters.json feedA.pcap
+```
+
 ## Book parameters
 
 Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake:
@@ -120,7 +133,11 @@ include/b3/pcap.hpp          pcap reader
 src/pcap.cpp
 apps/b3_pcapinfo.cpp         pcap -> counters JSON line
 include/b3/packet.hpp        packet header, short datagrams, sequencing hook
+include/b3/framing.hpp       the complete message test (walker, sequencer)
 include/b3/walker.hpp        message framing, malformed test, dispatch
+include/b3/instruments.hpp   instrument table: load and lookup
+include/b3/tracker.hpp       rptSeq, stale flags, per-message checks
+src/instruments.cpp
 apps/b3_decode.cpp           pcap -> decode counts JSON (and --list)
 tests/test_build.cpp         doctest main, build parameter tests
 tests/test_layouts.cpp       layouts.hpp against spec/LAYOUTS.md
@@ -128,5 +145,8 @@ tests/test_wire.cpp          both byte orders, every width
 tests/test_pcap.cpp          reader on hand-built pcap bytes
 tests/test_walker.cpp        packet decoder and walker on hand-built packets
 tests/test_decode.cpp        field access, groups, var data, body faults, writer
+tests/test_sequencer.cpp     sequencing rules
+tests/test_tracker.cpp       rptSeq, stale flags, unknown instruments
+tests/test_instruments.cpp   table loading and lookup
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```

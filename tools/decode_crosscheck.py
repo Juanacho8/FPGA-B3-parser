@@ -185,9 +185,10 @@ def first_difference(want, got):
 
 
 def compare(want_counts, want_list, got_counts, got_list, feed):
+    # Every key the answer keys give; b3_decode reports more (sequencing, the
+    # instrument table), which make counters-compare checks.
     problems = [f"{k}: keys {want_counts.get(k)!r}, c++ {got_counts.get(k)!r}"
-                for k in sorted(set(want_counts) | set(got_counts))
-                if want_counts.get(k) != got_counts.get(k)]
+                for k in sorted(want_counts) if want_counts.get(k) != got_counts.get(k)]
     if feed == "A":
         d = first_difference(want_list, got_list)
         if d:

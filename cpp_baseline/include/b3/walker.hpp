@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "b3/framing.hpp"
 #include "b3/layouts.hpp"
 #include "b3/packet.hpp"
 #include "b3/wire.hpp"
@@ -54,24 +55,13 @@ struct MessageView {
     const std::uint8_t* body;      // message + 12: the root block, then groups and var data
 };
 
-// Why a packet's walk stopped early (DESIGN.md 3.6.1), in test order.
-enum class Malformed : std::uint8_t {
-    header_truncated,
-    length_zero,
-    length_too_small,
-    length_past_end,
-    bad_encoding,
-    bad_schema_id,
-    block_length_past_end,
-};
-inline constexpr std::size_t kMalformedReasons = 7;
-// msg_index values port 1 can hold (one byte, DESIGN.md 3.1).
-inline constexpr std::size_t kMaxMessagesPerPacket = 256;
+// The complete message test and its reasons live in framing.hpp (shared
+// with the sequencer's look-ahead).
+using framing::Malformed;
+using framing::kMalformedReasons;
+using framing::kMalformedNames;
+using framing::kMaxMessagesPerPacket;
 
-inline constexpr std::array<std::string_view, kMalformedReasons> kMalformedNames = {
-    "header_truncated", "length_zero", "length_too_small", "length_past_end",
-    "bad_encoding", "bad_schema_id", "block_length_past_end",
-};
 
 struct WalkCounters {
     std::uint64_t packets = 0;            // packets walked
@@ -135,61 +125,33 @@ class Walker {
 public:
     // Walks the messages of one accepted packet (payload holds the whole
     // datagram, packet header included) and dispatches each complete one.
+    // Returns true when part of the packet was discarded (a malformed tail,
+    // or messages past msg_index 255): a loss on its channel.
     template <class Sink>
-    void walk(const packet::PacketHeader& header, const std::uint8_t* payload, std::size_t len,
-              Sink& sink) noexcept {
+    bool walk(const packet::PacketHeader& header, const std::uint8_t* payload, std::size_t len,
+              Sink& sink) {
         ++counters_.packets;
         std::size_t pos = layout::packet_header::size;
         if (pos >= len) {
             ++counters_.empty_packets;
-            return;
+            return false;
         }
         std::uint16_t index = 0;
         while (pos < len) {
             if (index >= kMaxMessagesPerPacket) {
                 ++counters_.msg_index_overflow;   // stop: msg_index would not fit in a byte
-                return;
+                return true;
             }
-            const std::size_t remaining = len - pos;
             const std::uint8_t* msg = payload + pos;
-            // 1. The 12-byte message header fits.
-            if (remaining < mh::size) {
-                fail(Malformed::header_truncated);
-                return;
+            framing::MessageHeader h;
+            if (const auto fault = framing::check(msg, len - pos, h)) {
+                fail(*fault);
+                return true;
             }
-            const auto length = wire::load_le<mh::messageLength::type>(msg + mh::messageLength::offset);
-            const auto encoding = wire::load_le<mh::encodingType::type>(msg + mh::encodingType::offset);
-            const auto block = wire::load_le<mh::blockLength::type>(msg + mh::blockLength::offset);
-            const auto tid = wire::load_le<mh::templateId::type>(msg + mh::templateId::offset);
-            const auto schema = wire::load_le<mh::schemaId::type>(msg + mh::schemaId::offset);
-            const auto version = wire::load_le<mh::version::type>(msg + mh::version::offset);
-            // 2-4. messageLength frames a whole message inside the datagram.
-            if (length == 0) {
-                fail(Malformed::length_zero);
-                return;
-            }
-            if (length < mh::size) {
-                fail(Malformed::length_too_small);
-                return;
-            }
-            if (length > remaining) {
-                fail(Malformed::length_past_end);
-                return;
-            }
-            // 5-7. It is an SBE message of this schema, and its root block fits.
-            if (encoding != layout::encoding_type) {
-                fail(Malformed::bad_encoding);
-                return;
-            }
-            if (schema != layout::schema_id) {
-                fail(Malformed::bad_schema_id);
-                return;
-            }
-            if (block > length - mh::size) {
-                fail(Malformed::block_length_past_end);
-                return;
-            }
-
+            const auto length = h.length;
+            const auto tid = h.template_id;
+            const auto version = h.version;
+            const auto block = h.block_length;
             const MessageView view{header, index, tid, version, block, length, msg, msg + mh::size};
             ++counters_.messages;
             if (!dispatch(view, sink)) {
@@ -198,6 +160,7 @@ public:
             pos += length;
             ++index;
         }
+        return false;
     }
 
     const WalkCounters& counters() const noexcept { return counters_; }

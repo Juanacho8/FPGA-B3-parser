@@ -6,18 +6,24 @@
 //   than the header is discarded and counted: it uses up no sequence number
 //   (docs/DESIGN.md 3.6). A datagram over B3's 1400-byte limit is counted as
 //   oversize and still decoded (DESIGN.md 3.6.1).
-//   Sequencing is a template parameter: the Sequencer decides whether a
-//   parsed packet is accepted. Step 6 puts the per-channel rules there; until
-//   then AcceptAll accepts every packet.
+//   Sequencing is a template parameter, Sequencer by default: per channel it
+//   accepts the next packet, counts gaps, drops duplicates, checks heartbeat
+//   nextSeqNo and handles SequenceReset (DESIGN.md 3.6.3, spec/LAYOUTS.md
+//   12.1, feed_generator/tests/book_builder.py).
 //
 // What it must not do:
-//   Look past the 16-byte packet header. The messages belong to the walker.
+//   Look past the 16-byte packet header, except for the sequencer reading the
+//   first message's header (is it a SequenceReset?). Message contents belong
+//   to the walker; a heartbeat's nextSeqNo is checked when it is dispatched.
+//   Allocate: the sequencer's state is a fixed array of 256 channels.
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
+#include "b3/framing.hpp"
 #include "b3/layouts.hpp"
 #include "b3/wire.hpp"
 
@@ -38,7 +44,7 @@ struct PacketCounters {
     std::uint64_t short_datagrams = 0;   // shorter than the packet header: discarded
     std::uint64_t packets = 0;           // headers parsed
     std::uint64_t oversize_packets = 0;  // over max_packet_size bytes (still decoded)
-    std::uint64_t rejected_packets = 0;  // parsed, not accepted by the sequencer (step 6)
+    std::uint64_t rejected_packets = 0;  // parsed, not accepted by the sequencer (duplicates)
 };
 
 // Reads the packet header. p must hold at least packet_header::size bytes.
@@ -52,17 +58,132 @@ inline PacketHeader read_header(const std::uint8_t* p) noexcept {
     return h;
 }
 
-// Step 4: every parsed packet is accepted. Step 6 replaces this with the
-// per-channel sequencing of the brief's section 6 (gaps, duplicates,
-// heartbeats, SequenceReset).
-struct AcceptAll {
-    constexpr bool accept(const PacketHeader&) const noexcept { return true; }
+// ---- Sequencing (DESIGN.md 3.6.3) ----
+
+// True when the packet's first message is complete (framing.hpp's test) and
+// is a SequenceReset. The only look past the packet header: one message header.
+inline bool first_is_sequence_reset(const std::uint8_t* payload, std::size_t len) noexcept {
+    framing::MessageHeader h;
+    return len > ph::size && !framing::check(payload + ph::size, len - ph::size, h) &&
+           h.template_id == layout::SequenceReset_1::template_id;
+}
+
+struct SequencerCounters {
+    std::uint64_t sequenced = 0;            // packets with sequenceNumber != 0, reset packets included
+    std::uint64_t gaps = 0;                 // packets missing (sum of the jumps)
+    std::uint64_t gap_events = 0;           // jumps
+    std::uint64_t duplicates = 0;           // dropped: sequenceNumber at or below the last accepted
+    std::uint64_t heartbeats = 0;           // sequenceNumber 0
+    std::uint64_t heartbeat_mismatches = 0; // a heartbeat's nextSeqNo != the next expected number
+    std::uint64_t resets = 0;               // packets whose first message is a SequenceReset
+    std::uint64_t reset_mismatches = 0;     // packet after a reset packet not (version + 1, 1)
+    std::uint64_t version_changes = 0;      // sequenceVersion changed without a reset packet
 };
 
-template <class Sequencer = AcceptAll>
+// What the last packet did to its channel's sequence.
+struct SequenceVerdict {
+    enum class Kind : std::uint8_t { next, gap, duplicate, heartbeat, reset, first, version_change };
+    Kind kind = Kind::first;
+    std::uint16_t gap_version = 0;   // for a gap: the first missing (version, sequenceNumber)
+    std::uint32_t gap_first = 0;
+    std::uint32_t gap_count = 0;
+};
+
+class Sequencer {
+public:
+    static constexpr std::uint16_t kMaxVersion = 65534;   // then back to 1 (LAYOUTS.md 3)
+
+    // Decides one packet from its header and its first message's header.
+    // True if it goes on to the walker; false for a duplicate.
+    bool accept(const PacketHeader& h, const std::uint8_t* payload, std::size_t len) noexcept {
+        using K = SequenceVerdict::Kind;
+        Channel& c = channels_[h.channel];
+        last_ = SequenceVerdict{};
+        if (h.seq_num == 0) {
+            // Heartbeat: not sequenced; its nextSeqNo is checked when its
+            // Sequence message is dispatched (check_heartbeat).
+            ++counters_.heartbeats;
+            last_.kind = K::heartbeat;
+            return true;
+        }
+        ++counters_.sequenced;
+        if (first_is_sequence_reset(payload, len)) {
+            // Accepted without checking its own sequenceNumber or version.
+            ++counters_.resets;
+            c.reset_pending = true;
+            last_.kind = K::reset;
+            return true;
+        }
+        if (c.reset_pending) {
+            c.reset_pending = false;
+            const std::uint16_t want = !c.seen ? h.seq_version
+                                     : (c.version >= kMaxVersion ? 1 : static_cast<std::uint16_t>(c.version + 1));
+            if (h.seq_version != want || h.seq_num != 1) ++counters_.reset_mismatches;
+            c.seen = true;
+            c.version = want;
+            c.next = 1;   // then the ordinary rules: a later number is a gap
+        }
+        if (!c.seen) {
+            // The first packet on a channel sets the expected number.
+            c.seen = true;
+            c.version = h.seq_version;
+            c.next = h.seq_num + 1;
+            last_.kind = K::first;
+            return true;
+        }
+        if (h.seq_version != c.version) {
+            ++counters_.version_changes;   // B3 changes version only through a SequenceReset
+            c.version = h.seq_version;
+            c.next = h.seq_num + 1;
+            last_.kind = K::version_change;
+            return true;
+        }
+        if (h.seq_num == c.next) {
+            ++c.next;
+            last_.kind = K::next;
+            return true;
+        }
+        if (h.seq_num > c.next) {
+            last_ = SequenceVerdict{K::gap, c.version, c.next, h.seq_num - c.next};
+            counters_.gaps += last_.gap_count;
+            ++counters_.gap_events;
+            c.next = h.seq_num + 1;
+            return true;
+        }
+        ++counters_.duplicates;   // at or below the last accepted: no dispatch, no event state
+        last_.kind = K::duplicate;
+        return false;
+    }
+
+    // A heartbeat's Sequence message: nextSeqNo must be the channel's next
+    // expected number (1 after a reset packet). Nothing to check before the
+    // channel's first sequenced packet.
+    void check_heartbeat(std::uint8_t channel, std::uint32_t next_seq_no) noexcept {
+        const Channel& c = channels_[channel];
+        if (!c.seen && !c.reset_pending) return;
+        const std::uint32_t expected = c.reset_pending ? 1 : c.next;
+        if (next_seq_no != expected) ++counters_.heartbeat_mismatches;
+    }
+
+    const SequenceVerdict& last() const noexcept { return last_; }
+    const SequencerCounters& counters() const noexcept { return counters_; }
+
+private:
+    struct Channel {
+        bool seen = false;            // a sequenced packet was accepted
+        bool reset_pending = false;   // a reset packet arrived; the next packet starts a version
+        std::uint16_t version = 0;
+        std::uint32_t next = 0;       // the next expected sequenceNumber
+    };
+    std::array<Channel, 256> channels_{};
+    SequencerCounters counters_;
+    SequenceVerdict last_;
+};
+
+template <class Seq = Sequencer>
 class PacketDecoder {
 public:
-    explicit PacketDecoder(Sequencer seq = Sequencer{}) : seq_(seq) {}
+    explicit PacketDecoder(Seq seq = Seq{}) : seq_(seq) {}
 
     // Parses one UDP payload. Returns true and fills out when the packet goes
     // on to the walker; false when it is discarded (short) or not accepted.
@@ -77,7 +198,7 @@ public:
             ++counters_.oversize_packets;
         }
         out = read_header(payload);
-        if (!seq_.accept(out)) {
+        if (!seq_.accept(out, payload, len)) {
             ++counters_.rejected_packets;
             return false;
         }
@@ -85,10 +206,11 @@ public:
     }
 
     const PacketCounters& counters() const noexcept { return counters_; }
-    Sequencer& sequencer() noexcept { return seq_; }
+    Seq& sequencer() noexcept { return seq_; }
+    const Seq& sequencer() const noexcept { return seq_; }
 
 private:
-    Sequencer seq_;
+    Seq seq_;
     PacketCounters counters_;
 };
 
