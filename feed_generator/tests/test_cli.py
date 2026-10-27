@@ -13,7 +13,7 @@ import pytest
 from b3gen import cli, config, layouts, main
 from layouts_md import MESSAGE_LAYOUTS
 import sbe_decoder
-from wire import decode_wire
+from wire import in_sequence_order, read_packets
 
 TINY = Path(__file__).parent / "fixtures" / "tiny_config.toml"
 FILES = {"feedA.pcap", "feedB.pcap", "intent.jsonl", "book_key.jsonl", "manifest.json",
@@ -67,7 +67,12 @@ def test_burst_set_spikes_more_often(built):
 
 
 def independent_rows(folder, securities):
-    for (channel, version, seq, index, sending), data in decode_wire(folder / "feedA.pcap"):
+    """Feed A's messages in sequence order (the reorder scenario's late
+    packets back in place), as intent.jsonl rows."""
+    wire = [((p["channel"], p["version"], p["seq"], index, p["sending"]), data)
+            for p in in_sequence_order(read_packets(folder / "feedA.pcap"))
+            for index, data in enumerate(p["messages"])]
+    for (channel, version, seq, index, sending), data in wire:
         header, fields = sbe_decoder.decode(data)
         if fields is None:
             yield {"templateId": header["templateId"], "sequenceNumber": seq, "index": index}
@@ -97,6 +102,11 @@ def test_every_pcap_decodes_to_its_intent_log(built):
                               (folder / "intent.jsonl").read_text().splitlines())
                   if (r["channel"], r["sequenceVersion"], r["sequenceNumber"]) not in missing]
         wire = list(independent_rows(folder, securities))
+        if manifest(folder)["reordered"]["A"]:
+            # A late packet also moves against the other channels: compare
+            # each channel's rows (stable sorts keep its order).
+            wire.sort(key=lambda r: r.get("channel", -1))
+            intent.sort(key=lambda r: r["channel"])
         assert len(wire) == len(intent), folder
         for got, row in zip(wire, intent):
             if row["templateId"] == main.UNKNOWN_TEMPLATE:
@@ -116,6 +126,8 @@ def test_every_manifest_lists_what_its_scenario_promises(built):
             assert m["missing"]["B"] and m["unreliable_books"]
         elif name == "gap_one":
             assert len(m["missing"]["B"]) == 1 and len(m["unreliable_books"]) == 1
+        elif name == "reorder":
+            assert m["reordered"]["A"] and m["reordered"]["B"] and not m["missing"]["A"]
         elif name == "idle":
             assert m["heartbeats"] > 0 and m["params"]["idle"]
         elif name in ("failover", "channel_reset", "instrument_reset", "weekly_start"):
@@ -139,6 +151,8 @@ def test_every_manifest_lists_what_its_scenario_promises(built):
             assert len(m["faults"]) == 6
         else:
             assert name == "clean" and not m["missing"]["A"] and not m["resets"]
+        if name != "reorder":
+            assert m["reordered"] == {"A": [], "B": []}, name
 
 
 def test_cli_and_library_give_the_same_bytes(built, tmp_path):
