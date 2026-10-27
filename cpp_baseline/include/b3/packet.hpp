@@ -76,6 +76,7 @@ struct SequencerCounters {
     std::uint64_t gaps = 0;                 // packets missing (sum of the jumps)
     std::uint64_t gap_events = 0;           // jumps
     std::uint64_t duplicates = 0;           // dropped: sequenceNumber at or below the last accepted
+    std::uint64_t late_after_gap = 0;       // dropped: inside a gap this channel recorded (not a duplicate)
     std::uint64_t heartbeats = 0;           // sequenceNumber 0
     std::uint64_t heartbeat_mismatches = 0; // a heartbeat's nextSeqNo != the next expected number
     std::uint64_t heartbeat_without_sequence = 0;  // a heartbeat whose first message is not a Sequence
@@ -86,7 +87,7 @@ struct SequencerCounters {
 
 // What the last packet did to its channel's sequence.
 struct SequenceVerdict {
-    enum class Kind : std::uint8_t { next, gap, duplicate, heartbeat, reset, first, version_change };
+    enum class Kind : std::uint8_t { next, gap, duplicate, late, heartbeat, reset, first, version_change };
     Kind kind = Kind::first;
     std::uint16_t gap_version = 0;   // for a gap: the first missing (version, sequenceNumber)
     std::uint32_t gap_first = 0;
@@ -96,6 +97,9 @@ struct SequenceVerdict {
 class Sequencer {
 public:
     static constexpr std::uint16_t kMaxVersion = 65534;   // then back to 1 (LAYOUTS.md 3)
+    // Gaps remembered per channel to tell a late packet from a duplicate. A
+    // late packet for an older gap than these is counted as a duplicate.
+    static constexpr std::size_t kRecordedGaps = 8;
 
     // Decides one packet from its header and its first message's header.
     // True if it goes on to the walker; false for a duplicate.
@@ -153,10 +157,21 @@ public:
             last_ = SequenceVerdict{K::gap, c.version, c.next, h.seq_num - c.next};
             counters_.gaps += last_.gap_count;
             ++counters_.gap_events;
+            c.gaps[c.next_gap] = Gap{c.version, c.next, h.seq_num - 1};
+            c.next_gap = (c.next_gap + 1) % kRecordedGaps;
             c.next = h.seq_num + 1;
             return true;
         }
-        ++counters_.duplicates;   // at or below the last accepted: no dispatch, no event state
+        // At or below the last accepted: dropped, no dispatch, no event state.
+        // Inside a gap this channel recorded, it is a late packet, not a duplicate.
+        for (const Gap& g : c.gaps) {
+            if (g.version == h.seq_version && g.first != 0 && g.first <= h.seq_num && h.seq_num <= g.last) {
+                ++counters_.late_after_gap;
+                last_.kind = K::late;
+                return false;
+            }
+        }
+        ++counters_.duplicates;
         last_.kind = K::duplicate;
         return false;
     }
@@ -175,11 +190,18 @@ public:
     const SequencerCounters& counters() const noexcept { return counters_; }
 
 private:
+    struct Gap {
+        std::uint16_t version = 0;
+        std::uint32_t first = 0;      // 0: an empty slot (sequenceNumber 0 is never sequenced)
+        std::uint32_t last = 0;
+    };
     struct Channel {
         bool seen = false;            // a sequenced packet was accepted
         bool reset_pending = false;   // a reset packet arrived; the next packet starts a version
         std::uint16_t version = 0;
         std::uint32_t next = 0;       // the next expected sequenceNumber
+        std::array<Gap, kRecordedGaps> gaps{};   // the last gaps recorded, a ring
+        std::size_t next_gap = 0;
     };
     std::array<Channel, 256> channels_{};
     SequencerCounters counters_;

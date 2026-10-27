@@ -272,7 +272,7 @@ On the first failure the decoder counts it by reason, keeps what it decoded befo
 
 ### 3.6.3 Sequencing
 
-Per channel, on every packet that passed the packet decoder (`cpp_baseline/include/b3/packet.hpp`, `Sequencer`), following `spec/LAYOUTS.md` 12.1 and `feed_generator/tests/book_builder.py`. A short datagram never gets here (3.6.1); a malformed packet does, so it uses up its sequence number. State is a fixed array of 256 channels, each: `seen`, `reset_pending`, `version` (u16), `next` (u32, the expected sequenceNumber).
+Per channel, on every packet that passed the packet decoder (`cpp_baseline/include/b3/packet.hpp`, `Sequencer`), following `spec/LAYOUTS.md` 12.1 and `feed_generator/tests/book_builder.py`. A short datagram never gets here (3.6.1); a malformed packet does, so it uses up its sequence number. State is a fixed array of 256 channels, each: `seen`, `reset_pending`, `version` (u16), `next` (u32, the expected sequenceNumber), and a ring of its last 8 gaps (version, first, last).
 
 **The decision is made once per packet, before any message is dispatched, from two things only**: the 16-byte packet header, and the header of the packet's first message. The first message makes a **reset packet** when it passes the complete message test (3.6.1) and its templateId is 1 (SequenceReset). Nothing else in the packet is looked at, so the RTL can decide while the first message header streams in.
 
@@ -285,7 +285,8 @@ Per channel, on every packet that passed the packet decoder (`cpp_baseline/inclu
 | sequenceVersion ≠ the channel's | Accepted, counted as a **version change**, and followed (sets version and `next`) |
 | sequenceNumber = `next` | Accepted |
 | sequenceNumber > `next` | Accepted. A **gap** of sequenceNumber − `next` packets is counted, starting at `next` (the stale point, 3.6.4) |
-| sequenceNumber < `next` | **Duplicate**: dropped. Not dispatched, so it touches no counter, event state, stale flag or book |
+| sequenceNumber < `next`, inside a gap this channel recorded | **Late** (`late_after_gap`): dropped like a duplicate (no dispatch, no state touched), but counted apart. The channel remembers its last 8 gaps (a fixed ring per channel, same sequenceVersion only); a late packet for an older gap is counted as a duplicate |
+| sequenceNumber < `next`, otherwise | **Duplicate**: dropped. Not dispatched, so it touches no counter, event state, stale flag or book |
 
 On dispatch (`cpp_baseline/include/b3/tracker.hpp`):
 
