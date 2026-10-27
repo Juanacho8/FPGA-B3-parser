@@ -54,6 +54,7 @@ its own (delayed) times.
 | `loss` | Feed A misses bursts of packets that Feed B carries |
 | `gap` | bursts of packets missing from both feeds |
 | `gap_one` | one packet missing from both feeds, holding messages for one instrument only |
+| `reorder` | packets arriving late on each feed (on their own), behind up to 3 later packets of their channel; nothing lost |
 | `idle` | a 3.5 s pause with heartbeats on both feeds |
 | `failover` | SequenceReset, sequenceVersion +1, every book rebuilt (EmptyBook + recovery orders) |
 | `channel_reset` | ChannelReset on one channel, then its books rebuilt |
@@ -128,19 +129,23 @@ every rebuild, and after a new session starts:
 | Key | Meaning |
 |---|---|
 | `scenario`, `seed`, `target_messages`, `messages`, `heartbeats` | what was built |
-| `params` | Feed B delay and jitter, loss/gap/idle parameters, the packets `gap_one` dropped |
+| `params` | Feed B delay and jitter, loss/gap/reorder/idle parameters, the packets `gap_one` dropped |
 | `missing.A`, `missing.B` | `[channel, sequenceVersion, sequenceNumber]` of each packet missing from that feed |
+| `reordered.A`, `reordered.B` | per late packet on that feed, in arrival order: `packet` (its key), `after` (the key of the packet it arrives right after) and `depth` (how many later packets of its channel arrive before it). Empty outside `reorder` |
 | `unreliable_books` | instrument → the first missing packet that breaks its book. Without a snapshot (v2), a client can't trust that book from there on. Only SecurityGroupPhase, ChannelReset and SequenceReset make a whole channel unreliable |
 | `resets` | per reset: kind, time, target, first and last placement, each channel's SequenceReset placement, each instrument's rebuild span, trade dates and bands for a new session |
 | `injections` | per edge/rare/schema action: kind, parameters, and the placements of its messages |
 | `faults` (malformed) | per fault: packet, kind, byte offset and the number of complete messages before it |
-| `expected_client_behavior` | for `schema` and `malformed`: what a correct client does |
+| `expected_client_behavior` | for `reorder`, `schema` and `malformed`: what a correct client does |
 
 **A/B arbitration:** take each `(channel, sequenceVersion, sequenceNumber)`
 from whichever feed has it first. In the `loss` scenario the merged feed is
 complete, so its book matches the book key everywhere. In `gap` it matches
 except for the instruments in `unreliable_books`, which match only up to
-their first missing packet.
+their first missing packet. In `reorder` each feed alone is complete: a
+client that holds packets above the expected sequenceNumber for `max_depth`
+packets per channel, and applies them in order, matches the book key
+everywhere.
 
 ### provenance.json
 

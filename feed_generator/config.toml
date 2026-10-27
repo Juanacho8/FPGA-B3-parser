@@ -145,5 +145,9 @@ mean_burst = 3.0                  # mean burst length (geometric), packets
 burst_rate = 0.001
 mean_burst = 2.0
 
+[reorder]                         # reorder scenario: late packets on each feed, all [invented]
+rate = 0.005                      # chance a packet arrives late
+max_depth = 3                     # ... behind 1..max_depth later packets of its channel
+
 [idle]                            # idle scenario
 duration_ns = 3_500_000_000       # [invented] long enough for 3 heartbeats per channel
