@@ -1,4 +1,4 @@
-"""Step 7a scenarios: Feed B, loss, gaps, idle.
+"""Step 7a scenarios: Feed B, loss, gaps, reorder, idle.
 
 Both pcaps are decoded independently (tests/wire.py, tests/sbe_decoder.py).
 The clean scenario's Feed A is the full feed: every other scenario runs the
@@ -17,14 +17,14 @@ from book_builder import BookBuilder
 from replay import check_unreliable
 from layouts_md import MESSAGE_LAYOUTS
 import sbe_decoder
-from wire import read_packets, top5
+from wire import in_sequence_order, read_packets, top5
 
 TIMESTAMPS = ("transactTime", "mDEntryTimestamp", "mDInsertTimestamp", "aggressorTime")
 
 
 from conftest import scenario_config as config
 
-FEED_SCENARIOS = ("clean", "loss", "gap", "gap_one", "idle")  # same session as clean
+FEED_SCENARIOS = ("clean", "loss", "gap", "gap_one", "reorder", "idle")  # same session as clean
 
 
 def sequenced(packets):
@@ -73,20 +73,28 @@ def test_feed_b_carries_the_same_bytes(runs, name):
 
 @pytest.mark.parametrize("name", main.SCENARIOS)
 def test_feed_b_is_never_earlier_and_keeps_channel_order(runs, name):
+    # Apart from the reorder scenario's late packets (tested below).
     result = runs[name]
     params = result.manifest["params"]["feed_b"]
+    late = late_keys(result, "A") | late_keys(result, "B")
     a, b = feeds(result)
     a_seq, b_seq = sequenced(a), sequenced(b)
-    for key in a_seq.keys() & b_seq.keys():
+    for key in a_seq.keys() & b_seq.keys() - late:
         assert b_seq[key]["time"] >= a_seq[key]["time"] + params["base_delay_ns"], key
     a_hb, b_hb = heartbeats(a), heartbeats(b)
     for channel in a_hb:
         for pa, pb in zip(a_hb[channel], b_hb[channel]):
             assert pb["time"] >= pa["time"] + params["base_delay_ns"]
     assert [p["time"] for p in b] == sorted(p["time"] for p in b)
+    late_b = late_keys(result, "B")
     for channel in {p["channel"] for p in b}:
-        order = [(p["version"], p["seq"]) for p in b if p["channel"] == channel and p["seq"]]
+        order = [(p["version"], p["seq"]) for p in b if p["channel"] == channel and p["seq"]
+                 and (channel, p["version"], p["seq"]) not in late_b]
         assert order == sorted(order)
+
+
+def late_keys(result, feed):
+    return {tuple(r["packet"]) for r in result.manifest["reordered"][feed]}
 
 
 def test_feed_b_has_its_own_multicast_groups(runs):
@@ -209,14 +217,14 @@ def merged(a, b):
     return [by_key[k] for k in sorted(by_key)]
 
 
-@pytest.mark.parametrize("name", ["loss", "gap", "gap_one"])
+@pytest.mark.parametrize("name", ["loss", "gap", "gap_one", "reorder"])
 def test_merging_a_and_b_reproduces_the_feed(runs, name):
     full = sequenced(read_packets(runs["clean"].run.pcap_path))
     gaps = {tuple(k) for k in runs[name].manifest["missing"]["B"]}
     got = merged(*feeds(runs[name]))
     want = [full[k] for k in sorted(full) if k not in gaps]
     assert [p["payload"] for p in got] == [p["payload"] for p in want]
-    if name == "loss":
+    if name in ("loss", "reorder"):
         assert len(got) == len(full)
 
 
@@ -369,6 +377,140 @@ def test_news_and_unknown_templates_never_make_a_book_unreliable():
 
 
 # ---------------------------------------------------------------------------
+# Reorder
+# ---------------------------------------------------------------------------
+
+def late_from_the_wire(packets):
+    """[{"packet", "after", "depth"}] read from arrival order alone: a packet
+    is late when a higher sequence number of its channel arrived before it.
+    after is the packet just before it on its channel, depth how many
+    packets of its channel overtook it."""
+    seen, previous, out = {}, {}, []
+    for p in packets:
+        if not p["seq"]:
+            continue
+        channel, key = p["channel"], (p["version"], p["seq"])
+        ahead = [k for k in seen.get(channel, ()) if k > key]
+        if ahead:
+            out.append({"packet": [channel, *key], "after": [channel, *previous[channel]],
+                        "depth": len(ahead)})
+        seen.setdefault(channel, set()).add(key)
+        previous[channel] = key
+    return out
+
+
+@pytest.mark.parametrize("feed", ["A", "B"])
+def test_late_packets_match_the_manifest(runs, feed):
+    result = runs["reorder"]
+    packets = read_packets(result.run.pcap_path if feed == "A" else result.feed_b_path)
+    assert late_from_the_wire(packets) == result.manifest["reordered"][feed]
+
+
+@pytest.mark.parametrize("name", [n for n in main.SCENARIOS if n != "reorder"])
+def test_only_the_reorder_scenario_reorders(runs, name):
+    for packets in feeds(runs[name]):
+        assert late_from_the_wire(packets) == []
+
+
+def test_reorder_is_bounded_spread_and_independent_per_feed(runs):
+    m = runs["reorder"].manifest
+    max_depth = m["params"]["reorder"]["max_depth"]
+    for feed in ("A", "B"):
+        late = m["reordered"][feed]
+        depths = [r["depth"] for r in late]
+        assert len(late) >= 5 and set(depths) == set(range(1, max_depth + 1)), (feed, depths)
+        assert len({r["packet"][0] for r in late}) > 1, "late packets on one channel only"
+        for r in late:
+            channel, version, seq = r["packet"]
+            assert r["after"] == [channel, version, seq + r["depth"]], r
+    assert late_keys(runs["reorder"], "A") != late_keys(runs["reorder"], "B")
+
+
+def test_late_packets_take_the_time_of_the_packet_they_follow(runs):
+    result = runs["reorder"]
+    for feed, path in (("A", result.run.pcap_path), ("B", result.feed_b_path)):
+        packets = read_packets(path)
+        assert [p["time"] for p in packets] == sorted(p["time"] for p in packets)
+        times = {(p["channel"], p["version"], p["seq"]): p["time"] for p in packets}
+        for r in result.manifest["reordered"][feed]:
+            assert times[tuple(r["packet"])] == times[tuple(r["after"])], (feed, r)
+    # Only the arrival changes: the clean run's bytes, sendingTime included.
+    clean = sequenced(read_packets(runs["clean"].run.pcap_path))
+    a = sequenced(feeds(result)[0])
+    assert {k: p["payload"] for k, p in a.items()} == {k: p["payload"] for k, p in clean.items()}
+
+
+@pytest.mark.parametrize("feed", ["A", "B"])
+def test_reordered_feed_in_sequence_order_matches_the_key(runs, feed):
+    # A client with a reorder buffer loses nothing: no book is unreliable.
+    result = runs["reorder"]
+    assert result.manifest["unreliable_books"] == {}
+    packets = read_packets(result.run.pcap_path if feed == "A" else result.feed_b_path)
+    checks = replay(result, sorted(sequenced(in_sequence_order(packets)).values(),
+                                   key=lambda p: (p["channel"], p["version"], p["seq"])))
+    rows = len(Path(result.run.book_key_path).read_text().splitlines())
+    assert all(n == rows for n in checks.values()), (checks, rows)
+
+
+def test_reordered_feed_in_arrival_order_breaks_strict_sequencing(runs):
+    # The reorder is real: applying packets as they arrive, the first late
+    # packet's channel sees a jump.
+    builder = BookBuilder()
+    with pytest.raises(AssertionError):
+        for p in read_packets(runs["reorder"].run.pcap_path):
+            builder.apply_packet(p["channel"], p["version"], p["seq"], p["messages"])
+
+
+def test_reorder_has_its_own_rngs(tmp_path):
+    # Feed B timing and the loss parameters must not move which packets are late.
+    base = main.run_scenario(config(tmp_path / "a"), "reorder").manifest["reordered"]
+    other = main.run_scenario(config(tmp_path / "b", feed_b=scenarios.FeedBParams(5_000, 77_000),
+                                     loss=scenarios.BurstParams(0.5, 9)),
+                              "reorder").manifest["reordered"]
+    assert other == base  # B too: jitter never reorders a channel, so its walk is the same
+
+
+def _entries(keys):
+    return [(i, key[0], bytes([i])) for i, key in enumerate(keys)], list(keys)
+
+
+def test_reorder_never_crosses_a_version_change_or_overlaps():
+    import random
+    keys = [(68, 1, s) for s in range(1, 6)] + [(68, 2, s) for s in range(1, 6)] + \
+        [(70, 1, s) for s in range(1, 30)]
+    entries, keys = _entries(keys)
+    for seed in range(50):
+        out, moves = scenarios.reorder(entries, keys, scenarios.ReorderParams(0.5, 3),
+                                       random.Random(seed))
+        assert [e[0] for e in out] == sorted(e[0] for e in out)  # times never go back
+        assert sorted(e[2] for e in out) == sorted(e[2] for e in entries)  # nothing lost
+        late = [tuple(m["packet"]) for m in moves]
+        spans = []
+        for m in moves:
+            channel, version, seq = m["packet"]
+            assert m["after"] == [channel, version, seq + m["depth"]]  # same version
+            assert 1 <= m["depth"] <= 3
+            spans.append((channel, version, seq, seq + m["depth"]))
+        for i, (c1, v1, lo1, hi1) in enumerate(spans):
+            for c2, v2, lo2, hi2 in spans[i + 1:]:
+                assert (c1, v1) != (c2, v2) or hi1 < lo2 or hi2 < lo1, (spans, seed)
+        assert len(late) == len(set(late))
+
+
+def test_reorder_leaves_heartbeats_in_place():
+    import random
+    keys = [(68, 1, 1), (68, 1, 0), (68, 1, 2), (68, 1, 3), (68, 1, 0), (68, 1, 4)]
+    entries, keys = _entries(keys)
+    out, moves = scenarios.reorder(entries, keys, scenarios.ReorderParams(1.0, 1),
+                                   random.Random(0))
+    # Beats (entries 1 and 4) never move and never count towards a depth.
+    assert [e[2][0] for e in out] == [1, 2, 0, 4, 5, 3]
+    assert [e[0] for e in out] == [1, 2, 2, 4, 5, 5]
+    assert moves == [{"packet": [68, 1, 1], "after": [68, 1, 2], "depth": 1},
+                     {"packet": [68, 1, 3], "after": [68, 1, 4], "depth": 1}]
+
+
+# ---------------------------------------------------------------------------
 # Idle
 # ---------------------------------------------------------------------------
 
@@ -440,7 +582,7 @@ def _order(row):
 # ---------------------------------------------------------------------------
 
 def test_scenarios_are_deterministic(tmp_path, runs):
-    for name in ("loss", "gap", "idle"):
+    for name in ("loss", "gap", "reorder", "idle"):
         again = main.run_scenario(config(tmp_path), name)
         for attr in ("pcap_path", "intent_path", "book_key_path"):
             assert Path(getattr(again.run, attr)).read_bytes() == \
