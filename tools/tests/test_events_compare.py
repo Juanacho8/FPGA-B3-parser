@@ -31,7 +31,8 @@ def fake_cpp(tmp_path, corrupt_record=None):
     script.write_text(f"""#!{sys.executable}
 import json, subprocess, sys
 from pathlib import Path
-out, pcap = sys.argv[2], Path(sys.argv[3])
+args = sys.argv[1:]
+out, pcap = args[args.index("--events") + 1], Path(args[-1])
 subprocess.run([sys.executable, {str(TOOLS_DIR / 'intent_to_events.py')!r}, str(pcap.parent / 'intent.jsonl'),
                 "-o", out], check=True, stdout=subprocess.DEVNULL)
 data = bytearray(Path(out).read_bytes())

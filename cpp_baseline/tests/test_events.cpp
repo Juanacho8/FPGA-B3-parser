@@ -28,6 +28,8 @@
 #include <vector>
 
 #include "b3/event_sink.hpp"
+#include "b3/instruments.hpp"
+#include "b3/tracker.hpp"
 #include "b3/packet.hpp"
 #include "b3/records.hpp"
 #include "b3/walker.hpp"
@@ -398,4 +400,64 @@ TEST_CASE("DESIGN.md example: events.bin header of the default build") {
         for (std::size_t i = 16; i < 24; ++i) want[i] = got[i];
     }
     CHECK(got == want);
+}
+
+namespace {
+// The tracker first, then port 1, as b3_decode runs them.
+struct TrackerThenEvents {
+    b3::tracker::Tracker& t;
+    b3::event_sink::EventSink& e;
+    template <std::uint16_t Id>
+    void on(const b3::walker::MessageView& m) {
+        t.on<Id>(m);
+        e.on<Id>(m);
+    }
+    void on_unknown(const b3::walker::MessageView& m) {
+        t.on_unknown(m);
+        e.on_unknown(m);
+    }
+};
+}  // namespace
+
+TEST_CASE("flag bit 3: a table instrument that is not CLEAN; channel-wide records never") {
+    const auto table = b3::instruments::Table::parse("7 68\n");
+    std::vector<EventRecord> buf(16);
+    b3::packet::PacketDecoder<> decoder;
+    b3::tracker::Tracker tracker(table, decoder.sequencer());
+    b3::event_sink::EventSink events(buf.data(), buf.size(), &tracker);
+    TrackerThenEvents sink{tracker, events};
+    b3::walker::Walker walker;
+    std::vector<Bytes> keep;
+    auto feed = [&](Bytes d) {
+        keep.push_back(std::move(d));
+        const Bytes& p = keep.back();
+        b3::packet::PacketHeader h;
+        if (!decoder.decode(p.data(), p.size(), h)) return;
+        const auto& v = decoder.sequencer().last();
+        if (v.kind == b3::packet::SequenceVerdict::Kind::gap) tracker.on_loss({h.channel, v.gap_version, v.gap_first});
+        walker.walk(h, p.data(), p.size(), sink);
+    };
+    Bytes empty(20, 0);
+    put(empty, 0, 7, 8);
+    Bytes reset(12, 0);
+    put(reset, 0, 0x80, 1);
+    feed(packet(68, 1, {message(50, order(0x80, 0, '0', 1, 1, 0, 1, 1, 1, kNull64))}));   // clean
+    feed(packet(68, 3, {message(50, order(0x80, 0, '0', 1, 1, 0, 2, 2, 1, kNull64)),      // gap: stale
+                        message(1, {})}));
+    feed(packet(68, 4, {message(9, empty)}));                                               // EmptyBook: clean again
+    feed(packet(68, 5, {message(50, order(0x80, 0, '0', 1, 1, 0, 3, 1, 1, kNull64)),
+                        message(50, order(0x00, 0, '0', 1, 1, 0, 4, 5, 1, kNull64)),      // rptSeq jump: stale
+                        message(11, reset)}));                                              // ChannelReset: clears
+    feed(packet(68, 6, {message(50, order(0x80, 0, '0', 1, 1, 0, 5, 6, 1, kNull64))}));   // CLEAN after the ChannelReset
+    const std::vector<EventRecord> rs(buf.begin(), buf.begin() + events.size());
+    REQUIRE(rs.size() == 8);
+    CHECK((rs[0].flags & 0x08) == 0);
+    CHECK((rs[1].flags & 0x08) == 0x08);   // the packet revealing the gap is stale
+    CHECK((rs[2].flags & 0x08) == 0);      // SEQ_RESET: no instrument
+    CHECK((rs[3].flags & 0x08) == 0);      // CLEAR_BOOK: its own EmptyBook made it CLEAN
+    CHECK((rs[4].flags & 0x08) == 0);
+    CHECK((rs[5].flags & 0x08) == 0x08);   // the jump: stale from this message
+    CHECK(rs[6].kind == K::CLEAR_CHANNEL);
+    CHECK((rs[6].flags & 0x08) == 0);      // channel-wide
+    CHECK((rs[7].flags & 0x08) == 0);      // after the ChannelReset
 }

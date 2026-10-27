@@ -16,6 +16,9 @@
 //     * SequenceReset or ChannelReset: its own record, then the channel's
 //       event state is cleared (IDLE), with nothing else emitted
 //   Duplicates and discarded tails never reach a sink, so they produce nothing.
+//   With a tracker, a record whose instrument is a table instrument that is
+//   not CLEAN (today: STALE), in the state the tracker left after this
+//   message, carries flag bit 3 (DESIGN.md 3.3). Run the tracker first.
 //   Records go into a buffer allocated by the caller before the loop, with a
 //   capacity from a counting pass at load time; a record past it is counted
 //   (overflow), never stored, and the buffer never grows.
@@ -34,6 +37,7 @@
 #include "b3/decode.hpp"
 #include "b3/fields.hpp"
 #include "b3/records.hpp"
+#include "b3/tracker.hpp"
 #include "b3/walker.hpp"
 
 namespace b3::event_sink {
@@ -219,7 +223,8 @@ struct EventCounters {
 
 class EventSink {
 public:
-    EventSink(R::EventRecord* buffer, std::size_t capacity) noexcept : buf_(buffer), cap_(capacity) {}
+    EventSink(R::EventRecord* buffer, std::size_t capacity, const tracker::Tracker* tracker = nullptr) noexcept
+        : buf_(buffer), cap_(capacity), tracker_(tracker) {}
 
     template <std::uint16_t Id>
     void on(const walker::MessageView& m) noexcept {
@@ -249,7 +254,7 @@ public:
         }
         if (on_port1) {
             identity(m, r);
-            r.flags = has_mei ? flags_of(mei) : 0;
+            r.flags = static_cast<std::uint8_t>((has_mei ? flags_of(mei) : 0) | not_clean(r.instrument_id));
         }
         if (!has_mei) {
             if constexpr (Id == L::ExecutionSummary_55::template_id) open_[ch] = true;   // first of an event
@@ -296,6 +301,15 @@ private:
         r.venue_msg_type = static_cast<std::uint8_t>(m.template_id);   // < 256: walker.hpp static_assert
     }
 
+    // Bit 3 for a record of a table instrument that is not CLEAN. Records
+    // with no instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET,
+    // END_OF_EVENT) have instrument_id 0 and get 0.
+    std::uint8_t not_clean(std::uint64_t instrument_id) const noexcept {
+        if (tracker_ == nullptr || instrument_id == 0) return 0;
+        const std::size_t slot = tracker_->table().find(instrument_id);
+        return slot != instruments::Table::kNotFound && tracker_->state(slot).stale ? R::flag::BOOK_NOT_CLEAN : 0;
+    }
+
     void emit(const R::EventRecord& r) noexcept {
         if (count_ < cap_) {
             buf_[count_++] = r;
@@ -307,6 +321,7 @@ private:
 
     R::EventRecord* buf_;
     std::size_t cap_;
+    const tracker::Tracker* tracker_;
     std::size_t count_ = 0;
     std::array<bool, 256> open_{};
     EventCounters counters_;

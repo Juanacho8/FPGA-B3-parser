@@ -255,3 +255,23 @@ def test_every_generated_set(needs_data, tmp_path, feed):
         header, events = c.read_events(out.read_bytes())
         assert events, name
         assert all(1 <= e.kind <= 12 for e in events), name
+
+
+# ---- Flag bit 3: book not clean (DESIGN.md 3.3) ----
+def test_book_not_clean_bit_follows_the_replay():
+    import b3replay
+    manifest = {"missing": {"A": [[68, 1, 2]], "B": []}}
+    table = [(7, 68)]
+    rows = [order(0, seq=1), order(0, seq=3), row(1, {}, seq=4),
+            row(9, {"securityID": 7, "matchEventIndicator": 0x20, "mDEntryTimestamp": 1}, seq=5),
+            order(0, seq=6)]
+    for r in rows:
+        if r["templateId"] == 50:
+            r["fields"].update(securityID=7, rptSeq=r["sequenceNumber"])
+    rows[-1]["fields"]["rptSeq"] = 1                       # restarts after the EmptyBook
+    out = list(ie.convert(rows, b3replay.Replay(table, manifest, "A")))
+    assert [(e.kind, e.flags & c.FLAG_BOOK_NOT_CLEAN) for e in out] == [
+        (c.ADD, 0), (c.ADD, c.FLAG_BOOK_NOT_CLEAN),         # after the gap at 2
+        (c.SEQ_RESET, 0),                                   # no instrument
+        (c.CLEAR_BOOK, 0), (c.ADD, 0)]                      # rebuilt
+    assert not any(e.flags & c.FLAG_BOOK_NOT_CLEAN for e in ie.convert(rows))   # no replay: never
