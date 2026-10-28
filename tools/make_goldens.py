@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""make_goldens: port 1 golden files for the RTL, one folder per generator set.
+"""make_goldens: port 1 and port 2 golden files for the RTL, one folder per generator set.
 
 What it does:
   For every generator set under a data folder, writes DATA/golden/<set>/:
@@ -8,9 +8,16 @@ What it does:
                          (tools/b3feed.py reads it from the pcap)
     cpp_feedA.bin        b3_decode --events on feedA.pcap
     cpp_feedB.bin        b3_decode --events on feedB.pcap
+    expected_book_n<N>_k<K>_feed<F>.bin
+                         port 2, tools/expected_book.py's capped book with
+                         that N and K, per --book-cpp build (make goldens:
+                         K = 16 and K = 32 at N = 5)
+    cpp_book_n<N>_k<K>_feed<F>.bin
+                         b3_decode --book of that build
     provenance.json      repo commit, the set's generator provenance (its
                          SHA-256 and recorded generator commit), the build
-                         parameters, and the SHA-256 of every file above
+                         parameters (port 1's, and each book's N, K and STATUS
+                         interval), and the SHA-256 of every file above
   It refuses to write a set whose C++ files differ from the expected ones
   (make events-compare says where). A set in b3intent.EXPECTED_FAILURES (the
   reorder scenario, until the reorder window exists) keeps only
@@ -23,7 +30,8 @@ What it must not do:
   Import b3gen, or write a golden that does not match its answer key.
 
 Usage:
-  python3 tools/make_goldens.py --cpp cpp_baseline/build/release/b3_decode DATA_DIR
+  python3 tools/make_goldens.py --cpp cpp_baseline/build/release/b3_decode \
+      [--book-cpp cpp_baseline/build/k16/b3_decode ...] DATA_DIR
 """
 
 import argparse
@@ -40,8 +48,8 @@ import b3contract as c   # noqa: E402
 import events_compare     # noqa: E402  (the same instrument table as events-compare)
 import b3intent           # noqa: E402
 import b3replay           # noqa: E402
+import expected_book      # noqa: E402
 import intent_to_events   # noqa: E402
-import b3intent          # noqa: E402
 
 
 def sha256(path):
@@ -56,10 +64,45 @@ def repo_commit():
     return {"commit": commit, "dirty": dirty}
 
 
+def book_goldens(builds, folder, out, table, files):
+    """(ok, {"n<N>_k<K>": parameters}): port 2 goldens of each capped build,
+    expected and C++ for both feeds, added to files. ok is False when a C++
+    file differs from its expected one."""
+    books = {}
+    for binary in builds:
+        for feed in ("A", "B"):
+            pcap = folder / f"feed{feed}.pcap"
+            if not pcap.is_file():
+                continue
+            tmp = out / "cpp_book.tmp"
+            subprocess.run([str(binary), "--instruments", events_compare.table_path(), "--book", str(tmp),
+                            str(pcap)], check=True, stdout=subprocess.DEVNULL)
+            header = c.FileHeader.unpack(tmp.read_bytes())
+            n, k = header.published_depth, header.tracked_depth
+            if k == 0:
+                tmp.unlink()
+                raise SystemExit(f"error: {binary} is an uncapped build; --book-cpp takes capped builds")
+            tag = f"n{n}_k{k}"
+            port2, _ = expected_book.run(folder, feed, table, n=n, k=k, status_interval=header.status_interval)
+            want = out / f"expected_book_{tag}_feed{feed}.bin"
+            want.write_bytes(expected_book.book_bytes(port2, header.status_interval))
+            got = out / f"cpp_book_{tag}_feed{feed}.bin"
+            tmp.replace(got)
+            files[want.name], files[got.name] = want, got
+            books[tag] = {"published_depth": n, "tracked_depth": k, "book": "capped",
+                          "status_interval_ns": header.status_interval,
+                          "max_instruments": header.max_instruments}
+            if want.read_bytes() != got.read_bytes():
+                return False, books
+    return True, books
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("data", help="generator output folder (make data)")
     ap.add_argument("--cpp", required=True, help="path to b3_decode")
+    ap.add_argument("--book-cpp", action="append", default=[],
+                    help="b3_decode of a capped book build: port 2 goldens for its N and K (repeatable)")
     args = ap.parse_args(argv)
 
     root = Path(args.data)
@@ -108,6 +151,15 @@ def main(argv=None):
         matches = all(f"cpp_feed{f}.bin" in files and f"expected_feed{f}.bin" in files and
                       files[f"cpp_feed{f}.bin"].read_bytes() == files[f"expected_feed{f}.bin"].read_bytes()
                       for f in ("A", "B") if (folder / f"feed{f}.pcap").is_file())
+        books = {}
+        if not reason:
+            ok, books = book_goldens(args.book_cpp, folder, out, table, files)
+            if not ok:
+                print(f"FAIL {name}: a cpp_book_*.bin differs from its expected file (run make book-compare)")
+                for f in files.values():
+                    f.unlink()
+                failed += 1
+                continue
         if reason and matches:
             print(f"XPASS {name}: cpp_feedA.bin matches, but is expected to fail ({reason}); "
                   f"remove it from b3intent.EXPECTED_FAILURES")
@@ -138,10 +190,12 @@ def main(argv=None):
             "build": {"published_depth": header.published_depth, "tracked_depth": header.tracked_depth,
                       "max_instruments": header.max_instruments,
                       "book": "uncapped" if header.tracked_depth == 0 else "capped"},
+            "books": books,
             "files": {n: {"sha256": sha256(p), "bytes": p.stat().st_size} for n, p in sorted(files.items())},
         }
         if reason:
-            provenance["expected_failure"] = f"{reason}: no cpp_feed*.bin, the C++ does not match yet"
+            provenance["expected_failure"] = (f"{reason}: no cpp_feed*.bin and no book goldens, the C++ does not "
+                                              f"match yet")
         (out / "provenance.json").write_text(json.dumps(provenance, indent=1) + "\n")
         print(f"{'XFAIL' if reason else 'OK'} {name}: {', '.join(sorted(files))}"
               + (f" ({reason})" if reason else ""))

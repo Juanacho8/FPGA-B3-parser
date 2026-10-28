@@ -27,14 +27,16 @@
 //   buffer sized before the loop by a counting pass over the capture.
 //   --book FILE writes port 2 (DESIGN.md 4): the file header, then book
 //   records computed from port 1 and the tracker's state changes, with the
-//   uncapped book (book_uncapped.hpp; the capped book is step 8b, so
-//   --book needs the B3_BOOK=uncapped build). --book-levels N (default 1024)
-//   is its capacity per side; --status-interval-ns N (default 100 ms) the
+//   build's book: capped (book_capped.hpp, K slots per side, the RTL's
+//   algorithm) or, in the B3_BOOK=uncapped build, uncapped
+//   (book_uncapped.hpp; --book-levels N, default 1024, is its capacity per
+//   side). --status-interval-ns N (default 100 ms) is the
 //   STATUS interval. --silence-ns N (default 3 s; 0 off) is the silence
 //   rule's limit (DESIGN.md 3.6.4).
 //   --checkpoints FILE --checkpoint-out FILE: after each message whose
 //   placement ("channel version seq index" per line) is listed, every table
-//   instrument's state and top N levels, one line each, for the book-key
+//   instrument's state, depth-incomplete flags and top N levels, one line
+//   each, for the book-key
 //   check (tools/book_compare.py). Debug only.
 //   --counters FILE writes every counter as one JSON object, with each
 //   instrument's first stale point and the build parameters, for
@@ -49,6 +51,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <type_traits>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -56,6 +59,7 @@
 #include "b3/decode_writer.hpp"
 #include "b3/event_sink.hpp"
 #include "b3/records.hpp"
+#include "b3/book_capped.hpp"
 #include "b3/book_params.hpp"
 #include "b3/book_sink.hpp"
 #include "b3/book_uncapped.hpp"
@@ -84,12 +88,12 @@ struct DecodeSink {
     b3::decode_writer::DecodeWriter* writer = nullptr;
     b3::tracker::Tracker* tracker = nullptr;
     b3::event_sink::EventSink* events = nullptr;
-    b3::book::BookSink<>* book = nullptr;
+    b3::book::BookSink<>* book = nullptr;   // the build's book (b3::book::BuildBook)
     // --checkpoints: placements to dump the books at, and the dump.
     const std::unordered_set<std::uint64_t>* checkpoints = nullptr;
     std::string* checkpoint_out = nullptr;
     const b3::instruments::Table* table = nullptr;
-    const b3::book::UncappedBook* levels = nullptr;
+    const b3::book::BuildBook* levels = nullptr;
 
     static std::uint64_t placement(std::uint8_t ch, std::uint16_t ver, std::uint32_t seq, std::uint8_t index) {
         return (std::uint64_t{ch} << 56) | (std::uint64_t{ver} << 40) | (std::uint64_t{seq} << 8) | index;
@@ -115,7 +119,9 @@ struct DecodeSink {
             *checkpoint_out += std::to_string(m.packet.channel) + " " + std::to_string(m.packet.seq_version) + " " +
                                std::to_string(m.packet.seq_num) + " " + std::to_string(m.msg_index) + " " +
                                std::to_string((*table)[slot].security_id) + " " +
-                               (tracker->state(slot).stale ? "STALE" : "CLEAN");
+                               (tracker->state(slot).stale ? "STALE" : "CLEAN") + " " +
+                               std::to_string((levels->depth_incomplete(slot, b3::book::Side::bid) ? 1 : 0) |
+                                              (levels->depth_incomplete(slot, b3::book::Side::offer) ? 2 : 0));
             for (const auto side : {b3::book::Side::bid, b3::book::Side::offer}) {
                 const std::size_t n = levels->top(slot, side, lv, b3::kPublishedDepth);
                 *checkpoint_out += " " + std::to_string(n);
@@ -165,6 +171,42 @@ void counter_map(std::FILE* f, const char* key, const std::string_view* names, c
                      static_cast<ull>(values[i]));
     }
     std::fprintf(f, "}");
+}
+
+// The build's book, allocated once: the uncapped book's capacity per side
+// is a run-time value, the capped book's K slots a build parameter.
+template <class Book>
+std::unique_ptr<Book> make_book(std::size_t levels_per_side) {
+    if constexpr (std::is_same_v<Book, b3::book::UncappedBook>) {
+        return std::make_unique<Book>(b3::kMaxInstruments, levels_per_side);
+    } else {
+        return std::make_unique<Book>();
+    }
+}
+
+// The book block's shape counters: capacity and most levels (uncapped), or
+// per side the evidence for K (capped; brief section 5, "Measuring K").
+template <class Book>
+void print_book_shape(const Book& book) {
+    if constexpr (std::is_same_v<Book, b3::book::UncappedBook>) {
+        std::printf(",\"levels_per_side\":%zu,\"max_depth\":{\"bid\":%zu,\"offer\":%zu}",
+                    book.levels_per_side(), book.max_depth(b3::book::Side::bid),
+                    book.max_depth(b3::book::Side::offer));
+    } else {
+        std::printf(",\"sides\":{");
+        for (const auto side : {b3::book::Side::bid, b3::book::Side::offer}) {
+            const auto& st = book.stats(side);
+            std::printf("%s\"%s\":{\"truncations\":%llu,\"levels_dropped\":%llu,\"ignored\":%llu,"
+                        "\"depth_incomplete\":%llu,\"depth_incomplete_ns\":%llu,"
+                        "\"depth_incomplete_max_ns\":%llu,\"max_valid\":%llu}",
+                        side == b3::book::Side::bid ? "" : ",", side == b3::book::Side::bid ? "bid" : "offer",
+                        static_cast<ull>(st.truncations), static_cast<ull>(st.levels_dropped),
+                        static_cast<ull>(st.ignored), static_cast<ull>(st.depth_incomplete),
+                        static_cast<ull>(st.depth_incomplete_ns), static_cast<ull>(st.depth_incomplete_max_ns),
+                        static_cast<ull>(st.max_valid));
+        }
+        std::printf("}");
+    }
 }
 
 // Every counter of a run, as one JSON object (DESIGN.md 3.6.4).
@@ -323,11 +365,6 @@ int main(int argc, char** argv) {
         // Port 1 buffer: at most one record per complete message (a record or
         // a marker, never both), counted once over the loaded capture.
         const bool want_book = !book_path.empty() || !checkpoints_path.empty();
-        if (want_book && b3::kBookMode != b3::BookMode::Uncapped) {
-            std::fprintf(stderr, "b3_decode: --book and --checkpoints need the uncapped build (B3_BOOK=uncapped); "
-                                 "the capped book is step 8b\n");
-            return 2;
-        }
         std::vector<b3::records::EventRecord> event_buffer;
         std::unique_ptr<b3::event_sink::EventSink> event_sink;
         if (!events_path.empty() || want_book) {
@@ -351,17 +388,17 @@ int main(int argc, char** argv) {
             sink->events = event_sink.get();
         }
 
-        // Port 2: the uncapped book and a record buffer, both allocated here.
+        // Port 2: the book and a record buffer, both allocated here.
         // Capacity: one record per message, plus the STATUS ticks and a margin
         // for state changes; past it, records are counted, never stored.
-        std::unique_ptr<b3::book::UncappedBook> levels;
+        std::unique_ptr<b3::book::BuildBook> levels;
         std::unique_ptr<std::uint8_t[]> book_storage;
         std::unique_ptr<b3::book::BookSink<>> book_sink;
         std::size_t book_capacity = 0;
         std::unordered_set<std::uint64_t> checkpoints;
         std::string checkpoint_out;
         if (want_book) {
-            levels = std::make_unique<b3::book::UncappedBook>(b3::kMaxInstruments, book_levels);
+            levels = make_book<b3::book::BuildBook>(book_levels);
             const auto& pk = capture.packets();
             const std::uint64_t span = pk.empty() ? 0 : pk.back().timestamp_ns - pk.front().timestamp_ns;
             book_capacity = event_buffer.size() + (status_interval ? span / status_interval + 1 : 0) +
@@ -407,6 +444,8 @@ int main(int argc, char** argv) {
                 if (book_sink) book_sink->on_transitions(tracker->transitions(), tracker->transition_count());
             }
         }
+
+        if (levels && !capture.packets().empty()) levels->finish(capture.packets().back().timestamp_ns);
 
         // ---- Output ----
         const auto& pc = decoder.counters();
@@ -470,12 +509,17 @@ int main(int argc, char** argv) {
             std::printf(",\"book\":{\"records\":%zu,\"book_updates\":%llu,\"state_changes\":%llu,\"statuses\":%llu,"
                         "\"capacity\":%zu,\"overflow\":%llu,\"untracked_records\":%llu,\"level_overflow\":%llu,"
                         "\"consistency_errors\":%llu,\"consistency_errors_stale\":%llu,\"null_price_orders\":%llu,"
-                        "\"levels_per_side\":%zu,\"state_bytes\":%zu}",
+                        "\"book_mode\":\"%s\",\"published_depth\":%zu,\"tracked_depth\":%zu,\"state_bytes\":%zu",
                         book_sink->size(), static_cast<ull>(bc.book_updates), static_cast<ull>(bc.state_changes),
                         static_cast<ull>(bc.statuses), book_capacity, static_cast<ull>(bc.overflow),
                         static_cast<ull>(bc.untracked_records), static_cast<ull>(lc.level_overflow),
                         static_cast<ull>(lc.consistency_errors), static_cast<ull>(lc.consistency_errors_stale),
-                        static_cast<ull>(lc.null_price_orders), levels->levels_per_side(), levels->state_bytes());
+                        static_cast<ull>(lc.null_price_orders),
+                        b3::kBookMode == b3::BookMode::Capped ? "capped" : "uncapped", b3::kPublishedDepth,
+                        b3::kBookMode == b3::BookMode::Capped ? b3::kTrackedDepth : std::size_t{0},
+                        levels->state_bytes());
+            print_book_shape(*levels);
+            std::printf("}");
         }
         std::printf("}\n");
 

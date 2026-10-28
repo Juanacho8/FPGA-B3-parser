@@ -465,8 +465,24 @@ Levels: bid level i (0 = best) at offset 48 + 24·i, offer level i at 48 + 24·(
 
 ### 4.2 Capped and uncapped books
 
-* **Capped** (`B3_BOOK=capped`, the RTL's algorithm): K slots per side, with the truncation and depth-incomplete rules of brief section 5. The file header records K. Step 8b.
-* **Uncapped** (`B3_BOOK=uncapped`, software only, step 8a, 4.5): no tracked-depth limit. Same record format. The file header records **K = 0**, and DEPTH_INCOMPLETE_BID/OFFER are always 0.
+* **Capped** (`B3_BOOK=capped`, the default, the RTL's algorithm, `cpp_baseline/include/b3/book_capped.hpp`): K slots per side, with the truncation and depth-incomplete rules below (brief section 5). The file header records K. Step 8b.
+* **Uncapped** (`B3_BOOK=uncapped`, software only, step 8a, 4.5): no tracked-depth limit. Same record format and emission rules. The file header records **K = 0**, and DEPTH_INCOMPLETE_BID/OFFER are always 0.
+
+**The capped book.** Per table instrument and side: up to K slots (price, qty, order_count) sorted best first, a valid count, a `truncated` flag and a boundary price B. **Invariant:** the slots hold every level at or better than B; if not truncated, they hold the whole side.
+
+| Port 1 record | Capped book |
+|---|---|
+| ADD at price p | The level is in the slots: qty += qty, count += 1. Otherwise, if not truncated or p is at or better than B: insert in sorted position; if that makes K + 1 levels, the worst is dropped, `truncated` is set, and B becomes the new worst slot's price. Truncated and p worse than B: ignored |
+| MODIFY, DELETE | The level is in the slots: applied as in 4.5 (a DELETE removes the slot at count 0, **B unchanged**). Not in the slots: worse than B while truncated, ignored; otherwise (at or better than B, or not truncated) a **consistency error** |
+| CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL | No slots, `truncated` false |
+
+"Better" is a higher price for bids, a lower one for offers. Null prices are counted and kept out of the slots, as in 4.5; consistency errors are split CLEAN / STALE, as in 4.5.
+
+**Depth incomplete:** a side is depth incomplete when it is truncated and has fewer than N valid slots (unknown levels beyond B might belong in the published N). It ends when the side is cleared, or when valid slots reach N again; `truncated` itself ends only with a clear.
+
+**Port 2 with the capped book.** The same format and emission rules (4.1, 4.3). A record's levels are the side's first min(N, valid) slots, always correct. BOOK_UPDATE and STATE_CHANGE set DEPTH_INCOMPLETE_BID / DEPTH_INCOMPLETE_OFFER (byte 42, bits 1 and 2) from the instrument's sides at the moment the record is written (on a STATE_CHANGE to STALE too, whose levels are zeros). **A change of depth completeness writes no record of its own**: it shows on the next record for that instrument (in practice the BOOK_UPDATE of the event that caused it). Where a side is not depth incomplete, its levels equal the uncapped book's; `make book-oracle` checks exactly that.
+
+**Statistics** (counters JSON, `book.sides.bid` / `book.sides.offer`, summed over instruments): `truncations` (truncated set from false), `levels_dropped`, `ignored` (updates worse than B while truncated), `depth_incomplete` (episodes), `depth_incomplete_ns` and `depth_incomplete_max_ns` (their capture-time duration, total and longest; an episode open at the end of the file ends at the last datagram's time), `max_valid`. `book.state_bytes` is the book's state size; the uncapped build reports its own, and `book.max_depth` (most levels per side). The RTL layout is one wide word per (instrument, side): the K slots, valid, truncated and B. An update reads it, compares the price against all K slots at once, and writes it back shifted.
 
 ### 4.3 When records are written
 
@@ -640,11 +656,12 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
 | `counters_compare.py` | `b3_decode --counters` against counters derived from manifest.json and intent.jsonl: sequencing, rptSeq, stale flags and points, every other counter, both feeds (`make counters-compare`) |
 | `gen_instruments.py` | The instrument table (4.4) from the feed generator's config.toml |
-| `expected_book.py` | The expected port 2 book.bin for one feed (4): port 1 from `intent_to_events.py`, stale state from `b3replay.py`, a small independent price-level book, packet order and capture times from the pcap |
-| `book_compare.py` | `b3_decode --book` (uncapped build) against `expected_book.py` byte for byte on both feeds, the book key at every checkpoint for CLEAN instruments, and the book counters (`make book-compare`) |
+| `expected_book.py` | The expected port 2 book.bin for one feed (4): port 1 from `intent_to_events.py`, stale state from `b3replay.py`, a small independent price-level book (uncapped, or capped with `--tracked-depth K`: a second implementation of 4.2 beside the C++), packet order and capture times from the pcap |
+| `book_compare.py` | `b3_decode --book` of any book build against `expected_book.py` with the same N and K (its capped mode for a capped build) byte for byte on both feeds, the book key at every checkpoint for CLEAN instruments on sides not depth incomplete (the key's first N levels), and the book counters (`make book-compare`: uncapped, K = 16, K = 32, and N = 2 with K = 3 and uncapped) |
+| `book_oracle.py` | A capped build against an uncapped build with the same N: identical records except K, the depth-incomplete flags and the levels of flagged sides; truncation and depth-incomplete statistics per (N, K) (`make book-oracle`) |
 | `events_compare.py` | `b3_decode --events` against `intent_to_events.py`: both feeds byte-identical in full order, every build (`make events-compare`) |
 | `b3feed.py` | One feed's answer-key messages in the feed's own packet order and capture times, from its pcap (3.7) |
-| `make_goldens.py` | Port 1 goldens for the RTL (`make goldens`, below) |
+| `make_goldens.py` | Port 1 and port 2 (capped, K = 16 and K = 32) goldens for the RTL (`make goldens`, below) |
 | `decode_compare.py` | `b3_decode --decode` against intent.jsonl with `compare_decode.py --strict`, both feeds of every set, the schema set's features and B3's sample packet (`make decode-compare`) |
 | `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
 
@@ -656,7 +673,7 @@ python3 -m pytest tools/tests
 make data && python3 -m pytest tools/tests   # data tests fail until make data has run
 ```
 
-**Goldens** (`make data && make goldens`): for every set, `data/golden/<set>/` holds `expected_feedA.bin` and `expected_feedB.bin` (the converter, each in its feed's own order), `cpp_feedA.bin` and `cpp_feedB.bin` (the C++, release build), and `provenance.json` with the repo commit (and whether the tree was dirty), the SHA-256 and recorded commit of the set's generator `provenance.json`, the build parameters, and each file's SHA-256 and size. A set whose C++ files differ from the expected ones is not written. `data/` is gitignored; the goldens are rebuilt, not committed.
+**Goldens** (`make data && make goldens`): for every set, `data/golden/<set>/` holds `expected_feedA.bin` and `expected_feedB.bin` (the converter, each in its feed's own order), `cpp_feedA.bin` and `cpp_feedB.bin` (the C++, release build), port 2 for the capped book at N = 5 with K = 16 and K = 32 (`expected_book_n5_k16_feedA.bin` from `expected_book.py`'s capped mode, `cpp_book_n5_k16_feedA.bin` from the k16 build, and likewise for Feed B and K = 32; the RTL golden is compared against the build with the same N and K), and `provenance.json` with the repo commit (and whether the tree was dirty), the SHA-256 and recorded commit of the set's generator `provenance.json`, the build parameters (port 1's, and under `books` each book's N, K, STATUS interval and MAX_INSTRUMENTS), and each file's SHA-256 and size. A set whose C++ files differ from the expected ones is not written. `data/` is gitignored; the goldens are rebuilt, not committed.
 
 `intent_to_events.py` writes N, K and MAX_INSTRUMENTS into the header (defaults 5, 16, 64, matching `book_params.hpp`). For a golden file matched against another build, pass `--tracked-depth 32` (or `0` for uncapped) and so on.
 

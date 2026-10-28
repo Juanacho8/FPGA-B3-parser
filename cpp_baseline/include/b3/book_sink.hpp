@@ -13,7 +13,9 @@
 //        marked STALE), then empty the touched set.
 //   A SequenceReset or ChannelReset closes nothing: it empties the touched
 //   set; a ChannelReset then clears every table book of its channel and
-//   touches each. A loss gives STATE_CHANGEs only. A STATUS is written when
+//   touches each. A loss gives STATE_CHANGEs only. Book is UncappedBook or
+//   CappedBook (the same interface); BOOK_UPDATE and STATE_CHANGE carry the
+//   book's depth-incomplete flags (always 0 for the uncapped book). A STATUS is written when
 //   capture time reaches a tick: one for the latest tick due, with the
 //   number of earlier ticks it stands for (ticks_skipped), before the packet. Every record gets the next output sequence number.
 //   Records go into a buffer allocated before the loop; past its capacity
@@ -27,7 +29,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
+#include "b3/book_capped.hpp"
 #include "b3/book_params.hpp"
 #include "b3/book_uncapped.hpp"
 #include "b3/instruments.hpp"
@@ -46,10 +50,13 @@ struct BookSinkCounters {
     std::uint64_t untracked_records = 0;   // book-changing records of instruments not in the table
 };
 
-template <bool PublishStale = kPublishStale>
+// The book of this build (B3_BOOK).
+using BuildBook = std::conditional_t<kBookMode == BookMode::Capped, CappedBook<>, UncappedBook>;
+
+template <class Book = BuildBook, bool PublishStale = kPublishStale>
 class BookSink {
 public:
-    BookSink(const instruments::Table& table, const tracker::Tracker& tracker, UncappedBook& book,
+    BookSink(const instruments::Table& table, const tracker::Tracker& tracker, Book& book,
              R::BookRecord* buffer, std::size_t capacity, std::uint64_t status_interval_ns) noexcept
         : table_(table), tracker_(tracker), book_(book), buf_(buffer), cap_(capacity),
           interval_(status_interval_ns) {}
@@ -73,6 +80,7 @@ public:
             next_tick_ = latest + interval_;
         }
         capture_time_ = capture_time;
+        book_.set_time(capture_time);
     }
 
     // One message: its port 1 records (0 or 1, from the event sink) and the
@@ -171,6 +179,7 @@ private:
             r.header.state = stale ? R::book_state::STALE : R::book_state::CLEAN;
             r.header.flags = touched.recovery[slot] ? R::book_flag::RECOVERY : 0;
             levels(r, slot);
+            depth_flags(r, slot);
             ++counters_.book_updates;
             emit(r);
         }
@@ -185,6 +194,7 @@ private:
         r.header.state = t.to_stale ? R::book_state::STALE : R::book_state::CLEAN;
         r.header.cause = t.cause;
         if (!t.to_stale) levels(r, t.slot);
+        depth_flags(r, t.slot);
         ++counters_.state_changes;
         emit(r);
     }
@@ -204,6 +214,11 @@ private:
         r.header.offer_count = static_cast<std::uint8_t>(book_.top(slot, Side::offer, r.offers, kPublishedDepth));
     }
 
+    void depth_flags(R::BookRecord& r, std::size_t slot) const noexcept {
+        if (book_.depth_incomplete(slot, Side::bid)) r.header.flags |= R::book_flag::DEPTH_INCOMPLETE_BID;
+        if (book_.depth_incomplete(slot, Side::offer)) r.header.flags |= R::book_flag::DEPTH_INCOMPLETE_OFFER;
+    }
+
     void emit(R::BookRecord& r) noexcept {
         r.header.out_seq = ++out_seq_;
         if (count_ < cap_) {
@@ -215,7 +230,7 @@ private:
 
     const instruments::Table& table_;
     const tracker::Tracker& tracker_;
-    UncappedBook& book_;
+    Book& book_;
     R::BookRecord* buf_;
     std::size_t cap_;
     std::size_t count_ = 0;

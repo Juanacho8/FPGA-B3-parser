@@ -24,8 +24,10 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#include "b3/book_capped.hpp"
 #include "b3/book_sink.hpp"
 #include "b3/book_uncapped.hpp"
 #include "b3/event_sink.hpp"
@@ -106,8 +108,17 @@ Bytes mass_delete(std::uint64_t sid, char type, std::uint32_t rpt, std::uint8_t 
     return message(52, b);
 }
 
+template <class Book>
+Book make_levels() {
+    if constexpr (std::is_same_v<Book, UncappedBook>) {
+        return UncappedBook(b3::kMaxInstruments, 16);
+    } else {
+        return Book();
+    }
+}
+
 // The decode pipeline as b3_decode runs it: tracker, port 1, port 2.
-template <bool PublishStale = false>
+template <class Book = UncappedBook, bool PublishStale = false>
 struct Pipeline {
     b3::instruments::Table table;
     b3::packet::PacketDecoder<> decoder;
@@ -115,9 +126,9 @@ struct Pipeline {
     b3::tracker::Tracker tracker;
     std::vector<b3::records::EventRecord> events_buf;
     b3::event_sink::EventSink events;
-    UncappedBook levels;
+    Book levels;
     std::vector<BookRecord> book_buf;
-    b3::book::BookSink<PublishStale> book;
+    b3::book::BookSink<Book, PublishStale> book;
     std::vector<Bytes> keep;
 
     explicit Pipeline(const std::string& table_text, std::uint64_t status_interval = 0, std::size_t capacity = 64,
@@ -126,7 +137,7 @@ struct Pipeline {
           tracker(table, decoder.sequencer(), false, silence_ns),
           events_buf(256),
           events(events_buf.data(), events_buf.size(), &tracker),
-          levels(b3::kMaxInstruments, 16),
+          levels(make_levels<Book>()),
           book_buf(capacity),
           book(table, tracker, levels, book_buf.data(), book_buf.size(), status_interval) {}
 
@@ -319,8 +330,37 @@ TEST_CASE("STATE_CHANGE cause: discarded tail, then ChannelReset back to CLEAN w
     CHECK((rs[2].header.cause == b3::records::cause::CHANNEL_RESET && rs[2].header.bid_count == 0));
 }
 
+TEST_CASE("capped book on port 2: depth-incomplete flags, the first min(N, valid) slots") {
+    // K = N: N + 1 bids truncate; a delete then leaves N - 1 < N valid.
+    constexpr std::size_t N = b3::kPublishedDepth;
+    using Capped = b3::book::CappedBook<N, N>;
+    Pipeline<Capped> p("200000001 68\n");
+    Bytes pk;
+    std::vector<Bytes> msgs;
+    for (std::size_t i = 0; i <= N; ++i) {
+        msgs.push_back(order(WIN, 0, '0', static_cast<std::int64_t>(100 - i), 1, i + 1, static_cast<std::uint32_t>(i + 1),
+                             i == N ? 0x80 : 0));
+    }
+    Bytes one = packet(68, 1, {});
+    for (const auto& m : msgs) one.insert(one.end(), m.begin(), m.end());
+    p.feed(one, 10);
+    p.feed(packet(68, 2, {del(WIN, '0', 100, 1, 1, static_cast<std::uint32_t>(N + 2), 0x80)}), 20);
+    auto rs = p.records();
+    REQUIRE(rs.size() == 2);
+    CHECK((rs[0].header.flags == 0 && rs[0].header.bid_count == N));       // truncated, N valid: complete
+    CHECK(rs[0].bids[N - 1].price == static_cast<std::int64_t>(100 - (N - 1)));
+    CHECK(rs[1].header.flags == b3::records::book_flag::DEPTH_INCOMPLETE_BID);
+    CHECK((rs[1].header.bid_count == N - 1 && rs[1].bids[0].price == 99));
+    p.feed(packet(68, 4, {order(WIN, 0, '1', 200, 1, 50, static_cast<std::uint32_t>(N + 3), 0x80)}), 30);   // gap
+    rs = p.records();
+    REQUIRE(rs.size() == 3);
+    CHECK((rs[2].header.record_type == RT::STATE_CHANGE && rs[2].header.state == ST::STALE));
+    CHECK(rs[2].header.flags == b3::records::book_flag::DEPTH_INCOMPLETE_BID);   // on the next record, no record of its own
+    CHECK(p.levels.stats(Side::bid).depth_incomplete == 1);
+}
+
 TEST_CASE("B3_PUBLISH_STALE: BOOK_UPDATEs while STALE, marked STALE") {
-    Pipeline<true> p("200000001 68\n");
+    Pipeline<UncappedBook, true> p("200000001 68\n");
     p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));
     p.feed(packet(68, 2, {order(WIN, 0, '0', 101, 1, 2, 9, 0x80)}));   // rptSeq jump: STALE at this message
     const auto rs = p.records();
@@ -393,7 +433,8 @@ TEST_CASE("buffer capacity: past it records are counted and out_seq still moves"
     CHECK(p.book.counters().overflow == 1);
 }
 
-TEST_CASE("DESIGN.md 4.7: one record of each type") {
+// The example's bytes are N = 5 records: other builds skip it.
+TEST_CASE("DESIGN.md 4.7: one record of each type" * doctest::skip(b3::kPublishedDepth != 5)) {
     Pipeline<> p("200000001 68\n", 100'000'000);
     p.feed(packet(68, 1, {order(WIN, 0, '0', 1299800000, 5, 1, 1, 0x00, 999'000'000),
                           order(WIN, 0, '0', 1299750000, 3, 2, 2, 0x80, 999'000'100)}),

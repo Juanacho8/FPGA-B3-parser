@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare goldens cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -52,8 +52,14 @@ cpp-release:
 cpp-debug:
 	$(call cpp_build,debug,-DCMAKE_BUILD_TYPE=Debug)
 
-cpp-test: layouts-check cpp-debug
+# Debug (sanitizers) at K = 4, N = 2: the capped book's truncation paths
+# with the build's own parameters as well as the tests' explicit K = 4.
+cpp-debug-k4:
+	$(call cpp_build,debug-k4,-DCMAKE_BUILD_TYPE=Debug -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=4)
+
+cpp-test: layouts-check cpp-debug cpp-debug-k4
 	ctest --test-dir $(CPP_BUILD)/debug --output-on-failure
+	ctest --test-dir $(CPP_BUILD)/debug-k4 --output-on-failure
 
 cpp-k16:
 	$(call cpp_build,k16,-DCMAKE_BUILD_TYPE=Release -DB3_TRACKED_DEPTH=16)
@@ -65,6 +71,17 @@ cpp-uncapped:
 	$(call cpp_build,uncapped,-DCMAKE_BUILD_TYPE=Release -DB3_BOOK=uncapped)
 
 cpp-variants: cpp-k16 cpp-k32 cpp-uncapped
+
+# The generator's books are thin (K = 16 never truncates on them), so a
+# small capped book, N = 2 and K = 3, runs truncation on real order flow,
+# with an uncapped N = 2 build as its oracle.
+cpp-n2k3:
+	$(call cpp_build,n2k3,-DCMAKE_BUILD_TYPE=Release -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=3)
+
+cpp-uncapped-n2:
+	$(call cpp_build,uncapped-n2,-DCMAKE_BUILD_TYPE=Release -DB3_BOOK=uncapped -DB3_PUBLISHED_DEPTH=2)
+
+cpp-book-variants: cpp-variants cpp-n2k3 cpp-uncapped-n2
 
 # The C++ pcap reader against the generator's independent Python reader, on
 # feedA.pcap and feedB.pcap of every set under B3_DATA (make data). Fails on any difference.
@@ -97,16 +114,39 @@ EVENT_BUILDS := $(foreach b,release k16 k32 uncapped,--build $(b):$(CPP_BUILD)/$
 events-compare: cpp-release cpp-variants
 	$(PYTHON) tools/events_compare.py $(B3_DATA) $(EVENT_BUILDS)
 
-# Port 2 (uncapped book, step 8a): b3_decode --book against tools/expected_book.py
-# (byte for byte, both feeds), the book key at every checkpoint for CLEAN
-# instruments, and the book counters. Fails on any difference.
-book-compare: cpp-uncapped
-	$(PYTHON) tools/book_compare.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
+# Port 2: b3_decode --book of each book build (uncapped, capped K = 16 and
+# K = 32 at N = 5, and the N = 2 pair) against tools/expected_book.py with the
+# same N and K (byte for byte, both feeds), the book key at every checkpoint
+# for CLEAN instruments (sides not depth incomplete), and the book counters.
+# Fails on any difference.
+BOOK_BUILDS := uncapped k16 k32 n2k3 uncapped-n2
 
-# Goldens: each set's expected and C++ events.bin under $(B3_DATA)/golden/,
-# with provenance.json. Reproducible from make data && make goldens.
-goldens: cpp-release
-	$(PYTHON) tools/make_goldens.py --cpp $(CPP_BUILD)/release/b3_decode $(B3_DATA)
+book-compare: cpp-book-variants
+	set -e; for b in $(BOOK_BUILDS); do \
+	  echo "== book-compare: $$b"; \
+	  $(PYTHON) tools/book_compare.py --cpp $(CPP_BUILD)/$$b/b3_decode $(B3_DATA); \
+	done
+
+# The capped book against the uncapped book with the same N, every set and
+# feed: identical records except K, the depth-incomplete flags and the levels
+# of flagged sides; reports truncation and depth-incomplete statistics per
+# (N, K). Fails on any other difference.
+BOOK_ORACLE_PAIRS := k16:uncapped k32:uncapped n2k3:uncapped-n2
+
+book-oracle: cpp-book-variants
+	set -e; for pair in $(BOOK_ORACLE_PAIRS); do \
+	  capped=$${pair%%:*}; uncapped=$${pair##*:}; \
+	  echo "== book-oracle: $$capped against $$uncapped"; \
+	  $(PYTHON) tools/book_oracle.py --capped $(CPP_BUILD)/$$capped/b3_decode \
+	    --uncapped $(CPP_BUILD)/$$uncapped/b3_decode $(B3_DATA); \
+	done
+
+# Goldens: each set's expected and C++ events.bin, and capped book.bin for
+# K = 16 and K = 32 at N = 5, under $(B3_DATA)/golden/, with provenance.json.
+# Reproducible from make data && make goldens.
+goldens: cpp-release cpp-k16 cpp-k32
+	$(PYTHON) tools/make_goldens.py --cpp $(CPP_BUILD)/release/b3_decode \
+	  --book-cpp $(CPP_BUILD)/k16/b3_decode --book-cpp $(CPP_BUILD)/k32/b3_decode $(B3_DATA)
 
 cpp-clean:
 	rm -rf $(CPP_BUILD)

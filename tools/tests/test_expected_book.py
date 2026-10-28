@@ -81,16 +81,91 @@ def test_level_book_consistency_split():
 
 
 def test_book_key_check_catches_a_wrong_level():
-    plan = [((68, 1, 5, 0), WIN, [(100, 5, 1)], [])]
-    good = {(68, 1, 5, 0): {WIN: ("CLEAN", [(100, 5, 1)], [])}}
-    bad = {(68, 1, 5, 0): {WIN: ("CLEAN", [(100, 4, 1)], [])}}
-    stale = {(68, 1, 5, 0): {WIN: ("STALE", [(100, 4, 1)], [])}}
-    assert bc.check_key(plan, good) == (1, 0, [])
-    assert bc.check_key(plan, bad)[2]
-    assert bc.check_key(plan, stale) == (0, 0, [])
-    assert bc.check_key(plan, {}) == (0, 1, [])
+    plan = [((68, 1, 5, 0), WIN, [(100, 5, 1), (99, 1, 1)], [])]
+    good = {(68, 1, 5, 0): {WIN: ("CLEAN", 0, [(100, 5, 1), (99, 1, 1)], [])}}
+    bad = {(68, 1, 5, 0): {WIN: ("CLEAN", 0, [(100, 4, 1), (99, 1, 1)], [])}}
+    stale = {(68, 1, 5, 0): {WIN: ("STALE", 0, [(100, 4, 1)], [])}}
+    incomplete = {(68, 1, 5, 0): {WIN: ("CLEAN", 1, [(100, 4, 1)], [])}}   # bid side depth incomplete
+    assert bc.check_key(plan, good) == (1, 0, 0, [])
+    assert bc.check_key(plan, bad)[3]
+    assert bc.check_key(plan, stale) == (0, 0, 0, [])
+    assert bc.check_key(plan, {}) == (0, 1, 0, [])
+    assert bc.check_key(plan, incomplete) == (1, 0, 1, [])
+    assert bc.check_key(plan, {(68, 1, 5, 0): {WIN: ("CLEAN", 0, [(100, 5, 1)], [])}}, n=1) == (1, 0, 0, [])
 
 
 def test_parse_dump():
-    dump = bc.parse_dump("68 1 5 0 200000001 CLEAN 2 100 5 1 99 3 2 0\n")
-    assert dump == {(68, 1, 5, 0): {WIN: ("CLEAN", [(100, 5, 1), (99, 3, 2)], [])}}
+    dump = bc.parse_dump("68 1 5 0 200000001 CLEAN 2 2 100 5 1 99 3 2 0\n")
+    assert dump == {(68, 1, 5, 0): {WIN: ("CLEAN", 2, [(100, 5, 1), (99, 3, 2)], [])}}
+
+
+# ---- The capped book (DESIGN.md 4.2), K = 4, N = 2 ----
+def capped(k=4, n=2):
+    return eb.CappedBook(k, n)
+
+
+def prices(b, side=eb.BID):
+    return [lv[0] for lv in b.top(0, side, 99)]
+
+
+def test_capped_fill_then_truncate_and_ignore_worse_than_b():
+    b = capped()
+    for p in (100, 98, 99, 97):
+        b.add(0, eb.BID, p, 1, False)
+    assert prices(b) == [100, 99, 98, 97] and not b.sides[(0, eb.BID)]["truncated"]
+    b.add(0, eb.BID, 96, 1, False)                         # K + 1: the new one is the worst, dropped
+    st = b.sides[(0, eb.BID)]
+    assert prices(b) == [100, 99, 98, 97] and st["truncated"] and st["b"] == 97
+    b.add(0, eb.BID, 95, 1, False)                         # worse than B: ignored
+    assert prices(b) == [100, 99, 98, 97] and b.stats[eb.BID]["ignored"] == 1
+    b.add(0, eb.BID, 101, 1, False)                        # better: inserted, 97 pushed out
+    assert prices(b) == [101, 100, 99, 98] and st["b"] == 98
+    assert b.stats[eb.BID]["truncations"] == 1 and b.stats[eb.BID]["levels_dropped"] == 2
+
+
+def test_capped_delete_keeps_b_then_new_at_b_and_depth_incomplete():
+    b = capped()
+    for p in (100, 99, 98, 97, 96):
+        b.add(0, eb.BID, p, 1, False)
+    st = b.sides[(0, eb.BID)]
+    assert st["b"] == 97
+    b.remove(0, eb.BID, 97, 1, False)                      # B unchanged
+    assert prices(b) == [100, 99, 98] and st["b"] == 97
+    b.add(0, eb.BID, 97, 2, False)                         # at B: inserted
+    assert prices(b) == [100, 99, 98, 97]
+    b.set_time(10)
+    for p in (100, 99, 98):                                # a sweep: three levels go
+        b.remove(0, eb.BID, p, 1, False)
+    assert prices(b) == [97] and b.depth_incomplete(0, eb.BID)     # truncated, 1 < N
+    b.set_time(25)
+    b.add(0, eb.BID, 99, 1, False)                         # valid reaches N: complete again
+    assert not b.depth_incomplete(0, eb.BID)
+    assert b.stats[eb.BID]["depth_incomplete"] == 1 and b.stats[eb.BID]["depth_incomplete_ns"] == 15
+    b.remove(0, eb.BID, 99, 1, False)
+    assert b.depth_incomplete(0, eb.BID)
+    b.clear(0, eb.BID)                                     # a clear ends it too
+    assert not b.depth_incomplete(0, eb.BID) and not b.sides[(0, eb.BID)]["truncated"]
+    assert b.errors == 0
+
+
+def test_capped_consistency_error_better_than_b_and_mirror_offers():
+    b = capped()
+    for p in (100, 99, 98, 97, 96):
+        b.add(0, eb.BID, p, 1, False)
+    b.remove(0, eb.BID, 99, 1, False)
+    b.remove(0, eb.BID, 99, 1, False)                      # better than B, not there: error
+    b.remove(0, eb.BID, 90, 1, False)                      # worse than B: ignored
+    assert b.errors == 1 and b.stats[eb.BID]["ignored"] == 1
+    for p in (100, 102, 101, 103, 104):
+        b.add(0, eb.OFFER, p, 1, False)
+    assert prices(b, eb.OFFER) == [100, 101, 102, 103] and b.sides[(0, eb.OFFER)]["b"] == 103
+
+
+def test_capped_mode_flags_depth_incomplete_on_port2():
+    # K = 2, N = 2: three bids truncate; a delete leaves 1 < N valid while truncated.
+    o = [order(1, i, "0", 100 - i, 1, i + 1, i + 1, 0x80 if i == 2 else 0, 1) for i in range(3)]
+    d = dele(WIN, "0", 100, 1, 1, 4, 0x80, 2, 0)
+    p = eb.run_packets([o, [d]], [0, 0], TABLE[:1], CLEAN_MANIFEST, n=2, status_interval=0, k=2)
+    assert [header(r)[10] for r in p.records] == [0, c.BOOK_FLAG_DEPTH_INCOMPLETE_BID]
+    assert [header(r)[11] for r in p.records] == [2, 1]
+    assert eb.book_bytes(p, 0)[18:20] == (2).to_bytes(2, "little")      # K in the file header
