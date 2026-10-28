@@ -138,6 +138,24 @@ constexpr bool has_named(List<Fs...>) noexcept {
     return ((Fs::name == Name) || ...);
 }
 
+// Each template's time field (DESIGN.md 3.4, "Time field by template").
+template <std::uint16_t Id>
+struct TimeField {
+    static constexpr std::string_view name = [] {
+        switch (Id) {
+            case 3: case 10: case 50: case 51: case 52: case 53: case 54: case 55: case 57:
+                return std::string_view("transactTime");
+            case 9: case 11: case 15: case 16: case 17: case 19: case 21: case 22: case 24:
+            case 25: case 27: case 28: case 29: case 56:
+                return std::string_view("mDEntryTimestamp");
+            case 5:
+                return std::string_view("origTime");
+            default:
+                return std::string_view();
+        }
+    }();
+};
+
 // A constant field: the schema's value, never the wire's.
 template <class C>
 constexpr auto constant() noexcept {

@@ -7,10 +7,9 @@ What it does:
     * Feed A: the C++ events.bin must be byte-identical to
       tools/intent_to_events.py's, run with the build's N, K (0 = uncapped)
       and MAX_INSTRUMENTS, so the file headers agree too.
-    * Feed B: intent.jsonl does not give Feed B's cross-channel order
-      (docs/DESIGN.md 3.7), so the C++ records are compared record by record
-      within each channel with intent_to_events.convert() run on Feed B's
-      view of the intent log (tools/b3intent.py). The header must match too.
+    * Feed B: byte-identical too, in full order: the converter follows
+      Feed B's own packet order from its pcap (tools/b3feed.py), the same
+      way tools/expected_book.py does for port 2.
     * Across builds: the records (everything after the header) must be the
       same in every build; only the header's N and K may differ.
   The first difference is reported with its packet and message position, in
@@ -79,19 +78,6 @@ def first_difference(want, got, label):
     return []
 
 
-def per_channel(events):
-    out = {}
-    for e in events:
-        out.setdefault(e.channel, []).append(e)
-    return out
-
-
-def expected_feed_b(intent, manifest, header):
-    rows = (row for _, row in b3intent.feed_rows(intent, manifest, "B"))
-    replay = b3replay.Replay(b3replay.read_table(table_path()), manifest, "B")
-    return header, list(intent_to_events.convert(rows, replay))
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("data", help="generator output folder (make data)")
@@ -121,6 +107,13 @@ def main(argv=None):
                     continue
                 records_by_build = {}
                 problems = []
+                # The answer key, in this feed's own packet order (tools/b3feed.py).
+                try:
+                    want_records = intent_to_events.convert_feed(
+                        intent, manifest, feed, pcap, b3replay.read_table(table_path()))
+                    want_error = None
+                except b3replay.Broken as e:
+                    want_records, want_error = None, e
                 for build, binary in builds:
                     checked += 1
                     got_path = tmp / f"cpp_{build}.bin"
@@ -134,29 +127,15 @@ def main(argv=None):
                     records_by_build[build] = data[header.header_size:]
                     want_header = c.events_header(header.published_depth, header.tracked_depth,
                                                   header.max_instruments)
-                    if feed == "A":
-                        want_path = tmp / f"py_{build}.bin"
-                        subprocess.run([sys.executable, str(REPO / "tools" / "intent_to_events.py"),
-                                        str(intent), "-o", str(want_path),
-                                        "--published-depth", str(header.published_depth),
-                                        "--tracked-depth", str(header.tracked_depth),
-                                        "--max-instruments", str(header.max_instruments)],
-                                       check=True, stdout=subprocess.DEVNULL)
-                        want_bytes = want_path.read_bytes()
-                        if want_bytes != data:
-                            _, want = c.read_events(want_bytes)
-                            if want_bytes[:HEADER] != data[:HEADER]:
-                                problems.append(f"{build}: file header differs")
-                            problems += first_difference(want, got, build) or \
-                                [f"{build}: bytes differ outside the records"]
-                    else:
-                        if header != want_header:
-                            problems.append(f"{build}: header {header} != {want_header}")
-                        _, want = expected_feed_b(intent, manifest, want_header)
-                        w, g = per_channel(want), per_channel(got)
-                        for ch in sorted(set(w) | set(g)):
-                            problems += first_difference(w.get(ch, []), g.get(ch, []),
-                                                         f"{build} channel {ch}")
+                    if want_records is None:
+                        problems.append(f"{build}: answer key: {want_error}")
+                        continue
+                    want_bytes = want_header.pack() + b"".join(e.pack() for e in want_records)
+                    if want_bytes != data:
+                        if want_bytes[:HEADER] != data[:HEADER]:
+                            problems.append(f"{build}: file header differs")
+                        problems += first_difference(want_records, got, build) or \
+                            [f"{build}: bytes differ outside the records"]
                 base_build = builds[0][0]
                 for build, recs in records_by_build.items():
                     if recs != records_by_build[base_build]:
@@ -177,8 +156,7 @@ def main(argv=None):
                         print(f"    {p}")
                 else:
                     n = len(records_by_build[base_build]) // c.EVENT.size
-                    how = "byte-identical" if feed == "A" else "same records per channel"
-                    print(f"OK {name}/{pcap.name}: {n} records, {how}, "
+                    print(f"OK {name}/{pcap.name}: {n} records, byte-identical in full order, "
                           f"{len(builds)} builds ({', '.join(b for b, _ in builds)})")
     for note in reset_notes:
         print(f"note: SequenceReset/ChannelReset with an event open: {note}")

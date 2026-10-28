@@ -15,7 +15,9 @@ What it does:
       rptSeq gaps per instrument, unknown instruments, and stale flags: a gap
       (at its first missing number) or a discarded malformed tail (at the
       faulted packet) marks every table instrument of the channel; an rptSeq
-      jump marks one; EmptyBook and ChannelReset clear. Each instrument's
+      jump marks one; a channel silent past the silence limit marks the
+      channel (capture times from the feed's pcap, tools/b3feed.py);
+      EmptyBook and ChannelReset clear. Each instrument's
       first stale point, stale events and state at the end are compared.
     * the build parameters (N, K, MAX_INSTRUMENTS, book) against
       cpp_baseline/include/b3/book_params.hpp's defaults (the release build)
@@ -54,6 +56,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
+import b3feed             # noqa: E402
 import b3intent           # noqa: E402
 import decode_crosscheck  # noqa: E402
 import gen_instruments    # noqa: E402
@@ -86,8 +89,14 @@ def expected_counters(folder, manifest, feed, table):
     counts, _ = decode_crosscheck.expected(folder / "intent.jsonl", manifest, feed)
     rows = [r for _, r in b3intent.feed_rows(folder / "intent.jsonl", manifest, feed)]
     replay = Replay(table, manifest, feed)
-    for pkt in packets(rows):
-        replay.packet(pkt)
+    if b3intent.expected_failure(manifest):
+        # The key of a decoder feature not built yet (the reorder window): the
+        # view's order (the window's release order), without capture times.
+        for pkt in packets(rows):
+            replay.packet(pkt)
+    else:
+        # The feed's own packet order and capture times: the silence rule.
+        b3feed.drive(folder / "intent.jsonl", manifest, feed, folder / f"feed{feed}.pcap", replay)
     last_seen = {}
     for r in rows:
         if r["sequenceNumber"]:
@@ -102,6 +111,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "empty_packets", "messages", "unknown_templates",
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
+               silences=replay.silences,
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
     late = [r["packet"] for r in (manifest.get("reordered") or {}).get(feed, [])]

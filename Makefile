@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare goldens cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare goldens cpp-release cpp-debug cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -96,6 +96,12 @@ EVENT_BUILDS := $(foreach b,release k16 k32 uncapped,--build $(b):$(CPP_BUILD)/$
 
 events-compare: cpp-release cpp-variants
 	$(PYTHON) tools/events_compare.py $(B3_DATA) $(EVENT_BUILDS)
+
+# Port 2 (uncapped book, step 8a): b3_decode --book against tools/expected_book.py
+# (byte for byte, both feeds), the book key at every checkpoint for CLEAN
+# instruments, and the book counters. Fails on any difference.
+book-compare: cpp-uncapped
+	$(PYTHON) tools/book_compare.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
 
 # Goldens: each set's expected and C++ events.bin under $(B3_DATA)/golden/,
 # with provenance.json. Reproducible from make data && make goldens.

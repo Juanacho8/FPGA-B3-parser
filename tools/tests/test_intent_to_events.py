@@ -7,7 +7,7 @@ import pytest
 import b3contract as c
 import b3intent
 import intent_to_events as ie
-from rows import heartbeat, order, row, stats, summary
+from rows import heartbeat, order, row, stats, summary, write_pcap
 
 
 def kinds(row_list):
@@ -144,6 +144,8 @@ def test_unsupported_order_action_with_eoe_gets_a_marker():
 def write_set(tmp_path, row_list, manifest):
     (tmp_path / "intent.jsonl").write_text("".join(json.dumps(r) + "\n" for r in row_list))
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    for feed in "AB":
+        write_pcap(tmp_path / f"feed{feed}.pcap", row_list)
     return tmp_path / "intent.jsonl"
 
 
@@ -236,22 +238,45 @@ def test_cli_writes_header_and_records(tmp_path):
     assert [e.kind for e in events] == [c.EXEC_SUMMARY, c.END_OF_EVENT]
 
 
-def test_cli_refuses_feed_b(tmp_path, capsys):
-    path = write_set(tmp_path, [summary()], {"missing": {"A": [], "B": []}})
-    assert ie.main([str(path), "-o", str(tmp_path / "e.bin"), "--feed", "B"]) == 2
-    assert "Feed B" in capsys.readouterr().err
+def test_cli_feed_b_follows_its_own_pcap_order(tmp_path):
+    rows_ = [order(0, seq=1, channel=68), order(0, seq=1, channel=70), order(0, seq=2, channel=68)]
+    path = write_set(tmp_path, rows_, {"missing": {"A": [], "B": []}})
+    write_pcap(tmp_path / "feedB.pcap", [rows_[1], rows_[0], rows_[2]])   # B delivers channel 70 first
+    for feed, want in (("A", [68, 70, 68]), ("B", [70, 68, 68])):
+        out = tmp_path / f"e{feed}.bin"
+        assert ie.main([str(path), "-o", str(out), "--feed", feed]) == 0
+        assert [e.channel for e in c.read_events(out.read_bytes())[1]] == want
 
 
-@pytest.mark.parametrize("feed", ["A"])
+def test_silence_marks_the_channel_not_clean(tmp_path):
+    rows_ = [order(0, seq=1), order(0, seq=2), order(0, seq=3, channel=70), order(0, seq=3)]
+    for r, rpt in zip(rows_, (1, 2, 1, 3)):
+        r["fields"].update(securityID=7 if r["channel"] == 68 else 8, rptSeq=rpt)
+    path = write_set(tmp_path, rows_, {"missing": {"A": [], "B": []}})
+    # 68 is silent from 1.0 s to 4.5 s: at 4.5 s (70's packet) it is past 3 s.
+    write_pcap(tmp_path / "feedA.pcap", rows_, [1_000_000_000, 1_000_001_000, 4_500_000_000, 4_600_000_000])
+    (tmp_path / "t.txt").write_text("7 68\n8 70\n")
+    out = tmp_path / "e.bin"
+    assert ie.main([str(path), "-o", str(out), "--instruments", str(tmp_path / "t.txt")]) == 0
+    flags = [e.flags & c.FLAG_BOOK_NOT_CLEAN for e in c.read_events(out.read_bytes())[1]]
+    assert flags == [0, 0, 0, c.FLAG_BOOK_NOT_CLEAN]   # 70 was not silent; 68 is STALE after
+
+
+@pytest.mark.parametrize("feed", ["A", "B"])
 def test_every_generated_set(needs_data, tmp_path, feed):
     """Runs the converter on every set in B3_DATA and checks the output is a
-    well-formed events.bin with one close per marker-or-flag."""
+    well-formed events.bin. A set expected to fail (the reorder window, not
+    built yet) is refused: its pcap's order is not the window's release order."""
     from conftest import generated_sets
     sets = generated_sets()
     assert sets, "B3_DATA has no intent.jsonl"
     for name, folder in sets:
         out = tmp_path / (name.replace("/", "_") + ".bin")
-        assert ie.main([str(folder / "intent.jsonl"), "-o", str(out), "--feed", feed]) == 0
+        status = ie.main([str(folder / "intent.jsonl"), "-o", str(out), "--feed", feed])
+        if b3intent.expected_failure(b3intent.load_manifest(folder / "intent.jsonl")):
+            assert status == 2, name
+            continue
+        assert status == 0, name
         header, events = c.read_events(out.read_bytes())
         assert events, name
         assert all(1 <= e.kind <= 12 for e in events), name

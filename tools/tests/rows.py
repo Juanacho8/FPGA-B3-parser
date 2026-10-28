@@ -58,3 +58,24 @@ def summary(**kw):
 def heartbeat(**kw):
     kw.setdefault("seq", 0)
     return row(2, {"nextSeqNo": 5}, **kw)
+
+
+def write_pcap(path, rows, times=None):
+    """A pcap whose datagrams carry the rows' packet headers, one datagram per
+    packet (a row with index 0 starts one), at times (ns) or 1 us apart. The
+    answer keys read only the headers and times (tools/b3feed.py)."""
+    import struct
+    from test_pcap_crosscheck import frame, pcap
+    starts = [r for r in rows if r["index"] == 0]
+    times = times or [1_000_000_000 + 1000 * i for i in range(len(starts))]
+    frames = []
+    for r, t in zip(starts, times):
+        payload = struct.pack("<BBHIQ", r["channel"], 0, r["sequenceVersion"], r["sequenceNumber"],
+                              r.get("sendingTime", 0)) + bytes(12)
+        frames.append((frame(payload), t))
+    data = bytearray(pcap([(fr, 0) for fr, _ in frames]))
+    off = 24
+    for fr, t in frames:            # the record times
+        struct.pack_into("<II", data, off, t // 1_000_000_000, t % 1_000_000_000)
+        off += 16 + len(fr)
+    Path(path).write_bytes(bytes(data))
