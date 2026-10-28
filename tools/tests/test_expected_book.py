@@ -1,5 +1,6 @@
 """expected_book (the port 2 answer key) on hand-given packets, and book_compare's checks."""
 
+import b3contract as c
 import book_compare as bc
 import expected_book as eb
 from book_example import order
@@ -17,7 +18,7 @@ def dele(sid, side, px, qty, soid, rpt, mei, seq, index):
 
 
 def header(rec):
-    return eb.BOOK_HEADER.unpack_from(rec, 0)
+    return c.BOOK_HEADER.unpack_from(rec, 0)
 
 
 def test_mass_cancel_one_update_per_instrument_in_first_touch_order():
@@ -28,18 +29,18 @@ def test_mass_cancel_one_update_per_instrument_in_first_touch_order():
     p = eb.run_packets(pkts, [0, 0], TABLE, CLEAN_MANIFEST, status_interval=0)
     sids = [header(r)[5] for r in p.records]
     assert sids == [WIN, DOL, DOL, WIN]
-    assert [header(r)[8] for r in p.records] == [eb.BOOK_UPDATE] * 4
+    assert [header(r)[8] for r in p.records] == [c.BOOK_UPDATE] * 4
 
 
 def test_stale_publishes_nothing_unless_publish_stale():
     pkts = [[order(1, 0, "0", 100, 5, 1, 1, 0x80, 1)], [order(3, 0, "0", 101, 1, 2, 3, 0x80, 1)]]
     manifest = {"missing": {"A": [[68, 1, 2]], "B": []}}
     p = eb.run_packets(pkts, [0, 0], TABLE[:1], manifest, status_interval=0)
-    assert [(header(r)[8], header(r)[9]) for r in p.records] == [(eb.BOOK_UPDATE, eb.CLEAN),
-                                                                  (eb.STATE_CHANGE, eb.STALE)]
+    assert [(header(r)[8], header(r)[9]) for r in p.records] == [(c.BOOK_UPDATE, c.BOOK_CLEAN),
+                                                                  (c.STATE_CHANGE, c.BOOK_STALE)]
     p = eb.run_packets(pkts, [0, 0], TABLE[:1], manifest, status_interval=0, publish_stale=True)
     assert [(header(r)[8], header(r)[9]) for r in p.records] == [
-        (eb.BOOK_UPDATE, eb.CLEAN), (eb.STATE_CHANGE, eb.STALE), (eb.BOOK_UPDATE, eb.STALE)]
+        (c.BOOK_UPDATE, c.BOOK_CLEAN), (c.STATE_CHANGE, c.BOOK_STALE), (c.BOOK_UPDATE, c.BOOK_STALE)]
 
 
 def test_state_change_cause_byte():
@@ -51,10 +52,10 @@ def test_state_change_cause_byte():
             [order(7, 0, "0", 103, 1, 4, 1, 0x80, 1)]]
     manifest = {"missing": {"A": [[68, 1, 2]], "B": []}}
     p = eb.run_packets(pkts, [0, 1, 2, 3, 4, 10_000_000_004], TABLE[:1], manifest, status_interval=0)
-    changes = [(header(r)[9], header(r)[13]) for r in p.records if header(r)[8] == eb.STATE_CHANGE]
-    assert changes == [(eb.STALE, eb.GAP), (eb.CLEAN, eb.EMPTY_BOOK), (eb.STALE, eb.RPT_SEQ_JUMP),
-                       (eb.CLEAN, eb.CHANNEL_RESET), (eb.STALE, eb.SILENCE)]
-    assert all(header(r)[13] == 0 for r in p.records if header(r)[8] != eb.STATE_CHANGE)
+    changes = [(header(r)[9], header(r)[13]) for r in p.records if header(r)[8] == c.STATE_CHANGE]
+    assert changes == [(c.BOOK_STALE, c.CAUSE_GAP), (c.BOOK_CLEAN, c.CAUSE_EMPTY_BOOK), (c.BOOK_STALE, c.CAUSE_RPT_SEQ_JUMP),
+                       (c.BOOK_CLEAN, c.CAUSE_CHANNEL_RESET), (c.BOOK_STALE, c.CAUSE_SILENCE)]
+    assert all(header(r)[13] == 0 for r in p.records if header(r)[8] != c.STATE_CHANGE)
 
 
 def test_status_ticks_and_out_seq():
@@ -64,7 +65,7 @@ def test_status_ticks_and_out_seq():
     # with ticks_skipped 2 (offset 24).
     assert [header(r)[8] for r in p.records] == [1, 1, 3, 1]
     assert [header(r)[0] for r in p.records] == list(range(1, 5))
-    status = [header(r) for r in p.records if header(r)[8] == eb.STATUS]
+    status = [header(r) for r in p.records if header(r)[8] == c.STATUS]
     assert [(h[7], h[6]) for h in status] == [(1300, 2)]
 
 

@@ -36,6 +36,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
+import b3contract as c   # noqa: E402
 import b3intent           # noqa: E402
 import b3replay           # noqa: E402
 import counters_compare   # noqa: E402
@@ -43,14 +44,12 @@ import expected_book      # noqa: E402
 import gen_instruments    # noqa: E402
 
 N = 5   # book_key.jsonl's depth; the uncapped build's N (checked from book.bin's header)
-TYPES = {1: "BOOK_UPDATE", 2: "STATE_CHANGE", 3: "STATUS"}
 
 
 def describe(rec):
-    h = expected_book.BOOK_HEADER.unpack_from(rec, 0)
-    out_seq, seq, ver, ch, idx, sid, exch, cap, rtype, state, flags, nb, no, cause = h
-    return (f"out_seq {out_seq} {TYPES.get(rtype, rtype)} channel {ch} v{ver} packet {seq} message {idx} "
-            f"instr {sid} state {state} cause {cause} flags {flags:#x} levels {nb}/{no} capture {cap}")
+    out_seq, seq, ver, ch, idx, sid, exch, cap, rtype, state, flags, nb, no, cause = c.BOOK_HEADER.unpack_from(rec, 0)
+    return (f"out_seq {out_seq} {c.RECORD_TYPE_NAMES.get(rtype, rtype)} channel {ch} v{ver} packet {seq} "
+            f"message {idx} instr {sid} state {state} cause {cause} flags {flags:#x} levels {nb}/{no} capture {cap}")
 
 
 def first_difference(want, got):
