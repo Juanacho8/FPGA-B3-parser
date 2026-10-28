@@ -52,6 +52,14 @@ public:
     }
     std::size_t levels_per_side() const noexcept { return cap_; }
     const BookCounters& counters() const noexcept { return counters_; }
+    // Most levels a side of any instrument held (the evidence for K).
+    std::size_t max_depth(Side side) const noexcept { return max_depth_[static_cast<std::size_t>(side)]; }
+
+    // The capped book's interface (book_capped.hpp), with nothing to do here:
+    // the uncapped book is never depth incomplete.
+    void set_time(std::uint64_t) noexcept {}
+    void finish(std::uint64_t) noexcept {}
+    bool depth_incomplete(std::size_t, Side) const noexcept { return false; }
 
     void add(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
         if (price == kNullPrice) {
@@ -152,6 +160,8 @@ private:
         std::memmove(it + 1, it, static_cast<std::size_t>(end - it) * sizeof(BookLevel));
         *it = BookLevel{price, 0, 0, 0};
         ++n;
+        std::size_t& most = max_depth_[static_cast<std::size_t>(side)];
+        if (n > most) most = n;
         return it;
     }
     void erase(std::size_t slot, Side side, BookLevel* it) noexcept {
@@ -171,6 +181,7 @@ private:
     std::size_t cap_;
     std::vector<std::size_t> size_;
     std::vector<BookLevel> levels_;
+    std::size_t max_depth_[2] = {0, 0};
     BookCounters counters_;
 };
 

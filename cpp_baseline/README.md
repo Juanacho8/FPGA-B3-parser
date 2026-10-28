@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 8a (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records, the uncapped book and port 2).
+Status: step 8b (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records, the uncapped book and port 2, the capped book).
 
 ## Requirements
 
@@ -19,16 +19,21 @@ From the repo root:
 |---|---|---|
 | `make cpp-release` | `-O3 -mcpu=native` | `cpp_baseline/build/release` |
 | `make cpp-debug` | `-O1 -g`, AddressSanitizer + UndefinedBehaviorSanitizer | `cpp_baseline/build/debug` |
-| `make cpp-test` | `make layouts-check`, Debug build, then runs the tests with `ctest` | `cpp_baseline/build/debug` |
+| `make cpp-debug-k4` | Debug (sanitizers), N = 2, K = 4 | `cpp_baseline/build/debug-k4` |
+| `make cpp-test` | `make layouts-check`, the Debug and Debug K = 4 builds, then runs the tests with `ctest` in both | `cpp_baseline/build/debug`, `debug-k4` |
 | `make cpp-k16` | Release, K = 16 | `cpp_baseline/build/k16` |
 | `make cpp-k32` | Release, K = 32 | `cpp_baseline/build/k32` |
 | `make cpp-uncapped` | Release, uncapped book | `cpp_baseline/build/uncapped` |
 | `make cpp-variants` | The three variants above | |
+| `make cpp-n2k3` | Release, N = 2, K = 3: truncation on the generator's thin books | `cpp_baseline/build/n2k3` |
+| `make cpp-uncapped-n2` | Release, uncapped, N = 2: the oracle for n2k3 | `cpp_baseline/build/uncapped-n2` |
+| `make cpp-book-variants` | `cpp-variants` plus the two N = 2 builds | |
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 | `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
 | `make events-compare` | Release and variant builds, then `b3_decode --events` (port 1) against `tools/intent_to_events.py`: Feed A byte-identical, Feed B per channel, identical records in every build | `cpp_baseline/build/*` |
-| `make book-compare` | Uncapped build, then `b3_decode --book` (port 2) against `tools/expected_book.py` byte for byte on both feeds, the book key for CLEAN instruments, and the book counters | `cpp_baseline/build/uncapped` |
-| `make goldens` | Port 1 goldens for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release` |
+| `make book-compare` | Every book build (uncapped, k16, k32, n2k3, uncapped-n2), then `b3_decode --book` (port 2) against `tools/expected_book.py` with the same N and K byte for byte on both feeds, the book key for CLEAN instruments, and the book counters | `cpp_baseline/build/*` |
+| `make book-oracle` | Capped against uncapped with the same N (k16 and k32 against uncapped, n2k3 against uncapped-n2): identical records except K, the depth-incomplete flags and flagged sides' levels; truncation and depth-incomplete statistics | `cpp_baseline/build/*` |
+| `make goldens` | Port 1 goldens, and port 2 capped goldens for K = 16 and K = 32, for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release`, `k16`, `k32` |
 | `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
 | `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
 | `make decode-crosscheck` | Release build, then `b3_decode` against intent.jsonl and manifest.json on both feeds of every set under `B3_DATA` | `cpp_baseline/build/release` |
@@ -108,15 +113,19 @@ cpp_baseline/build/release/b3_decode --events events.bin feedA.pcap
 python3 tools/dump_events.py events.bin --limit 20
 ```
 
-## Port 2 (step 8a: the uncapped book)
+## Port 2 (steps 8a and 8b: the books)
 
-`book_uncapped.hpp`: sorted flat level arrays per instrument and side,
-reserved at startup. `book_sink.hpp`: BOOK_UPDATE, STATE_CHANGE and STATUS
-records from port 1 records and the tracker's state changes (DESIGN.md 4).
-In 8a, `--book` needs the uncapped build; the capped book is step 8b.
+`book_capped.hpp` (the default build, the RTL's algorithm, DESIGN.md 4.2): K
+slots per side sorted best first, a valid count, a truncated flag and the
+boundary price, in one fixed array allocated once; inserts and deletes
+compare against all K slots and shift, as the hardware does.
+`book_uncapped.hpp` (`B3_BOOK=uncapped`, software only): sorted flat level
+arrays per instrument and side, reserved at startup. `book_sink.hpp`:
+BOOK_UPDATE, STATE_CHANGE and STATUS records from port 1 records and the
+tracker's state changes (DESIGN.md 4), with either book.
 
 ```
-cpp_baseline/build/uncapped/b3_decode --instruments instruments.txt --book book.bin feedA.pcap
+cpp_baseline/build/k16/b3_decode --instruments instruments.txt --book book.bin feedA.pcap
 ```
 
 ## Book parameters
@@ -165,6 +174,7 @@ include/b3/instruments.hpp   instrument table: load and lookup
 include/b3/tracker.hpp       rptSeq, stale flags, per-message checks
 include/b3/records.hpp       port 1 record and file header structs
 include/b3/event_sink.hpp    port 1: records, event closing
+include/b3/book_capped.hpp   the capped price-level book (K slots, the RTL's)
 include/b3/book_uncapped.hpp the uncapped price-level book
 include/b3/book_sink.hpp     port 2: book updates, state changes, status
 src/instruments.cpp
@@ -179,6 +189,7 @@ tests/test_sequencer.cpp     sequencing rules
 tests/test_tracker.cpp       rptSeq, stale flags, unknown instruments
 tests/test_instruments.cpp   table loading and lookup
 tests/test_events.cpp        port 1 per kind, event closing, DESIGN.md hex examples
-tests/test_book.cpp          uncapped book, port 2 rules, DESIGN.md 4.7
+tests/test_book.cpp          uncapped book, port 2 rules (both books), DESIGN.md 4.7
+tests/test_book_capped.cpp   the capped book's truncation rules at K = 4
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```
