@@ -117,7 +117,7 @@ enable_testing()
 add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp
   tests/test_pcap.cpp tests/test_walker.cpp tests/test_decode.cpp
   tests/test_sequencer.cpp tests/test_instruments.cpp tests/test_tracker.cpp tests/test_events.cpp
-  tests/test_book.cpp tests/test_book_capped.cpp)
+  tests/test_book.cpp tests/test_book_capped.cpp tests/test_book_mbo.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # The repository root: tests read docs/DESIGN.md's hex examples and B3's sample packet.

@@ -38,12 +38,19 @@
 //   instrument's state, depth-incomplete flags and top N levels, one line
 //   each, for the book-key
 //   check (tools/book_compare.py). Debug only.
+//   --mbo (the B3_BOOK=uncapped build only; never timed) also builds the MBO
+//   book (book_mbo.hpp) from the port 1 records and checks it at every event
+//   close against the uncapped book (mbo_check.hpp, DESIGN.md 4.8);
+//   --mbo-orders N (default 262144) is its order capacity, and
+//   --mbo-checkpoint-out FILE dumps its top N levels at the --checkpoints
+//   placements, in the --checkpoint-out format. Results in the "mbo" block.
 //   --counters FILE writes every counter as one JSON object, with each
 //   instrument's first stale point and the build parameters, for
 //   tools/counters_compare.py.
 //
 // Usage: b3_decode [--instruments FILE] [--events FILE] [--book FILE] [--book-levels N]
 //                  [--status-interval-ns N] [--checkpoints FILE --checkpoint-out FILE]
+//                  [--mbo [--mbo-orders N] [--mbo-checkpoint-out FILE]]
 //                  [--counters FILE] [--list FILE] [--decode FILE] FILE.pcap
 
 #include <cstdint>
@@ -60,10 +67,12 @@
 #include "b3/event_sink.hpp"
 #include "b3/records.hpp"
 #include "b3/book_capped.hpp"
+#include "b3/book_mbo.hpp"
 #include "b3/book_params.hpp"
 #include "b3/book_sink.hpp"
 #include "b3/book_uncapped.hpp"
 #include "b3/instruments.hpp"
+#include "b3/mbo_check.hpp"
 #include "b3/tracker.hpp"
 #include "b3/packet.hpp"
 #include "b3/pcap.hpp"
@@ -94,6 +103,10 @@ struct DecodeSink {
     std::string* checkpoint_out = nullptr;
     const b3::instruments::Table* table = nullptr;
     const b3::book::BuildBook* levels = nullptr;
+    // --mbo: the MBO book and its check, and its checkpoint dump.
+    b3::book::MboCheck* mbo_check = nullptr;
+    b3::book::MboBook* mbo = nullptr;
+    std::string* mbo_checkpoint_out = nullptr;
 
     static std::uint64_t placement(std::uint8_t ch, std::uint16_t ver, std::uint32_t seq, std::uint8_t index) {
         return (std::uint64_t{ch} << 56) | (std::uint64_t{ver} << 40) | (std::uint64_t{seq} << 8) | index;
@@ -105,6 +118,9 @@ struct DecodeSink {
         if (book != nullptr) {
             book->on_message(events->data() + records_before, events->size() - records_before,
                              tracker->transitions(), tracker->transition_count());
+        }
+        if (mbo_check != nullptr) {   // after the price-level book: the check reads it
+            mbo_check->on_message(events->data() + records_before, events->size() - records_before);
         }
         if (checkpoints != nullptr &&
             checkpoints->count(placement(m.packet.channel, m.packet.seq_version, m.packet.seq_num,
@@ -131,6 +147,27 @@ struct DecodeSink {
                 }
             }
             *checkpoint_out += "\n";
+        }
+        if (mbo_checkpoint_out != nullptr) dump_mbo(m);
+    }
+
+    // The MBO book's top N per-price totals, same format, depth flags 0.
+    void dump_mbo(const b3::walker::MessageView& m) {
+        b3::records::BookLevel lv[b3::kPublishedDepth];
+        for (std::size_t slot = 0; slot < table->size(); ++slot) {
+            *mbo_checkpoint_out += std::to_string(m.packet.channel) + " " + std::to_string(m.packet.seq_version) + " " +
+                                   std::to_string(m.packet.seq_num) + " " + std::to_string(m.msg_index) + " " +
+                                   std::to_string((*table)[slot].security_id) + " " +
+                                   (tracker->state(slot).stale ? "STALE" : "CLEAN") + " 0";
+            for (const auto side : {b3::book::Side::bid, b3::book::Side::offer}) {
+                const std::size_t n = mbo->levels(slot, side, lv, b3::kPublishedDepth);
+                *mbo_checkpoint_out += " " + std::to_string(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    *mbo_checkpoint_out += " " + std::to_string(lv[i].price) + " " + std::to_string(lv[i].qty) + " " +
+                                           std::to_string(lv[i].order_count);
+                }
+            }
+            *mbo_checkpoint_out += "\n";
         }
     }
 
@@ -209,6 +246,62 @@ void print_book_shape(const Book& book) {
     }
 }
 
+// The MBO check needs the uncapped book; a capped build has none to give.
+template <class Book>
+std::unique_ptr<b3::book::MboCheck> make_mbo_check(const b3::instruments::Table& table,
+                                                   const b3::tracker::Tracker& tracker, b3::book::MboBook& mbo,
+                                                   const Book& levels) {
+    if constexpr (std::is_same_v<Book, b3::book::UncappedBook>) {
+        return std::make_unique<b3::book::MboCheck>(table, tracker, mbo, levels);
+    } else {
+        (void)table, (void)tracker, (void)mbo, (void)levels;
+        return nullptr;
+    }
+}
+
+// The "mbo" block: state, peaks, overflow, faults by reason, the check.
+void print_mbo(const b3::book::MboBook& mbo, const b3::book::MboCheck& check, const b3::instruments::Table& table) {
+    const auto& mc = mbo.counters();
+    const auto& cc = check.counters();
+    std::uint64_t peak_instrument = 0;
+    for (std::size_t slot = 0; slot < table.size(); ++slot) {
+        if (mbo.peak(slot) > peak_instrument) peak_instrument = mbo.peak(slot);
+    }
+    std::printf(",\"mbo\":{\"capacity\":%zu,\"state_bytes\":%zu,\"peak_orders\":%llu,"
+                "\"peak_orders_per_instrument\":%llu,\"pool_overflow\":%llu,\"table_overflow\":%llu,"
+                "\"null_price_orders\":%llu,\"closes\":%llu,\"instrument_checks\":%llu,\"level_mismatches\":%llu,",
+                mbo.capacity(), mbo.state_bytes(), static_cast<ull>(mc.peak_orders), static_cast<ull>(peak_instrument),
+                static_cast<ull>(mc.pool_overflow), static_cast<ull>(mc.table_overflow),
+                static_cast<ull>(mc.null_price_orders), static_cast<ull>(cc.closes),
+                static_cast<ull>(cc.instrument_checks), static_cast<ull>(cc.level_mismatches));
+    for (const bool stale : {false, true}) {
+        const auto& f = stale ? mc.faults_stale : mc.faults;
+        std::printf("%s\"%s\":{", stale ? "," : "", stale ? "faults_stale" : "faults");
+        for (std::size_t i = 0; i < f.size(); ++i) {
+            std::printf("%s\"%.*s\":%llu", i ? "," : "", static_cast<int>(b3::book::kMboFaultNames[i].size()),
+                        b3::book::kMboFaultNames[i].data(), static_cast<ull>(f[i]));
+        }
+        std::printf("}");
+    }
+    std::printf(",\"peaks\":{");
+    for (std::size_t slot = 0; slot < table.size(); ++slot) {
+        std::printf("%s\"%llu\":%llu", slot ? "," : "", static_cast<ull>(table[slot].security_id),
+                    static_cast<ull>(mbo.peak(slot)));
+    }
+    std::printf("},\"mismatches\":[");
+    for (std::size_t i = 0; i < check.kept(); ++i) {
+        const auto& x = check.mismatches()[i];
+        std::printf("%s{\"at\":[%u,%u,%u,%u],\"instrument\":%llu,\"side\":\"%s\",\"level\":%zu,"
+                    "\"mbo\":[%lld,%lld,%u],\"levels\":[%lld,%lld,%u]}",
+                    i ? "," : "", x.channel, x.seq_version, x.seq_num, x.msg_index,
+                    static_cast<ull>(x.instrument_id), x.side == b3::book::Side::bid ? "bid" : "offer", x.level,
+                    static_cast<long long>(x.mbo.price), static_cast<long long>(x.mbo.qty), x.mbo.order_count,
+                    static_cast<long long>(x.levels.price), static_cast<long long>(x.levels.qty),
+                    x.levels.order_count);
+    }
+    std::printf("]}");
+}
+
 // Every counter of a run, as one JSON object (DESIGN.md 3.6.4).
 bool write_counters(const std::string& path, const std::string& pcap, const b3::packet::PacketCounters& pc,
                     const b3::packet::SequencerCounters& sq, const b3::walker::WalkCounters& wc,
@@ -282,11 +375,26 @@ int main(int argc, char** argv) {
     std::string checkpoints_path;
     std::string checkpoint_out_path;
     std::size_t book_levels = 1024;
+    bool want_mbo = false;
+    std::size_t mbo_orders = 262144;
+    std::string mbo_checkpoint_out_path;
     std::uint64_t status_interval = 100'000'000;
     std::uint64_t silence_ns = b3::tracker::Tracker::kDefaultSilenceNs;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--book") == 0 && i + 1 < argc) {
             book_path = argv[++i];
+            continue;
+        }
+        if (std::strcmp(argv[i], "--mbo") == 0) {
+            want_mbo = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--mbo-orders") == 0 && i + 1 < argc) {
+            mbo_orders = std::stoul(argv[++i]);
+            continue;
+        }
+        if (std::strcmp(argv[i], "--mbo-checkpoint-out") == 0 && i + 1 < argc) {
+            mbo_checkpoint_out_path = argv[++i];
             continue;
         }
         if (std::strcmp(argv[i], "--book-levels") == 0 && i + 1 < argc) {
@@ -364,7 +472,11 @@ int main(int argc, char** argv) {
         }
         // Port 1 buffer: at most one record per complete message (a record or
         // a marker, never both), counted once over the loaded capture.
-        const bool want_book = !book_path.empty() || !checkpoints_path.empty();
+        const bool want_book = !book_path.empty() || !checkpoints_path.empty() || want_mbo;
+        if (want_mbo && b3::kBookMode != b3::BookMode::Uncapped) {
+            std::fprintf(stderr, "b3_decode: --mbo checks against the uncapped book: use the B3_BOOK=uncapped build\n");
+            return 2;
+        }
         std::vector<b3::records::EventRecord> event_buffer;
         std::unique_ptr<b3::event_sink::EventSink> event_sink;
         if (!events_path.empty() || want_book) {
@@ -411,6 +523,16 @@ int main(int argc, char** argv) {
             sink->table = &instruments;
             sink->levels = levels.get();
         }
+        // --mbo: the order pool and hash table, allocated here.
+        std::unique_ptr<b3::book::MboBook> mbo;
+        std::unique_ptr<b3::book::MboCheck> mbo_check;
+        std::string mbo_checkpoint_out;
+        if (want_mbo) {
+            mbo = std::make_unique<b3::book::MboBook>(b3::kMaxInstruments, mbo_orders);
+            mbo_check = make_mbo_check(instruments, *tracker, *mbo, *levels);
+            sink->mbo = mbo.get();
+            sink->mbo_check = mbo_check.get();
+        }
         if (!checkpoints_path.empty()) {
             std::ifstream in(checkpoints_path);
             if (!in) throw b3::pcap::Error(checkpoints_path + ": cannot open");
@@ -422,6 +544,7 @@ int main(int argc, char** argv) {
             }
             sink->checkpoints = &checkpoints;
             sink->checkpoint_out = &checkpoint_out;
+            if (mbo && !mbo_checkpoint_out_path.empty()) sink->mbo_checkpoint_out = &mbo_checkpoint_out;
         }
 
         // ---- The loop ----
@@ -521,6 +644,7 @@ int main(int argc, char** argv) {
             print_book_shape(*levels);
             std::printf("}");
         }
+        if (mbo_check) print_mbo(*mbo, *mbo_check, instruments);
         std::printf("}\n");
 
         if (book_sink && !book_path.empty()) {
@@ -531,6 +655,15 @@ int main(int argc, char** argv) {
                                 book_sink->size();
             if (out == nullptr || std::fclose(out) != 0 || !ok) {
                 std::fprintf(stderr, "b3_decode: cannot write %s\n", book_path.c_str());
+                return 1;
+            }
+        }
+        if (!mbo_checkpoint_out_path.empty()) {
+            std::FILE* out = std::fopen(mbo_checkpoint_out_path.c_str(), "w");
+            if (out == nullptr ||
+                std::fwrite(mbo_checkpoint_out.data(), 1, mbo_checkpoint_out.size(), out) != mbo_checkpoint_out.size() ||
+                std::fclose(out) != 0) {
+                std::fprintf(stderr, "b3_decode: cannot write %s\n", mbo_checkpoint_out_path.c_str());
                 return 1;
             }
         }

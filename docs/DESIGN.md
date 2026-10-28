@@ -535,7 +535,7 @@ Trades never touch the book. A **null price** (INT64_MIN, a market-on-auction or
 
 ### 4.6 Future items
 
-* **Snapshot recovery**: rebuilding a stale instrument from the snapshot recovery stream (`spec/LAYOUTS.md` 12.6, 12.8), which would clear its stale flag. Not in v1: a stale instrument stays stale until its EmptyBook or a ChannelReset (3.6.4).
+* **Snapshot recovery**: rebuilding a stale instrument from the snapshot recovery stream (`spec/LAYOUTS.md` 12.6, 12.8), which would clear its stale flag. Not in v1: a stale instrument stays stale until its EmptyBook or a ChannelReset (3.6.4). The MBO book (4.8) has the entry point a snapshot load would use.
 
 ### 4.7 Worked example
 
@@ -642,6 +642,39 @@ c0 5f 79 4d 00 00 00 00 05 00 00 00 00 00 00 00
 
 ---
 
+### 4.8 MBO book (step 9, software only)
+
+`cpp_baseline/include/b3/book_mbo.hpp` and `mbo_check.hpp`, enabled by `b3_decode --mbo` in the `B3_BOOK=uncapped` build, never in a timed build. It is built **only from port 1 records** (3) and the tracker's state, never from the wire: the input a downstream consumer of port 1 has. It writes nothing to port 1 or port 2.
+
+**Orders.** Per table instrument, the resting orders keyed by order_id (secondaryOrderID), each with side, price and remaining qty. B3 identifies an order by (securityID, side, price, secondaryOrderID) (`spec/LAYOUTS.md` 12.3); the id is unique and only grows, so (instrument, order_id) finds the order and side and price are checked against it. Storage, sized at startup (`--mbo-orders`, default 262144): an order pool, an open-addressing hash table with twice as many slots (linear probing, backward-shift deletion), and per instrument and side a linked list through the pool for the clears. An ADD past the pool is counted (`pool_overflow`) and dropped; nothing is allocated in the loop.
+
+| Port 1 record | MBO book |
+|---|---|
+| ADD | Insert the order |
+| MODIFY | Set its qty (it keeps its priority: B3 sends a loss of priority as DELETE, then ADD with a new id) |
+| DELETE | Remove it. A DELETE with no price (schema before v15, price INT64_MIN) is found by id, its price not checked |
+| CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL | Remove the side's, the instrument's, or every table instrument of the channel's orders |
+
+Trades never touch it. Null-price orders are kept, and left out of the per-price totals, as the price-level books keep them out (4.5).
+
+**Per-order checks**, counted by reason and split by the instrument's state when they happen, as in 4.5 (`faults` while CLEAN, which must all be 0; `faults_stale` while STALE, expected after a loss):
+
+| Reason | |
+|---|---|
+| `add_duplicate` | ADD of an order_id already resting |
+| `modify_missing`, `modify_side`, `modify_price`, `modify_prev_qty` | MODIFY of an order not resting, at another side or price than stored, or whose previous qty (port 1 aux, mDEntryPrevSize) is not the stored qty (or is null) |
+| `delete_missing`, `delete_side`, `delete_price`, `delete_qty` | DELETE of an order not resting, at another side or price, or whose qty is not the stored remaining qty |
+
+After a fault the message wins: the stored order takes the message's side, price and qty (a DELETE still removes it), so the book follows the feed.
+
+**Three-way check.** The MBO check keeps port 2's touched set (4.3). At every event close, for every touched instrument that is CLEAN, the MBO book's per-price totals (qty and order count, every level, both sides) must equal the uncapped book's (`level_mismatches`, the first eight kept with the closing record's identity). At every `book_key.jsonl` checkpoint, the MBO book's top 5 for CLEAN instruments must equal the key (`--mbo-checkpoint-out`): a per-order rebuild against the generator's own book. `make mbo-check` runs both on every set and feed.
+
+**Reported** (the `mbo` block of b3_decode's output): `state_bytes`, `capacity`, `peak_orders` (all instruments at once), `peak_orders_per_instrument` and `peaks` per securityID, `pool_overflow`, `table_overflow`, the faults, and the check's counts.
+
+**Future use (entry points, not built).**
+* *Snapshot recovery* (step 12): clear the instrument, then `load_order()` each order of the snapshot (`spec/LAYOUTS.md` 12.6, 12.8), with no consistency check, and resume the incremental feed after the snapshot's rptSeq. Needs the generator's snapshot stream, the snapshot's last rptSeq per instrument, and the tracker clearing STALE at that point (a new STATE_CHANGE cause).
+* *Host refill of the capped book* (open item G): `levels(slot, side, out, n, &B)` gives the per-price totals strictly worse than the capped side's boundary price B, best first, which the host would push into the free slots. Needs a host-to-FPGA write path, a rule for when a refill is allowed (between events, the side unchanged since the read), and a way for the capped book to lower B and clear `truncated` when the refill reaches the side's end.
+
 ## 5. Tools
 
 All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest). None of them imports b3gen.
@@ -658,6 +691,7 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `gen_instruments.py` | The instrument table (4.4) from the feed generator's config.toml |
 | `expected_book.py` | The expected port 2 book.bin for one feed (4): port 1 from `intent_to_events.py`, stale state from `b3replay.py`, a small independent price-level book (uncapped, or capped with `--tracked-depth K`: a second implementation of 4.2 beside the C++), packet order and capture times from the pcap |
 | `book_compare.py` | `b3_decode --book` of any book build against `expected_book.py` with the same N and K (its capped mode for a capped build) byte for byte on both feeds, the book key at every checkpoint for CLEAN instruments on sides not depth incomplete (the key's first N levels), and the book counters (`make book-compare`: uncapped, K = 16, K = 32, and N = 2 with K = 3 and uncapped) |
+| `mbo_check.py` | `b3_decode --mbo` (uncapped build) on every set and feed: 0 per-order faults while CLEAN, 0 level mismatches against the uncapped book at every close, the book key at every CLEAN checkpoint from the MBO book (`make mbo-check`) |
 | `book_oracle.py` | A capped build against an uncapped build with the same N: identical records except K, the depth-incomplete flags and the levels of flagged sides; truncation and depth-incomplete statistics per (N, K) (`make book-oracle`) |
 | `events_compare.py` | `b3_decode --events` against `intent_to_events.py`: both feeds byte-identical in full order, every build (`make events-compare`) |
 | `b3feed.py` | One feed's answer-key messages in the feed's own packet order and capture times, from its pcap (3.7) |

@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -140,6 +140,13 @@ book-oracle: cpp-book-variants
 	  $(PYTHON) tools/book_oracle.py --capped $(CPP_BUILD)/$$capped/b3_decode \
 	    --uncapped $(CPP_BUILD)/$$uncapped/b3_decode $(B3_DATA); \
 	done
+
+# The MBO book (b3_decode --mbo, uncapped build, step 9) on both feeds of
+# every set: 0 per-order faults while CLEAN, 0 level mismatches against the
+# uncapped book after every event close, and the book key at every CLEAN
+# checkpoint. Fails on any difference.
+mbo-check: cpp-uncapped
+	$(PYTHON) tools/mbo_check.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
 
 # Goldens: each set's expected and C++ events.bin, and capped book.bin for
 # K = 16 and K = 32 at N = 5, under $(B3_DATA)/golden/, with provenance.json.
