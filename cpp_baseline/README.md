@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 8b (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records, the uncapped book and port 2, the capped book).
+Status: step 9 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records, the uncapped book and port 2, the capped book, the MBO book).
 
 ## Requirements
 
@@ -33,6 +33,7 @@ From the repo root:
 | `make events-compare` | Release and variant builds, then `b3_decode --events` (port 1) against `tools/intent_to_events.py`: Feed A byte-identical, Feed B per channel, identical records in every build | `cpp_baseline/build/*` |
 | `make book-compare` | Every book build (uncapped, k16, k32, n2k3, uncapped-n2), then `b3_decode --book` (port 2) against `tools/expected_book.py` with the same N and K byte for byte on both feeds, the book key for CLEAN instruments, and the book counters | `cpp_baseline/build/*` |
 | `make book-oracle` | Capped against uncapped with the same N (k16 and k32 against uncapped, n2k3 against uncapped-n2): identical records except K, the depth-incomplete flags and flagged sides' levels; truncation and depth-incomplete statistics | `cpp_baseline/build/*` |
+| `make mbo-check` | Uncapped build, then `b3_decode --mbo` on every set and feed: 0 per-order faults while CLEAN, 0 level mismatches against the uncapped book at every close, the book key from the MBO book | `cpp_baseline/build/uncapped` |
 | `make goldens` | Port 1 goldens, and port 2 capped goldens for K = 16 and K = 32, for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release`, `k16`, `k32` |
 | `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
 | `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
@@ -128,6 +129,15 @@ tracker's state changes (DESIGN.md 4), with either book.
 cpp_baseline/build/k16/b3_decode --instruments instruments.txt --book book.bin feedA.pcap
 ```
 
+`book_mbo.hpp` and `mbo_check.hpp` (step 9, `--mbo`, uncapped build only, never
+timed): the per-order book from port 1 records, its per-order consistency
+checks, and at every event close its per-price totals against the uncapped
+book (DESIGN.md 4.8).
+
+```
+cpp_baseline/build/uncapped/b3_decode --instruments instruments.txt --mbo feedA.pcap
+```
+
 ## Book parameters
 
 Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake:
@@ -177,6 +187,8 @@ include/b3/event_sink.hpp    port 1: records, event closing
 include/b3/book_capped.hpp   the capped price-level book (K slots, the RTL's)
 include/b3/book_uncapped.hpp the uncapped price-level book
 include/b3/book_sink.hpp     port 2: book updates, state changes, status
+include/b3/book_mbo.hpp      the MBO (per-order) book, software only
+include/b3/mbo_check.hpp     the MBO book against the uncapped book
 src/instruments.cpp
 apps/b3_decode.cpp           pcap -> decode counts JSON (and --list)
 tests/test_build.cpp         doctest main, build parameter tests
@@ -191,5 +203,6 @@ tests/test_instruments.cpp   table loading and lookup
 tests/test_events.cpp        port 1 per kind, event closing, DESIGN.md hex examples
 tests/test_book.cpp          uncapped book, port 2 rules (both books), DESIGN.md 4.7
 tests/test_book_capped.cpp   the capped book's truncation rules at K = 4
+tests/test_book_mbo.cpp      the MBO book, its faults, the three-way check
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```
