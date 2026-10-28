@@ -214,6 +214,8 @@ Answer keys for the `reorder` scenario (`tools/b3intent.py` reads the manifest's
 * Two measurements: packet start to its last event record written, and packet start to book update written. Plus throughput (messages and packets per second).
 * **Gabriel's machine is an Apple Silicon Mac.** No core pinning, no x86 timestamp counter. `std::chrono::steady_clock` ticks at about 42 ns there, which is coarser than one message's decode time. Time per packet or per batch of packets and divide, and report the clock resolution alongside results. Numbers are relative, with the hardware stated.
 * Data: `large/` (1M messages) for throughput, `burst/` for tail latency.
+* Timed builds compile out the counters and checks that the mirror builds keep (debug and consistency counters, the MBO book, the checkpoint dump).
+* Every timed build first passes the byte-identical check: its events.bin and book.bin must equal the goldens at the same parameters before any timing of it is reported.
 
 ## 9. Build steps
 
@@ -229,7 +231,7 @@ Answer keys for the `reorder` scenario (`tools/b3intent.py` reads the manifest's
 | 7 | Event sink (port 1) | `events.bin` byte-identical to the converted intent log on every set. **First RTL golden** |
 | 8 | Depth-limited book + book sink (port 2), parameters in `book_params.hpp` | Unit tests pass for K = 4, 16 and 32 (truncation paths covered). Matches `book_key.jsonl` at every checkpoint on every set and scenario, stale flags match `unreliable_books`. **Second RTL golden, one per (N, K)** |
 | 9 | MBO book behind a flag | Its top N equals the depth-limited book after every event whenever the side is not depth incomplete. Delete and CHANGE consistency checks (stored price, size, prevSize) all pass. Depth-incomplete statistics reported for K = 16 and K = 32 |
-| 10 | Benchmark harness | Reproducible percentiles for both measurements on `large/` and `burst/` |
+| 10 | Optimise, then measure. Profile the decode path. Build capped-optimised and uncapped-optimised variants, free to use any technique: binary search or SIMD insert, direct-index or hash instrument lookup, cache-friendly layout, debug and consistency counters compiled out. Their outputs must be byte-identical to the goldens. Benchmark reports FPGA vs capped-optimised as the headline (same results and memory budget), uncapped-optimised as the conventional baseline, and the mirror's timing clearly labelled | Reproducible percentiles for both measurements on `large/` and `burst/` |
 | 11 | A/B arbitration with a per-channel hold window: in-order packets pass straight through; packets after a gap are held until the hole is filled from either feed or the window expires, then the channel goes STALE. The same window is the reorder window (section 6) | `loss` scenario: merged A + B gives the same outputs as `clean`-style complete data and matches the book key everywhere. `gap`: matches except `unreliable_books`. `reorder`: each feed alone passes every compare target, and its entry leaves `b3intent.EXPECTED_FAILURES` |
 
 | 12 | Snapshot recovery: software rebuilds STALE books from the snapshot stream (`spec/LAYOUTS.md` 12.6, 12.8), plus host refill of FPGA slots (open item G). Needs the generator's snapshot stream | A gap scenario recovers every STALE book from the snapshot and then matches the book key |
@@ -279,6 +281,7 @@ tools/                 repo level: gen_layouts.py, contract converters, comparis
 | Publish rule | At EndOfEvent; see port 2 book state, DESIGN.md |
 | Offsets | Generated from B3's XML by a shared repo-level script |
 | A/B arbitration | Last core step. Take the first copy of each (channel, sequenceVersion, sequenceNumber) |
+| Two roles of the C++ | The C++ has two roles. The mirror builds (current capped book) are the RTL golden model and copy the hardware's structure. The optimised builds are the timing baseline: any software technique is allowed, provided their events.bin and book.bin are byte-identical to the goldens at the same parameters |
 
 ## 12. Open items
 
