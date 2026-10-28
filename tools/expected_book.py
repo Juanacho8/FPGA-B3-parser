@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import struct
 import sys
 from pathlib import Path
 
@@ -43,29 +42,15 @@ import b3intent              # noqa: E402
 import b3replay              # noqa: E402
 import intent_to_events      # noqa: E402
 
-BOOK_HEADER = struct.Struct("<QIHBBQQQBBBBBB2x")
-LEVEL = struct.Struct("<qqI4x")
-assert BOOK_HEADER.size == 48 and LEVEL.size == 24
-
-BOOK_UPDATE, STATE_CHANGE, STATUS = 1, 2, 3
-CLEAN, STALE = 0, 2
-FLAG_RECOVERY = 0x01
-# STATE_CHANGE cause (header offset 45, DESIGN.md 4.1)
-GAP, DISCARDED_TAIL, RPT_SEQ_JUMP, SILENCE, EMPTY_BOOK, CHANNEL_RESET = 1, 2, 3, 4, 5, 6
 NULL_PRICE = -(1 << 63)
 DEFAULT_LEVELS = 1024
 DEFAULT_INTERVAL = 100_000_000
 BID, OFFER = 0, 1
 
 
-def record_size(n):
-    return (BOOK_HEADER.size + 2 * n * LEVEL.size + 63) // 64 * 64
-
-
 def file_header(n, status_interval, max_instruments=c.DEFAULT_MAX_INSTRUMENTS):
     """book.bin's header: K = 0 (uncapped), the STATUS interval at offset 24."""
-    return c.FILE_HEADER.pack(c.BOOK_MAGIC, c.FORMAT_VERSION, c.FILE_HEADER.size, record_size(n),
-                              n, 0, max_instruments, status_interval)
+    return c.book_header(n, 0, max_instruments, status_interval).pack()
 
 
 class LevelBook:
@@ -160,27 +145,27 @@ class TransitionReplay(b3replay.Replay):
         self._step = None
 
     def advance(self, t):
-        self._step = SILENCE
+        self._step = c.CAUSE_SILENCE
         super().advance(t)
         self._step = None
 
-    def sequence(self, c, ch, ver, num):
-        self._step = GAP
-        super().sequence(c, ch, ver, num)
+    def sequence(self, chan, ch, ver, num):
+        self._step = c.CAUSE_GAP
+        super().sequence(chan, ch, ver, num)
         self._step = None
 
     def stale(self, slot, point):
         was = self.state[slot]["stale"]
         super().stale(slot, point)
         if not was:
-            cause = self._step or (RPT_SEQ_JUMP if self._row is not None else DISCARDED_TAIL)
+            cause = self._step or (c.CAUSE_RPT_SEQ_JUMP if self._row is not None else c.CAUSE_DISCARDED_TAIL)
             self.pending.append((slot, True, cause, self._row, point))
 
-    def message(self, row, c):
+    def message(self, row, chan):
         self._row = row
         before = [st["stale"] for st in self.state]
-        super().message(row, c)
-        cause = CHANNEL_RESET if row["templateId"] == b3replay.CHANNEL_RESET else EMPTY_BOOK
+        super().message(row, chan)
+        cause = c.CAUSE_CHANNEL_RESET if row["templateId"] == b3replay.CHANNEL_RESET else c.CAUSE_EMPTY_BOOK
         for slot, (was, st) in enumerate(zip(before, self.state)):
             if was and not st["stale"]:
                 self.pending.append((slot, False, cause, row, None))
@@ -220,7 +205,7 @@ class Port2:
         if self.interval and t >= self.next_tick:
             due = (t - self.next_tick) // self.interval + 1
             latest = self.next_tick + (due - 1) * self.interval
-            self.emit(STATUS, (0, 0, 0, 0), 0, due - 1, CLEAN, 0, capture=latest)
+            self.emit(c.STATUS, (0, 0, 0, 0), 0, due - 1, c.BOOK_CLEAN, 0, capture=latest)
             self.counts["statuses"] += 1
             self.next_tick = latest + self.interval
         self.capture = t
@@ -230,12 +215,10 @@ class Port2:
         seq_num, version, channel, index = ident
         bids = self.book.top(slot, BID, self.n) if slot is not None else []
         offers = self.book.top(slot, OFFER, self.n) if slot is not None else []
-        out = BOOK_HEADER.pack(self.out_seq, seq_num, version, channel, index, instrument, exch_time,
-                               self.capture if capture is None else capture, rtype, state, flags,
-                               len(bids), len(offers), cause)
-        for side in (bids, offers):
-            out += b"".join(LEVEL.pack(*lv) for lv in side) + bytes(LEVEL.size * (self.n - len(side)))
-        self.records.append(out + bytes(record_size(self.n) - len(out)))
+        rec = c.BookRecord(self.out_seq, rtype, seq_num, version, channel, index, instrument, exch_time,
+                           self.capture if capture is None else capture, state, flags, cause,
+                           tuple(bids), tuple(offers))
+        self.records.append(rec.pack(self.n))
 
     def stale_now(self, slot):
         return self.replay.state[slot]["stale"]
@@ -280,9 +263,9 @@ class Port2:
                 exch = time_field(row)
             sid = self.table[slot][0]
             if to_stale:
-                self.emit(STATE_CHANGE, ident, sid, exch, STALE, 0, cause=cause)
+                self.emit(c.STATE_CHANGE, ident, sid, exch, c.BOOK_STALE, 0, cause=cause)
             else:
-                self.emit(STATE_CHANGE, ident, sid, exch, CLEAN, 0, slot=slot, cause=cause)
+                self.emit(c.STATE_CHANGE, ident, sid, exch, c.BOOK_CLEAN, 0, slot=slot, cause=cause)
             self.counts["state_changes"] += 1
         self.replay.pending.clear()
 
@@ -292,8 +275,9 @@ class Port2:
             stale = self.stale_now(slot)
             if stale and not self.publish_stale:
                 continue
-            self.emit(BOOK_UPDATE, (e.seq_num, e.seq_version, e.channel, e.msg_index), self.table[slot][0],
-                      e.exch_time, STALE if stale else CLEAN, FLAG_RECOVERY if recovery else 0, slot=slot)
+            self.emit(c.BOOK_UPDATE, (e.seq_num, e.seq_version, e.channel, e.msg_index), self.table[slot][0],
+                      e.exch_time, c.BOOK_STALE if stale else c.BOOK_CLEAN,
+                      c.BOOK_FLAG_RECOVERY if recovery else 0, slot=slot)
             self.counts["book_updates"] += 1
         touched.clear()
 

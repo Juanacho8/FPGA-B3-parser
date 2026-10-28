@@ -3,7 +3,8 @@
 What it does:
   Defines the byte layouts shared by the C++ baseline and the RTL: the
   32-byte file header of events.bin and book.bin, the 64-byte port 1 event
-  record, and the port 2 book update record. Packs and unpacks them.
+  record, and the port 2 book record (48-byte header and levels, with its
+  record types, states, flags and causes). Packs and unpacks them.
   docs/DESIGN.md is the specification; this module is one reading of it.
 
 What it must not do:
@@ -36,22 +37,23 @@ class FileHeader:
     published_depth: int     # N
     tracked_depth: int       # K, 0 = uncapped
     max_instruments: int
+    status_interval: int = 0  # offset 24: book.bin's STATUS interval (ns); 0 in events.bin
 
     def pack(self):
         return FILE_HEADER.pack(self.magic, self.format_version, self.header_size,
                                 self.record_size, self.published_depth,
-                                self.tracked_depth, self.max_instruments, 0)
+                                self.tracked_depth, self.max_instruments, self.status_interval)
 
     @classmethod
     def unpack(cls, data):
         if len(data) < FILE_HEADER.size:
             raise ValueError(f"file shorter than its {FILE_HEADER.size}-byte header")
-        magic, ver, hsize, rsize, n, k, m, _ = FILE_HEADER.unpack_from(data, 0)
+        magic, ver, hsize, rsize, n, k, m, interval = FILE_HEADER.unpack_from(data, 0)
         if magic not in (EVENTS_MAGIC, BOOK_MAGIC):
             raise ValueError(f"bad magic {magic!r}")
         if ver != FORMAT_VERSION:
             raise ValueError(f"unsupported format version {ver}")
-        return cls(magic, ver, hsize, rsize, n, k, m)
+        return cls(magic, ver, hsize, rsize, n, k, m, interval)
 
 
 # ---- 2. Port 1: event record (64 bytes) ----
@@ -114,16 +116,29 @@ def events_header(published_depth=DEFAULT_PUBLISHED_DEPTH,
                       published_depth, tracked_depth, max_instruments)
 
 
-# ---- 3. Port 2: book update record (32-byte header + 2 x N levels, padded to 64) ----
-BOOK_HEADER = struct.Struct("<IHBBQQBBB5x")
-assert BOOK_HEADER.size == 32
+# ---- 3. Port 2: book record (DESIGN.md 4.1) ----
+# 48-byte header, then N bid levels and N offer levels (best first), then
+# zero padding to a multiple of 64.
+BOOK_HEADER = struct.Struct("<QIHBBQQQBBBBBB2x")
+assert BOOK_HEADER.size == 48
 LEVEL = struct.Struct("<qqI4x")
 assert LEVEL.size == 24
 
-BOOK_FLAG_STALE = 0x01
-BOOK_FLAG_RECOVERY = 0x02
-BOOK_FLAG_DEPTH_INCOMPLETE_BID = 0x04
-BOOK_FLAG_DEPTH_INCOMPLETE_OFFER = 0x08
+# Record type (byte 40). 0 is never written.
+BOOK_UPDATE, STATE_CHANGE, STATUS = 1, 2, 3
+RECORD_TYPE_NAMES = {BOOK_UPDATE: "BOOK_UPDATE", STATE_CHANGE: "STATE_CHANGE", STATUS: "STATUS"}
+
+# Book state (byte 41). HOLDING is reserved for step 11, RECOVERING for step 12.
+BOOK_CLEAN, BOOK_HOLDING, BOOK_STALE, BOOK_RECOVERING = 0, 1, 2, 3
+
+# Flags (byte 42)
+BOOK_FLAG_RECOVERY = 0x01
+BOOK_FLAG_DEPTH_INCOMPLETE_BID = 0x02
+BOOK_FLAG_DEPTH_INCOMPLETE_OFFER = 0x04
+
+# Cause (byte 45, STATE_CHANGE only; 0 on other record types)
+CAUSE_GAP, CAUSE_DISCARDED_TAIL, CAUSE_RPT_SEQ_JUMP, CAUSE_SILENCE = 1, 2, 3, 4
+CAUSE_EMPTY_BOOK, CAUSE_CHANNEL_RESET = 5, 6
 
 
 def book_record_size(published_depth):
@@ -131,12 +146,58 @@ def book_record_size(published_depth):
     return (raw + 63) // 64 * 64
 
 
+@dataclass(frozen=True)
+class BookRecord:
+    out_seq: int
+    record_type: int
+    seq_num: int = 0
+    seq_version: int = 0
+    channel: int = 0
+    msg_index: int = 0
+    instrument_id: int = 0
+    exch_time: int = 0       # on STATUS: ticks_skipped
+    capture_time: int = 0
+    state: int = 0
+    flags: int = 0
+    cause: int = 0
+    bids: tuple = ()         # ((price, qty, order_count), ...), best first
+    offers: tuple = ()
+
+    def pack(self, published_depth=DEFAULT_PUBLISHED_DEPTH):
+        n = published_depth
+        if len(self.bids) > n or len(self.offers) > n:
+            raise ValueError(f"more than {n} levels on a side")
+        out = BOOK_HEADER.pack(self.out_seq, self.seq_num, self.seq_version, self.channel, self.msg_index,
+                               self.instrument_id, self.exch_time, self.capture_time, self.record_type,
+                               self.state, self.flags, len(self.bids), len(self.offers), self.cause)
+        for side in (self.bids, self.offers):
+            out += b"".join(LEVEL.pack(*lv) for lv in side) + bytes(LEVEL.size * (n - len(side)))
+        return out + bytes(book_record_size(n) - len(out))
+
+    @classmethod
+    def unpack_from(cls, data, offset=0, published_depth=DEFAULT_PUBLISHED_DEPTH):
+        (out_seq, seq_num, ver, ch, idx, sid, exch, cap, rtype, state, flags, nb, no,
+         cause) = BOOK_HEADER.unpack_from(data, offset)
+        n = published_depth
+        if nb > n or no > n:
+            raise ValueError(f"level counts {nb}/{no} above N = {n}")
+
+        def side(first, count):
+            return tuple(LEVEL.unpack_from(data, offset + BOOK_HEADER.size + LEVEL.size * (first + i))
+                         for i in range(count))
+        return cls(out_seq, rtype, seq_num, ver, ch, idx, sid, exch, cap, state, flags, cause,
+                   side(0, nb), side(n, no))
+
+
 def book_header(published_depth=DEFAULT_PUBLISHED_DEPTH,
                 tracked_depth=DEFAULT_TRACKED_DEPTH,
-                max_instruments=DEFAULT_MAX_INSTRUMENTS):
+                max_instruments=DEFAULT_MAX_INSTRUMENTS,
+                status_interval=0):
+    """book.bin's header; tracked_depth 0 for the uncapped book, the STATUS
+    interval (ns) at offset 24."""
     return FileHeader(BOOK_MAGIC, FORMAT_VERSION, FILE_HEADER.size,
                       book_record_size(published_depth), published_depth,
-                      tracked_depth, max_instruments)
+                      tracked_depth, max_instruments, status_interval)
 
 
 # ---- 4. Reading a whole events.bin ----
