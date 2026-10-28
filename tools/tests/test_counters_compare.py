@@ -102,6 +102,7 @@ def test_late_packets_expect_no_gap_and_the_manifest_list(tmp_path):
     rows_ = [o(7, 1, 1), o(7, 2, 2), o(7, 3, 3), o(9, 1, 1, ch=70)]
     (tmp_path / "intent.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows_))
     m = manifest()
+    m["scenario"] = "reorder"   # an expected failure: the window's key, without capture times
     m["reordered"] = {"A": [{"packet": [68, 1, 2], "after": [68, 1, 3], "depth": 1}], "B": []}
     (tmp_path / "manifest.json").write_text(json.dumps(m))
     m = b3intent.load_manifest(tmp_path / "intent.jsonl")

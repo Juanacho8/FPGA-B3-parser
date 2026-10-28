@@ -3,19 +3,20 @@
 
 What it does:
   For every generator set under a data folder, writes DATA/golden/<set>/:
-    expected_feedA.bin   tools/intent_to_events.py (the answer key)
+    expected_feedA.bin   tools/intent_to_events.py (the answer key), Feed A's order
+    expected_feedB.bin   the same for Feed B, in Feed B's own packet order
+                         (tools/b3feed.py reads it from the pcap)
     cpp_feedA.bin        b3_decode --events on feedA.pcap
     cpp_feedB.bin        b3_decode --events on feedB.pcap
     provenance.json      repo commit, the set's generator provenance (its
                          SHA-256 and recorded generator commit), the build
                          parameters, and the SHA-256 of every file above
-  It refuses to write a set whose Feed A files differ (make events-compare
-  says where). A set in b3intent.EXPECTED_FAILURES (the reorder scenario,
-  until the reorder window exists) keeps only expected_feedA.bin, in the
-  window's release order (tools/b3intent.py), with the reason in its
-  provenance; it fails as XPASS if the C++ matches. There is no expected_feedB.bin: Feed B's cross-channel record
-  order is not in the intent log (docs/DESIGN.md 3.7); events-compare checks
-  cpp_feedB.bin per channel against the key instead.
+  It refuses to write a set whose C++ files differ from the expected ones
+  (make events-compare says where). A set in b3intent.EXPECTED_FAILURES (the
+  reorder scenario, until the reorder window exists) keeps only
+  expected_feedA.bin, in the window's release order (tools/b3intent.py,
+  without capture times: the pcap's order is not the window's), with the
+  reason in its provenance; it fails as XPASS if the C++ matches.
   data/ is gitignored; the goldens are reproducible with make data && make goldens.
 
 What it must not do:
@@ -37,6 +38,9 @@ sys.path.insert(0, str(REPO / "tools"))
 
 import b3contract as c   # noqa: E402
 import events_compare     # noqa: E402  (the same instrument table as events-compare)
+import b3intent           # noqa: E402
+import b3replay           # noqa: E402
+import intent_to_events   # noqa: E402
 import b3intent          # noqa: E402
 
 
@@ -70,9 +74,27 @@ def main(argv=None):
         out = root / "golden" / name
         out.mkdir(parents=True, exist_ok=True)
         files = {}
-        subprocess.run([sys.executable, str(REPO / "tools" / "intent_to_events.py"), str(folder / "intent.jsonl"),
-                        "-o", str(out / "expected_feedA.bin")], check=True, stdout=subprocess.DEVNULL)
-        files["expected_feedA.bin"] = out / "expected_feedA.bin"
+        manifest = b3intent.load_manifest(folder / "intent.jsonl")
+        reason = b3intent.expected_failure(manifest)
+        table = b3replay.read_table(events_compare.table_path())
+        for feed in ("A", "B"):
+            if not (folder / f"feed{feed}.pcap").is_file():
+                continue
+            try:
+                records = intent_to_events.convert_feed(folder / "intent.jsonl", manifest, feed,
+                                                        folder / f"feed{feed}.pcap", table)
+            except b3replay.Broken as e:
+                if not reason:
+                    raise
+                if feed != "A":
+                    print(f"XFAIL {name}: expected_feed{feed}.bin not written ({reason}: {e})")
+                    continue
+                # Feed A of an expected failure: the window's release order, no times.
+                rows = (r for _, r in b3intent.feed_rows(folder / "intent.jsonl", manifest, "A"))
+                records = list(intent_to_events.convert(rows, b3replay.Replay(table, manifest, "A")))
+            path = out / f"expected_feed{feed}.bin"
+            path.write_bytes(c.events_header().pack() + b"".join(e.pack() for e in records))
+            files[path.name] = path
         for feed in ("A", "B"):
             pcap = folder / f"feed{feed}.pcap"
             if not pcap.is_file():
@@ -83,9 +105,9 @@ def main(argv=None):
                             str(pcap)], check=True,
                            stdout=subprocess.DEVNULL)
             files[path.name] = path
-        reason = b3intent.expected_failure(b3intent.load_manifest(folder / "intent.jsonl"))
-        matches = "cpp_feedA.bin" in files and \
-            files["cpp_feedA.bin"].read_bytes() == files["expected_feedA.bin"].read_bytes()
+        matches = all(f"cpp_feed{f}.bin" in files and f"expected_feed{f}.bin" in files and
+                      files[f"cpp_feed{f}.bin"].read_bytes() == files[f"expected_feed{f}.bin"].read_bytes()
+                      for f in ("A", "B") if (folder / f"feed{f}.pcap").is_file())
         if reason and matches:
             print(f"XPASS {name}: cpp_feedA.bin matches, but is expected to fail ({reason}); "
                   f"remove it from b3intent.EXPECTED_FAILURES")
@@ -98,13 +120,13 @@ def main(argv=None):
                 if n in files:
                     files.pop(n).unlink()
             xfailed += 1
-        elif "cpp_feedA.bin" in files and not matches:
-            print(f"FAIL {name}: cpp_feedA.bin differs from expected_feedA.bin (run make events-compare)")
+        elif not matches:
+            print(f"FAIL {name}: a cpp_feed*.bin differs from its expected file (run make events-compare)")
             for f in files.values():
                 f.unlink()
             failed += 1
             continue
-        header, _ = c.read_events(files["expected_feedA.bin"].read_bytes())
+        header = c.events_header()
         gen = folder / "provenance.json"
         gen_info = json.loads(gen.read_text()) if gen.is_file() else {}
         provenance = {
@@ -117,8 +139,6 @@ def main(argv=None):
                       "max_instruments": header.max_instruments,
                       "book": "uncapped" if header.tracked_depth == 0 else "capped"},
             "files": {n: {"sha256": sha256(p), "bytes": p.stat().st_size} for n, p in sorted(files.items())},
-            "note": "no expected_feedB.bin: Feed B's cross-channel order is not in intent.jsonl "
-                    "(docs/DESIGN.md 3.7); events-compare checks cpp_feedB.bin per channel",
         }
         if reason:
             provenance["expected_failure"] = f"{reason}: no cpp_feed*.bin, the C++ does not match yet"

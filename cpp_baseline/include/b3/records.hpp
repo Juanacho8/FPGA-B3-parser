@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -123,6 +124,108 @@ inline FileHeader events_header() noexcept {
     h.published_depth = static_cast<std::uint16_t>(kPublishedDepth);
     h.tracked_depth = kBookMode == BookMode::Uncapped ? 0 : static_cast<std::uint16_t>(kTrackedDepth);
     h.max_instruments = static_cast<std::uint32_t>(kMaxInstruments);
+    return h;
+}
+
+// ---- Port 2: book records (DESIGN.md 4.1) ----
+namespace record_type {
+inline constexpr std::uint8_t BOOK_UPDATE = 1;
+inline constexpr std::uint8_t STATE_CHANGE = 2;
+inline constexpr std::uint8_t STATUS = 3;
+}  // namespace record_type
+
+namespace book_state {
+inline constexpr std::uint8_t CLEAN = 0;
+inline constexpr std::uint8_t HOLDING = 1;      // reserved, step 11
+inline constexpr std::uint8_t STALE = 2;
+inline constexpr std::uint8_t RECOVERING = 3;   // reserved, step 12
+}  // namespace book_state
+
+namespace book_flag {
+inline constexpr std::uint8_t RECOVERY = 0x01;
+inline constexpr std::uint8_t DEPTH_INCOMPLETE_BID = 0x02;
+inline constexpr std::uint8_t DEPTH_INCOMPLETE_OFFER = 0x04;
+}  // namespace book_flag
+
+// What caused a STATE_CHANGE (header offset 45; 0 on other record types).
+namespace cause {
+inline constexpr std::uint8_t GAP = 1;
+inline constexpr std::uint8_t DISCARDED_TAIL = 2;
+inline constexpr std::uint8_t RPT_SEQ_JUMP = 3;
+inline constexpr std::uint8_t SILENCE = 4;
+inline constexpr std::uint8_t EMPTY_BOOK = 5;
+inline constexpr std::uint8_t CHANNEL_RESET = 6;
+}  // namespace cause
+
+struct BookLevel {
+    std::int64_t price = 0;
+    std::int64_t qty = 0;
+    std::uint32_t order_count = 0;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(BookLevel) == 24);
+static_assert(offsetof(BookLevel, qty) == 8);
+static_assert(offsetof(BookLevel, order_count) == 16);
+
+struct BookHeader {
+    std::uint64_t out_seq = 0;
+    std::uint32_t seq_num = 0;
+    std::uint16_t seq_version = 0;
+    std::uint8_t channel = 0;
+    std::uint8_t msg_index = 0;
+    std::uint64_t instrument_id = 0;
+    std::uint64_t exch_time = 0;      // on STATUS: ticks_skipped
+    std::uint64_t capture_time = 0;
+    std::uint8_t record_type = 0;
+    std::uint8_t state = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t bid_count = 0;
+    std::uint8_t offer_count = 0;
+    std::uint8_t cause = 0;           // STATE_CHANGE only
+    std::uint8_t reserved[2] = {};
+};
+static_assert(sizeof(BookHeader) == 48);
+static_assert(offsetof(BookHeader, out_seq) == 0);
+static_assert(offsetof(BookHeader, seq_num) == 8);
+static_assert(offsetof(BookHeader, seq_version) == 12);
+static_assert(offsetof(BookHeader, channel) == 14);
+static_assert(offsetof(BookHeader, msg_index) == 15);
+static_assert(offsetof(BookHeader, instrument_id) == 16);
+static_assert(offsetof(BookHeader, exch_time) == 24);
+static_assert(offsetof(BookHeader, capture_time) == 32);
+static_assert(offsetof(BookHeader, record_type) == 40);
+static_assert(offsetof(BookHeader, state) == 41);
+static_assert(offsetof(BookHeader, flags) == 42);
+static_assert(offsetof(BookHeader, bid_count) == 43);
+static_assert(offsetof(BookHeader, offer_count) == 44);
+static_assert(offsetof(BookHeader, cause) == 45);
+
+// Record size = 48 + 2 x N x 24, rounded up to a multiple of 64 (DESIGN.md 4.1).
+constexpr std::size_t book_record_size(std::size_t n) noexcept {
+    return (sizeof(BookHeader) + 2 * n * sizeof(BookLevel) + 63) / 64 * 64;
+}
+static_assert(book_record_size(5) == 320);
+
+template <std::size_t N>
+struct BookRecordT {
+    BookHeader header;
+    BookLevel bids[N];
+    BookLevel offers[N];
+    std::array<std::uint8_t, book_record_size(N) - sizeof(BookHeader) - 2 * N * sizeof(BookLevel)> pad{};
+};
+using BookRecord = BookRecordT<kPublishedDepth>;
+static_assert(sizeof(BookRecord) == book_record_size(kPublishedDepth));
+static_assert(offsetof(BookRecord, bids) == 48);
+
+// The book.bin header of this build, with the STATUS interval at offset 24.
+inline FileHeader book_header(std::uint64_t status_interval_ns) noexcept {
+    FileHeader h;
+    for (std::size_t i = 0; i < sizeof h.magic; ++i) h.magic[i] = kBookMagic[i];
+    h.record_size = sizeof(BookRecord);
+    h.published_depth = static_cast<std::uint16_t>(kPublishedDepth);
+    h.tracked_depth = kBookMode == BookMode::Uncapped ? 0 : static_cast<std::uint16_t>(kTrackedDepth);
+    h.max_instruments = static_cast<std::uint32_t>(kMaxInstruments);
+    h.reserved = status_interval_ns;
     return h;
 }
 

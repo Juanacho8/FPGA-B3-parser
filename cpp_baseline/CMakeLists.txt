@@ -92,10 +92,14 @@ else()
   message(FATAL_ERROR "B3_BOOK must be 'capped' or 'uncapped', got '${B3_BOOK}'")
 endif()
 list(APPEND B3_PARAM_DEFINES B3_BOOK_UNCAPPED=${B3_BOOK_UNCAPPED})
+option(B3_PUBLISH_STALE "Port 2 also publishes STALE books (marked STALE)" OFF)
+if(B3_PUBLISH_STALE)
+  list(APPEND B3_PARAM_DEFINES B3_PUBLISH_STALE=1)
+endif()
 
 message(STATUS "b3: ${CMAKE_BUILD_TYPE}, N=${B3_PUBLISHED_DEPTH_EFFECTIVE} "
                "K=${B3_TRACKED_DEPTH_EFFECTIVE} instruments=${B3_MAX_INSTRUMENTS_EFFECTIVE} "
-               "book=${B3_BOOK}")
+               "book=${B3_BOOK} publish_stale=${B3_PUBLISH_STALE}")
 
 # ---- 5. Library ----
 add_library(b3 STATIC src/pcap.cpp src/decode_writer.cpp src/instruments.cpp)
@@ -112,7 +116,8 @@ target_link_libraries(b3_decode PRIVATE b3)
 enable_testing()
 add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp
   tests/test_pcap.cpp tests/test_walker.cpp tests/test_decode.cpp
-  tests/test_sequencer.cpp tests/test_instruments.cpp tests/test_tracker.cpp tests/test_events.cpp)
+  tests/test_sequencer.cpp tests/test_instruments.cpp tests/test_tracker.cpp tests/test_events.cpp
+  tests/test_book.cpp)
 target_link_libraries(b3_tests PRIVATE b3)
 target_include_directories(b3_tests SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 # The repository root: tests read docs/DESIGN.md's hex examples and B3's sample packet.

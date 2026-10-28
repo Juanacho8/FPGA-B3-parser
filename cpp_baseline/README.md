@@ -4,7 +4,7 @@ Software feed handler for B3 Binary UMDF: pcap in, event records (port 1) and
 book updates (port 2) out. It is the correctness reference, the RTL's golden
 model, and the software timing baseline. Full brief: `docs/CPP_BASELINE_CONTEXT.md`.
 
-Status: step 7 (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records).
+Status: step 8a (build system, generated layouts, pcap reader, packet decoder, message walker, field decoding, full decode writer, sequencing, instrument table, rptSeq and stale flags, port 1 event records, the uncapped book and port 2).
 
 ## Requirements
 
@@ -27,6 +27,7 @@ From the repo root:
 | `make cpp-clean` | Deletes `cpp_baseline/build` | |
 | `make data` | Runs the feed generator for every set into `data/` (gitignored), the default `B3_DATA` | |
 | `make events-compare` | Release and variant builds, then `b3_decode --events` (port 1) against `tools/intent_to_events.py`: Feed A byte-identical, Feed B per channel, identical records in every build | `cpp_baseline/build/*` |
+| `make book-compare` | Uncapped build, then `b3_decode --book` (port 2) against `tools/expected_book.py` byte for byte on both feeds, the book key for CLEAN instruments, and the book counters | `cpp_baseline/build/uncapped` |
 | `make goldens` | Port 1 goldens for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release` |
 | `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
 | `make decode-compare` | Release build, then `b3_decode --decode` against intent.jsonl (`compare_decode.py --strict`) on both feeds of every set, the schema set's features and B3's sample packet | `cpp_baseline/build/release` |
@@ -107,6 +108,17 @@ cpp_baseline/build/release/b3_decode --events events.bin feedA.pcap
 python3 tools/dump_events.py events.bin --limit 20
 ```
 
+## Port 2 (step 8a: the uncapped book)
+
+`book_uncapped.hpp`: sorted flat level arrays per instrument and side,
+reserved at startup. `book_sink.hpp`: BOOK_UPDATE, STATE_CHANGE and STATUS
+records from port 1 records and the tracker's state changes (DESIGN.md 4).
+In 8a, `--book` needs the uncapped build; the capped book is step 8b.
+
+```
+cpp_baseline/build/uncapped/b3_decode --instruments instruments.txt --book book.bin feedA.pcap
+```
+
 ## Book parameters
 
 Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake:
@@ -117,6 +129,7 @@ Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake
 | `-DB3_TRACKED_DEPTH=K` | 16 | Levels per side kept internally |
 | `-DB3_MAX_INSTRUMENTS=M` | 64 | Books held |
 | `-DB3_BOOK=capped\|uncapped` | capped | Capped: K slots per side (the RTL's algorithm). Uncapped: no tracked-depth limit |
+| `-DB3_PUBLISH_STALE=ON` | OFF | Port 2 also writes BOOK_UPDATEs for STALE books, marked STALE |
 
 Code reads them as `b3::kPublishedDepth`, `b3::kTrackedDepth`,
 `b3::kMaxInstruments` and `b3::kBookMode`. N > K fails to compile.
@@ -152,6 +165,8 @@ include/b3/instruments.hpp   instrument table: load and lookup
 include/b3/tracker.hpp       rptSeq, stale flags, per-message checks
 include/b3/records.hpp       port 1 record and file header structs
 include/b3/event_sink.hpp    port 1: records, event closing
+include/b3/book_uncapped.hpp the uncapped price-level book
+include/b3/book_sink.hpp     port 2: book updates, state changes, status
 src/instruments.cpp
 apps/b3_decode.cpp           pcap -> decode counts JSON (and --list)
 tests/test_build.cpp         doctest main, build parameter tests
@@ -164,5 +179,6 @@ tests/test_sequencer.cpp     sequencing rules
 tests/test_tracker.cpp       rptSeq, stale flags, unknown instruments
 tests/test_instruments.cpp   table loading and lookup
 tests/test_events.cpp        port 1 per kind, event closing, DESIGN.md hex examples
+tests/test_book.cpp          uncapped book, port 2 rules, DESIGN.md 4.7
 third_party/doctest.h        doctest 2.4.11, vendored (MIT)
 ```

@@ -99,7 +99,7 @@ Default header (N = 5, K = 16, 64 instruments), events.bin:
 | 0 | END_OF_EVENT | matchEventIndicator bit 7. Always 1 on an END_OF_EVENT marker |
 | 1 | RECOVERY | matchEventIndicator bit 5 (RecoveryMsg) |
 | 2 | IMPLIED | matchEventIndicator bit 4 |
-| 3 | BOOK_NOT_CLEAN | The record's instrument is a table instrument (4.4) whose state is not CLEAN (today: STALE, 3.6.4) once this message has been applied: a gap is marked before the packet that reveals it, so its records carry the bit; an rptSeq jump marks its own message; an instrument's EmptyBook and a ChannelReset clear it first, so their records do not. Records with no table instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET, END_OF_EVENT, or a securityID not in the table) have 0 |
+| 3 | BOOK_NOT_CLEAN | The record's instrument is a table instrument (4.4) whose state is not CLEAN (today: STALE, 3.6.4: a loss, an rptSeq jump or a silence) once this message has been applied: a gap or a silence is marked before the packet that reveals it, so its records carry the bit; an rptSeq jump marks its own message; an instrument's EmptyBook and a ChannelReset clear it first, so their records do not. Records with no table instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET, END_OF_EVENT, or a securityID not in the table) have 0 |
 | 4–7 | reserved, 0 | |
 
 A message without a matchEventIndicator (ExecutionSummary, SequenceReset) has flags 0. An END_OF_EVENT marker takes bits 1 and 2 from the closing message's matchEventIndicator.
@@ -206,7 +206,7 @@ Consequences, all deliberate:
 
 * Python, the answer key: `tools/intent_to_events.py` (from intent.jsonl).
 * C++: `cpp_baseline/include/b3/records.hpp` (the record and file header as structs, every offset `static_assert`ed, little-endian hosts only) and `event_sink.hpp` (the per-kind fields of 3.4 and the state machine above). `b3_decode --events FILE` writes the file. Its record buffer is allocated before the decode loop with one slot per complete message, counted at load time (a message gives at most one record: its own or a marker); a record past that capacity is counted, never stored.
-* `make events-compare` checks the C++ against the converter on every set: Feed A byte for byte, Feed B record by record within each channel (3.7), in the release, k16, k32 and uncapped builds, whose records must be identical (only the header's N and K differ). `make goldens` writes the RTL goldens (section 5).
+* `make events-compare` checks the C++ against the converter on every set, both feeds byte for byte in full order (3.7), in the release, k16, k32 and uncapped builds, whose records must be identical (only the header's N and K differ). `make goldens` writes the RTL goldens (section 5).
 
 ### 3.6 Which messages reach port 1
 
@@ -300,6 +300,7 @@ Per table instrument (4.4), on dispatch (`Tracker`). Flags only: there is no boo
 
 * **rptSeq**: every message with a securityID in the table and an rptSeq field. It must be the previous + 1, or 1 on the message after the instrument's EmptyBook. A jump is counted (`rpt_seq_gaps`) and marks **that instrument** stale, at the packet holding the message. The first message seen sets the starting value. A ChannelReset does not touch rptSeq; in every generator set each instrument's first message after a ChannelReset (or a SequenceReset) is its own EmptyBook, which restarts it.
 * **Losses** mark **every table instrument of the channel** stale: a sequence gap (stale point: channel, sequenceVersion and the first missing sequenceNumber) and a discarded tail (a malformed packet, or messages past msg_index 255; stale point: the packet itself). A decoder cannot know what the lost bytes held, so a loss is assumed to have held a message for each instrument of the channel, or a channel-wide one. A gap is marked before the packet that reveals it is dispatched; a discarded tail after the packet's complete messages.
+* **Silence** (`spec/LAYOUTS.md` 12.1: no message for 3 heartbeat intervals means the stream is down): each channel's last datagram is remembered (any datagram with a packet header: a heartbeat, a duplicate, a late packet). When time next advances (a datagram arrives, on any channel), every channel that has sent nothing for more than the **silence limit** (3 s of capture time by default, `b3_decode --silence-ns`, 0 turns it off) marks every CLEAN table instrument of it STALE, once per silence. Stale point: (channel, its sequenceVersion, its next expected sequenceNumber). The check runs before the datagram that advanced time is looked at, so that datagram's own channel is judged by its previous one. Counted (`silences`).
 * **Clearing**: an instrument's **EmptyBook** clears its stale flag; a **ChannelReset** clears it for every table instrument of its channel. Nothing else does.
 * **Before the rebuild**: after a ChannelReset, a message for a table instrument of that channel arriving before the instrument's own EmptyBook is counted (`msg_before_rebuild`). B3 may interleave such messages (generator open item J); the generator never does, and no rule here depends on it.
 * Reported per instrument: rptSeq gaps, the number of times it went stale, whether it is stale at the end, and its **first stale point** (channel, sequenceVersion, sequenceNumber), kept even after a clear.
@@ -312,8 +313,9 @@ The generator's `unreliable_books` (manifest.json) comes from the contents of th
 
 events.bin describes one feed's pcap, decoded alone (A/B arbitration comes in step 11).
 
-* **Feed A**: the generator's intent.jsonl is in Feed A wire order. `tools/intent_to_events.py` produces the expected events.bin for every set. In the `reorder` scenario the keys follow the reorder window's release order instead (`docs/CPP_BASELINE_CONTEXT.md` section 6, `tools/b3intent.py` feed_rows), an expected failure until step 11.
-* **Feed B** carries the same packets as A (minus `missing.B`), in the same order *within each channel*. But it merges the channels by its own jittered pcap timestamps, which intent.jsonl does not record. So the cross-channel order of a Feed B events.bin cannot be derived from the answer keys, and the converter refuses `--feed B`. Per channel, Feed B's records equal Feed A's records with `missing.B` removed instead of `missing.A`. A Feed B check needs either the generator to record B's packet order, or a comparison done per channel.
+* The answer keys follow **each feed's own packet order and capture times**, read from its pcap with the generator's independent reader (`tools/b3feed.py`): per channel, the next packet of the feed's view of intent.jsonl (`tools/b3intent.py`) is the next datagram of that channel the decoder accepts; the messages themselves are the intent log's. `tools/intent_to_events.py` (port 1) and `tools/expected_book.py` (port 2) produce the expected files for **both feeds**, and both are compared byte for byte in full order. The capture times also drive the silence rule (3.6.4) and STATUS (4.3).
+* **Feed B** carries the same packets as A (minus `missing.B`), in the same order within each channel, merged across channels by its own jittered pcap timestamps.
+* In the `reorder` scenario the keys follow the reorder window's release order (`docs/CPP_BASELINE_CONTEXT.md` section 6), which is not a pcap's order: an expected failure until step 11, whose port 1 Feed A key is the view's order without capture times.
 * `tools/compare_decode.py` matches rows per channel, so it checks a decode of either feed.
 
 ### 3.8 Not on port 1, but counted
@@ -392,26 +394,31 @@ c8 00 00 00 00 00 00 00 07 10 a5 d4 e8 00 00 00
 
 ### 4.1 Record layout
 
-A 32-byte header, then N bid levels and N offer levels, best first, then zero padding.
+Every port 2 record has the same size: a 48-byte header, then N bid levels and N offer levels, best first, then zero padding. Levels a record does not use are zero.
 
-**Record size** = 32 + 2 × N × 24, rounded up to a multiple of 64. N = 5: 272 → **320 bytes**. (N = 1: 128, N = 10: 512.)
+**Record size** = 48 + 2 × N × 24, rounded up to a multiple of 64. N = 5: 288 → **320 bytes** (unchanged from the earlier 32-byte header). N = 1: 128, N = 10: 576.
 
 Header:
 
 | Off | Size | Type | Field | Meaning |
 |---|---|---|---|---|
-| 0 | 4 | u32 | seq_num | Identity of the message that closed the event (3.5) |
-| 4 | 2 | u16 | seq_version | |
-| 6 | 1 | u8 | channel | |
-| 7 | 1 | u8 | msg_index | |
-| 8 | 8 | u64 | instrument_id | securityID |
-| 16 | 8 | u64 | exch_time | Closing message's time field (3.4) |
-| 24 | 1 | u8 | flags | Below |
-| 25 | 1 | u8 | bid_count | Valid bid levels, 0..N |
-| 26 | 1 | u8 | offer_count | Valid offer levels, 0..N |
-| 27 | 5 | | reserved | 0 |
+| 0 | 8 | u64 | out_seq | Output sequence number: 1 on the file's first record, + 1 on each record, so a consumer sees a missing record |
+| 8 | 4 | u32 | seq_num | Identity of the message the record is for (4.3), 0 on STATUS |
+| 12 | 2 | u16 | seq_version | |
+| 14 | 1 | u8 | channel | |
+| 15 | 1 | u8 | msg_index | |
+| 16 | 8 | u64 | instrument_id | securityID, 0 on STATUS |
+| 24 | 8 | u64 | exch_time / ticks_skipped | BOOK_UPDATE and STATE_CHANGE: the message's time field (3.4), 0 on a loss's or a silence's STATE_CHANGE. STATUS: **ticks_skipped**, the number of earlier ticks this STATUS stands for |
+| 32 | 8 | u64 | capture_time | Capture time (pcap, ns) of the packet being processed; on STATUS, the interval's tick |
+| 40 | 1 | u8 | record_type | 1 BOOK_UPDATE, 2 STATE_CHANGE, 3 STATUS (0 never written) |
+| 41 | 1 | u8 | state | The instrument's book state after the record (below); 0 on STATUS |
+| 42 | 1 | u8 | flags | Below |
+| 43 | 1 | u8 | bid_count | Valid bid levels, 0..N |
+| 44 | 1 | u8 | offer_count | Valid offer levels, 0..N |
+| 45 | 1 | u8 | cause | STATE_CHANGE: what caused it (below); 0 on other record types |
+| 46 | 2 | | reserved | 0 |
 
-Levels: bid level i (0 = best) at offset 32 + 24·i, offer level i at 32 + 24·(N + i). Padding from 32 + 48·N to the record size is 0.
+Levels: bid level i (0 = best) at offset 48 + 24·i, offer level i at 48 + 24·(N + i). Padding from 48 + 48·N to the record size is 0.
 
 | Off in level | Size | Type | Field |
 |---|---|---|---|
@@ -421,26 +428,69 @@ Levels: bid level i (0 = best) at offset 32 + 24·i, offer level i at 32 + 24·(
 | 20 | 4 | | reserved, 0 |
 
 * Bids are sorted by price descending, offers ascending. Levels at index ≥ bid_count (or offer_count) are all zero.
-* A level with order_count 0 is never published (the slot is removed when its count reaches 0).
+* A level with order_count 0 is never published (it is removed when its count reaches 0).
 
-Flags:
+**Book state** (byte 41, per table instrument):
+
+| Value | State | Meaning |
+|---|---|---|
+| 0 | CLEAN | The book can be trusted |
+| 1 | HOLDING | Reserved for step 11 (a hole held in the arbitration window) |
+| 2 | STALE | A loss, an rptSeq jump or a silence (3.6.4); cleared by the instrument's EmptyBook or a ChannelReset |
+| 3 | RECOVERING | Reserved for step 12 (snapshot recovery) |
+
+**Cause** (byte 45, STATE_CHANGE only; 0 on BOOK_UPDATE and STATUS):
+
+| Value | Cause | Transition |
+|---|---|---|
+| 1 | Gap | CLEAN → STALE: missing packets (3.6.1), before the packet that reveals them |
+| 2 | Discarded tail | CLEAN → STALE: a malformed packet's tail was discarded (3.2), after its complete messages |
+| 3 | rptSeq jump | CLEAN → STALE: this instrument's rptSeq skipped (3.6.4) |
+| 4 | Silence | CLEAN → STALE: the channel sent nothing for more than the silence limit (3.6.4) |
+| 5 | EmptyBook | STALE → CLEAN: the instrument's EmptyBook |
+| 6 | ChannelReset | STALE → CLEAN: its channel's ChannelReset |
+
+0 and 7–255 are never written on a STATE_CHANGE.
+
+**Flags** (byte 42):
 
 | Bit | Flag | Meaning |
 |---|---|---|
-| 0 | STALE | The instrument's book is stale (brief section 5). Under the v1 publish rule (no updates for stale instruments) it is always 0. It is kept for a later mode that publishes stale books |
-| 1 | RECOVERY | A record that changed this instrument's book in the event had RecoveryMsg |
-| 2 | DEPTH_INCOMPLETE_BID | Bid side truncated with fewer than N valid levels (brief section 5) |
-| 3 | DEPTH_INCOMPLETE_OFFER | Same, offer side |
-| 4–7 | reserved, 0 | |
+| 0 | RECOVERY | BOOK_UPDATE: a record that changed this instrument's book in the event had RecoveryMsg. 0 on other types |
+| 1 | DEPTH_INCOMPLETE_BID | Bid side truncated with fewer than N valid levels (brief section 5); always 0 in the uncapped book |
+| 2 | DEPTH_INCOMPLETE_OFFER | Same, offer side |
+| 3–7 | reserved, 0 | |
+
+**File header** (section 2): magic `B3PORT2\0`, the record size, N, K (0 for the uncapped book), MAX_INSTRUMENTS, and in book.bin the 8 bytes at offset 24 hold the **STATUS interval** in ns (events.bin keeps them 0).
 
 ### 4.2 Capped and uncapped books
 
-* **Capped** (`B3_BOOK=capped`, the RTL's algorithm): K slots per side, with the truncation and depth-incomplete rules of brief section 5. The file header records K.
-* **Uncapped** (`B3_BOOK=uncapped`, software only): no tracked-depth limit. Same record format. The file header records **K = 0**, and DEPTH_INCOMPLETE_BID/OFFER are always 0.
+* **Capped** (`B3_BOOK=capped`, the RTL's algorithm): K slots per side, with the truncation and depth-incomplete rules of brief section 5. The file header records K. Step 8b.
+* **Uncapped** (`B3_BOOK=uncapped`, software only, step 8a, 4.5): no tracked-depth limit. Same record format. The file header records **K = 0**, and DEPTH_INCOMPLETE_BID/OFFER are always 0.
 
 ### 4.3 When records are written
 
-At each close of a channel's event (3.5), one record per instrument in `touched[ch]` that is in the book table and not stale, in order of first touch within the event. CLEAR_CHANNEL touches every instrument of that channel in the book table, in table order. An instrument is touched when it receives a book-changing record (ADD, MODIFY, DELETE, CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL), even if the change falls in the untracked region and the published levels do not change. Nothing is written mid-event (brief open item E).
+Port 2 is computed from port 1's records (3), the tracker's state changes (3.6.4) and the capture time; it never reads the wire. Per channel, the **touched set** holds the table instruments that received a book-changing record (ADD, MODIFY, DELETE, CLEAR_SIDE, CLEAR_BOOK) since the channel's last close, in order of first touch. Records of instruments not in the table change no book and touch nothing.
+
+For each message, in decoder order, the book does three things, in this order:
+
+1. **Apply** its port 1 record, if any, to the book (4.5) and update the touched set.
+2. **STATE_CHANGE** for every state change the message caused (in table slot order).
+3. **Close**, if its record carries flag bit 0 (EndOfEvent, a marker included) and is not a reset: BOOK_UPDATEs, then the touched set is emptied.
+
+A loss (a gap, before the packet that reveals it; a discarded tail, after the packet's complete messages) and a silence (when time advances) cause STATE_CHANGEs only. For each datagram, in order: STATUS (if a tick is due), the silence rule's STATE_CHANGEs, then the datagram (a gap's STATE_CHANGEs, its messages, a discarded tail's).
+
+| Record | Written when | Identity, exch_time | state | Levels |
+|---|---|---|---|---|
+| BOOK_UPDATE | At a close, one per touched instrument, in order of first touch, whose state is CLEAN. While STALE nothing is written, unless the build sets `B3_PUBLISH_STALE`: then it is written with state STALE | The closing record's (a marker's identity is its closing message's) | CLEAN (or STALE) | The book's top N |
+| STATE_CHANGE | The moment an instrument's state changes: CLEAN → STALE on a loss, an rptSeq jump or a silence (3.6.4); STALE → CLEAN on its EmptyBook or a ChannelReset. Even with no book change | The causing message's identity and time field; for a loss or a silence, (channel, sequenceVersion, the stale point's sequenceNumber, msg_index 0) and exch_time 0 | The new state; cause at offset 45 (4.1) | The book's top N if the new state is CLEAN, else zeros |
+| STATUS | Ticks at T0 + k × interval, k ≥ 1 (default 100 ms, `b3_decode --status-interval-ns`), T0 = the capture time of the file's first datagram. When a datagram's capture time reaches one or more ticks not yet written, **one** STATUS for the latest of them, before the datagram; ticks_skipped = how many earlier ticks it stands for (none after the last datagram) | All 0, instrument_id 0; capture_time = the tick; offset 24 = ticks_skipped | 0 | Zeros |
+
+**Resets** (3.5): a SequenceReset or ChannelReset closes nothing. Its record clears the channel's touched set, discarding the open event without a BOOK_UPDATE. A ChannelReset then clears every table instrument's book on its channel and **touches** each of them, so the channel's next close publishes their (empty or rebuilt) books. Each that was STALE gets a **STATE_CHANGE to CLEAN at the reset**, carrying its empty book (bid_count and offer_count 0); the ones already CLEAN get none. Nothing is written mid-event (brief open item E).
+
+**Live versus replay time.** `b3_decode` and the answer keys replay a capture: time exists only as packets' capture timestamps, so the STATUS ticks and the silence check run only when a datagram arrives (on any channel). If every channel goes quiet at once, nothing runs until the next datagram, and the STATUS and silence records for the outage appear only then (as one coalesced STATUS and the STATE_CHANGEs). A live implementation must run both on its own clock (the RTL: a free-running timer), so that a whole-feed outage is still detected and reported while it lasts. The goldens stay valid for the RTL because its testbench drives time from the capture timestamps, as the replay does.
+
+Hex examples: 4.7.
 
 ### 4.4 Instrument table
 
@@ -452,9 +502,127 @@ The instruments the decoder tracks (rptSeq and stale flags now, books from step 
 * **Not in the table**: the message is still decoded and still goes to port 1 (3.6), but its instrument gets no rptSeq tracking and no book. It is counted.
 * The channel column says which instruments a loss on a channel marks stale, and which a ChannelReset clears (3.6.4). The lookup itself is by securityID only.
 
-### 4.5 Future items
+### 4.5 Uncapped book
+
+`cpp_baseline/include/b3/book_uncapped.hpp`. Per table instrument and side, a sorted flat array of levels (price, qty, order_count), the best price at the end, with a fixed capacity per side reserved at startup (`b3_decode --book-levels`, default 1024). A new level past it is counted (`level_overflow`) and dropped; the array never grows in the decode loop. The state size in bytes is in the counters JSON.
+
+| Port 1 record | Update |
+|---|---|
+| ADD at price p | Level p: qty += qty, count += 1; a new level if none |
+| MODIFY | Level p: qty += qty − previous qty (aux) |
+| DELETE | Level p: qty −= qty, count −= 1; the level is removed when count reaches 0 |
+| CLEAR_SIDE | One side emptied |
+| CLEAR_BOOK | Both sides emptied |
+| CLEAR_CHANNEL | Every table instrument of the channel emptied |
+
+Trades never touch the book. A **null price** (INT64_MIN, a market-on-auction order) is counted (`null_price_orders`) and kept out of the levels. **Consistency errors** are counted, split by the instrument's state when they happen: a MODIFY or DELETE on a level that does not exist (ignored), a qty or count going negative, a level reaching count 0 with qty not 0. While CLEAN there must be none; while STALE they are expected (the lost messages built the levels).
+
+### 4.6 Future items
 
 * **Snapshot recovery**: rebuilding a stale instrument from the snapshot recovery stream (`spec/LAYOUTS.md` 12.6, 12.8), which would clear its stale flag. Not in v1: a stale instrument stays stale until its EmptyBook or a ChannelReset (3.6.4).
+
+### 4.7 Worked example
+
+The bytes below are produced by `tools/expected_book.py` (`run_packets`) from `tools/tests/book_example.py`, and checked against this file by `tools/tests/test_book_examples.py` (Python) and `cpp_baseline/tests/test_book.cpp` (the C++ book sink, which builds the same messages and parses this block the same way). N = 5: each record is 320 bytes, shown as twenty rows of 16.
+
+Input: channel 68, WIN (securityID 200000001) the only table instrument, STATUS interval 100 ms.
+
+| Packet | Capture time | Messages | Port 2 |
+|---|---|---|---|
+| 1 | 1.000 s (T0) | Order_MBO NEW bid 1299800000 x5 (soid 1, rptSeq 1, mEI 0); Order_MBO NEW bid 1299750000 x3 (soid 2, rptSeq 2, mEI 0x80, transactTime 999000100) | BOOK_UPDATE, out_seq 1 |
+| 2 | | missing | |
+| 3 | 1.050 s | Order_MBO NEW offer 1299850000 x2 (rptSeq 4, mEI 0x80) | STATE_CHANGE to STALE (the gap, before the packet), out_seq 2; the order is booked but, STALE, not published |
+| 4 | 1.150 s | EmptyBook WIN (mEI 0x20, mDEntryTimestamp 1149000000) | STATUS for the 1.100 s tick (before the packet, ticks_skipped 0), out_seq 3; STATE_CHANGE to CLEAN, out_seq 4 |
+
+In v1 a STATE_CHANGE to CLEAN always shows an empty book: both events that clear STALE (EmptyBook, ChannelReset) empty it.
+
+<!-- example:book_records -->
+```text
+# BOOK_UPDATE: WIN bids 1299800000 x5 (1), 1299750000 x3 (1), closing message packet 1 message 1
+01 00 00 00 00 00 00 00 01 00 00 00 01 00 44 01
+01 c2 eb 0b 00 00 00 00 24 88 8b 3b 00 00 00 00
+00 ca 9a 3b 00 00 00 00 01 00 00 02 00 00 00 00
+c0 5f 79 4d 00 00 00 00 05 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00 70 9c 78 4d 00 00 00 00
+03 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+# STATE_CHANGE to STALE: the gap at packet 2 (identity 68/1/2/0), cause 1 (gap), levels zero
+02 00 00 00 00 00 00 00 02 00 00 00 01 00 44 00
+01 c2 eb 0b 00 00 00 00 00 00 00 00 00 00 00 00
+80 ba 95 3e 00 00 00 00 02 02 00 00 00 01 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+# STATUS: the 1.100 s tick (capture_time 1100000000), ticks_skipped 0 (offset 24), all else zero
+03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 ab 90 41 00 00 00 00 03 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+# STATE_CHANGE to CLEAN: WIN's EmptyBook, packet 4 message 0, exch_time its mDEntryTimestamp, cause 5 (EmptyBook); the book is empty
+04 00 00 00 00 00 00 00 04 00 00 00 01 00 44 00
+01 c2 eb 0b 00 00 00 00 40 59 7c 44 00 00 00 00
+80 9b 8b 44 00 00 00 00 02 00 00 00 00 05 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
 
 ---
 
@@ -472,7 +640,10 @@ All in `tools/`, Python standard library only, tests in `tools/tests/` (pytest).
 | `pcap_crosscheck.py` | `b3_pcapinfo` against the generator's independent pcap reader (`make pcap-crosscheck`) |
 | `counters_compare.py` | `b3_decode --counters` against counters derived from manifest.json and intent.jsonl: sequencing, rptSeq, stale flags and points, every other counter, both feeds (`make counters-compare`) |
 | `gen_instruments.py` | The instrument table (4.4) from the feed generator's config.toml |
-| `events_compare.py` | `b3_decode --events` against `intent_to_events.py`: Feed A byte-identical, Feed B per channel, every build (`make events-compare`) |
+| `expected_book.py` | The expected port 2 book.bin for one feed (4): port 1 from `intent_to_events.py`, stale state from `b3replay.py`, a small independent price-level book, packet order and capture times from the pcap |
+| `book_compare.py` | `b3_decode --book` (uncapped build) against `expected_book.py` byte for byte on both feeds, the book key at every checkpoint for CLEAN instruments, and the book counters (`make book-compare`) |
+| `events_compare.py` | `b3_decode --events` against `intent_to_events.py`: both feeds byte-identical in full order, every build (`make events-compare`) |
+| `b3feed.py` | One feed's answer-key messages in the feed's own packet order and capture times, from its pcap (3.7) |
 | `make_goldens.py` | Port 1 goldens for the RTL (`make goldens`, below) |
 | `decode_compare.py` | `b3_decode --decode` against intent.jsonl with `compare_decode.py --strict`, both feeds of every set, the schema set's features and B3's sample packet (`make decode-compare`) |
 | `decode_crosscheck.py` | `b3_decode` counts and per-message listing against intent.jsonl and manifest.json, both feeds (`make decode-crosscheck`) |
@@ -485,7 +656,7 @@ python3 -m pytest tools/tests
 make data && python3 -m pytest tools/tests   # data tests fail until make data has run
 ```
 
-**Goldens** (`make data && make goldens`): for every set, `data/golden/<set>/` holds `expected_feedA.bin` (the converter), `cpp_feedA.bin` and `cpp_feedB.bin` (the C++, release build), and `provenance.json` with the repo commit (and whether the tree was dirty), the SHA-256 and recorded commit of the set's generator `provenance.json`, the build parameters, and each file's SHA-256 and size. A set whose Feed A files differ is not written. There is no expected Feed B file: Feed B's cross-channel order is not in intent.jsonl (3.7). `data/` is gitignored; the goldens are rebuilt, not committed.
+**Goldens** (`make data && make goldens`): for every set, `data/golden/<set>/` holds `expected_feedA.bin` and `expected_feedB.bin` (the converter, each in its feed's own order), `cpp_feedA.bin` and `cpp_feedB.bin` (the C++, release build), and `provenance.json` with the repo commit (and whether the tree was dirty), the SHA-256 and recorded commit of the set's generator `provenance.json`, the build parameters, and each file's SHA-256 and size. A set whose C++ files differ from the expected ones is not written. `data/` is gitignored; the goldens are rebuilt, not committed.
 
 `intent_to_events.py` writes N, K and MAX_INSTRUMENTS into the header (defaults 5, 16, 64, matching `book_params.hpp`). For a golden file matched against another build, pass `--tracked-depth 32` (or `0` for uncapped) and so on.
 

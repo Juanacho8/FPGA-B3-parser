@@ -8,13 +8,16 @@ What it does:
   feed's pcap writes: rows the feed lost are left out, and so are the
   messages our malformed policy discards (tools/b3intent.py).
 
-  Feed A only. Feed B carries the same packets per channel, but merges the
-  channels in an order set by its own jittered timestamps, which the intent
-  log does not record (see DESIGN.md section 3.7).
+  Either feed: the records follow the feed's own packet order and capture
+  times, read from its pcap with the generator's independent reader
+  (tools/b3feed.py), which also gives the silence rule its time
+  (DESIGN.md 3.6.4). The pcap's packet headers and timestamps are all that
+  is read from it; the messages are the intent log's.
 
 What it must not do:
-  Import b3gen (its encoders or layouts), read the pcap, or look at C++
-  output. Its only inputs are intent.jsonl and manifest.json.
+  Import b3gen (its encoders or layouts), decode B3 messages from the pcap,
+  or look at C++ output. Its inputs are intent.jsonl, manifest.json and the
+  feed's pcap's order and times.
 
 Usage:
   python3 tools/intent_to_events.py data/small/intent.jsonl -o expected_events.bin
@@ -211,6 +214,18 @@ def end_of_event_marker(row, mei):
                    exch_time=field(row, TIME_FIELD[t]) if t in TIME_FIELD else 0)
 
 
+def convert_feed(intent, manifest, feed, pcap, table, silence_ns=b3replay.DEFAULT_SILENCE_NS):
+    """Port 1 records of one feed, in its pcap's order (tools/b3feed.py), with
+    the "book not clean" flag from the per-feed stale replay."""
+    import b3feed
+    replay = b3replay.Replay(table, manifest, feed, silence_ns)
+    closer = Closer()
+    out = []
+    b3feed.drive(intent, manifest, feed, pcap, replay,
+                 on_row=lambda row: out.extend(closer.process(row, replay)))
+    return out
+
+
 def convert(rows, replay=None):
     """Port 1 records for decoded rows, in order. With replay (a
     b3replay.Replay for the rows' feed), records of stale table instruments
@@ -239,22 +254,23 @@ def main(argv=None):
     ap.add_argument("--max-instruments", type=int, default=c.DEFAULT_MAX_INSTRUMENTS)
     ap.add_argument("--instruments", help="instrument table (default: the generator config's, as "
                                           "tools/gen_instruments.py writes it)")
+    ap.add_argument("--pcap", help="the feed's pcap (default: feedA.pcap or feedB.pcap next to intent.jsonl)")
+    ap.add_argument("--silence-ns", type=int, default=b3replay.DEFAULT_SILENCE_NS)
     args = ap.parse_args(argv)
 
-    if args.feed == "B":
-        print("error: Feed B's cross-channel packet order is set by its jittered pcap "
-              "timestamps, which intent.jsonl does not record (DESIGN.md section 3.7)",
-              file=sys.stderr)
-        return 2
     manifest = b3intent.load_manifest(args.intent, args.manifest)
-    rows = (row for _, row in b3intent.feed_rows(args.intent, manifest, args.feed))
     table = b3replay.read_table(args.instruments) if args.instruments else b3replay.default_table()
-    replay = b3replay.Replay(table, manifest, args.feed)
+    pcap = Path(args.pcap) if args.pcap else Path(args.intent).with_name(f"feed{args.feed}.pcap")
+    try:
+        events = convert_feed(args.intent, manifest, args.feed, pcap, table, args.silence_ns)
+    except b3replay.Broken as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     header = c.events_header(args.published_depth, args.tracked_depth, args.max_instruments)
     count = 0
     with open(args.out, "wb") as out:
         out.write(header.pack())
-        for event in convert(rows, replay):
+        for event in events:
             out.write(event.pack())
             count += 1
     print(f"{args.out}: {count} records")

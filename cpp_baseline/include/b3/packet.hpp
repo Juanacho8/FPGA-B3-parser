@@ -186,6 +186,11 @@ public:
         if (next_seq_no != expected) ++counters_.heartbeat_mismatches;
     }
 
+    // A channel's sequence version and next expected number (0, 0 before its
+    // first sequenced packet): the silence rule's stale point.
+    std::uint16_t expected_version(std::uint8_t channel) const noexcept { return channels_[channel].version; }
+    std::uint32_t expected_next(std::uint8_t channel) const noexcept { return channels_[channel].next; }
+
     const SequenceVerdict& last() const noexcept { return last_; }
     const SequencerCounters& counters() const noexcept { return counters_; }
 

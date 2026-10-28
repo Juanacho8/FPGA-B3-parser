@@ -6,7 +6,9 @@ What it does:
   (rptSeq and stale flags), from the manifest's missing packets and faults:
   a gap or a discarded malformed tail marks every table instrument of the
   channel stale, an rptSeq jump one instrument, EmptyBook and ChannelReset
-  clear. It is the one derivation of stale state shared by
+  clear. With capture times (tools/b3feed.py drives advance() and saw() from
+  the feed's pcap), a channel silent for more than the silence limit marks
+  its table instruments stale too (DESIGN.md 3.6.4, spec/LAYOUTS.md 12.1). It is the one derivation of stale state shared by
   tools/counters_compare.py (counters, first stale points) and
   tools/intent_to_events.py (port 1's "book not clean" flag).
   Every gap it finds must be packets the manifest lists as missing.
@@ -19,6 +21,7 @@ from pathlib import Path
 
 SEQUENCE_RESET, SEQUENCE, EMPTY_BOOK, CHANNEL_RESET = 1, 2, 9, 11
 MAX_VERSION = 65534
+DEFAULT_SILENCE_NS = 3_000_000_000   # 3 heartbeat intervals of 1 s (LAYOUTS.md 12.1)
 
 
 class Broken(Exception):
@@ -63,8 +66,12 @@ def packets(rows):
 class Replay:
     """The sequencer and tracker rules over the answer keys' rows."""
 
-    def __init__(self, table, manifest, feed):
+    def __init__(self, table, manifest, feed, silence_ns=DEFAULT_SILENCE_NS):
         self.table = table
+        self.silence_ns = silence_ns
+        self.last_seen = {}   # channel -> capture time of its last datagram
+        self.silent = set()   # channels already marked for their current silence
+        self.silences = 0
         self.slot = {sid: i for i, (sid, _) in enumerate(table)}
         self.missing = {tuple(k) for k in manifest["missing"][feed]}
         self.faulted = {(f["channel"], f["sequenceVersion"], f["sequenceNumber"])
@@ -80,6 +87,28 @@ class Replay:
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
                       for _ in table]
         self.gap_packets = set()
+
+    # ---- silence (capture time) ----
+    def advance(self, t):
+        """Time reaches t (a datagram arrives): each channel that has sent
+        nothing for more than the silence limit marks its table instruments
+        stale, once per silence, at (channel, version, next expected number)."""
+        if not self.silence_ns:
+            return
+        for ch, last in self.last_seen.items():
+            if ch not in self.silent and t - last > self.silence_ns:
+                self.silent.add(ch)
+                self.silences += 1
+                c = self.ch.get(ch, {"version": 0, "next": 0})
+                point = (ch, c["version"], c["next"])
+                for slot, (_, tch) in enumerate(self.table):
+                    if tch == ch:
+                        self.stale(slot, point)
+
+    def saw(self, ch, t):
+        """A datagram of channel ch at t (any datagram with a packet header)."""
+        self.last_seen[ch] = t
+        self.silent.discard(ch)
 
     # ---- sequencer ----
     def packet(self, rows, on_row=None):

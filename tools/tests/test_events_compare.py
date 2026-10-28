@@ -7,7 +7,7 @@ import sys
 
 import events_compare as ec
 import make_goldens as mg
-from rows import summary, stats, order
+from rows import summary, stats, order, write_pcap
 
 TOOLS_DIR = ec.REPO / "tools"
 
@@ -20,7 +20,7 @@ def make_set(tmp_path):
     (folder / "intent.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     (folder / "manifest.json").write_text(json.dumps({"missing": {"A": [], "B": []}, "unreliable_books": {}}))
     for feed in "AB":
-        (folder / f"feed{feed}.pcap").write_bytes(b"")   # the fake decoder never reads it
+        write_pcap(folder / f"feed{feed}.pcap", rows)   # the answer key reads its order and times
     return tmp_path / "data", folder
 
 
@@ -34,7 +34,7 @@ from pathlib import Path
 args = sys.argv[1:]
 out, pcap = args[args.index("--events") + 1], Path(args[-1])
 subprocess.run([sys.executable, {str(TOOLS_DIR / 'intent_to_events.py')!r}, str(pcap.parent / 'intent.jsonl'),
-                "-o", out], check=True, stdout=subprocess.DEVNULL)
+                "-o", out, "--feed", pcap.stem[-1], "--pcap", str(pcap)], check=True, stdout=subprocess.DEVNULL)
 data = bytearray(Path(out).read_bytes())
 corrupt = {corrupt_record!r}
 if corrupt is not None:
@@ -51,8 +51,8 @@ def test_correct_file_passes(tmp_path, capsys):
     data, _ = make_set(tmp_path)
     assert ec.main([str(data), "--build", f"release:{fake_cpp(tmp_path)}"]) == 0
     out = capsys.readouterr().out
-    assert "OK small/feedA.pcap: 4 records, byte-identical" in out
-    assert "OK small/feedB.pcap: 4 records, same records per channel" in out
+    assert "OK small/feedA.pcap: 4 records, byte-identical in full order" in out
+    assert "OK small/feedB.pcap: 4 records, byte-identical in full order" in out
 
 
 def test_wrong_record_is_found(tmp_path, capsys):
@@ -60,7 +60,7 @@ def test_wrong_record_is_found(tmp_path, capsys):
     assert ec.main([str(data), "--build", f"release:{fake_cpp(tmp_path, corrupt_record=1)}"]) == 1
     out = capsys.readouterr().out
     assert "release record 1: first difference at channel 68 v1 packet 2 message 0" in out
-    assert "release channel 68 record 1: first difference" in out     # Feed B, per channel
+    assert out.count("release record 1: first difference at channel 68 v1 packet 2 message 0") == 2   # both feeds
     assert "EXEC_SUMMARY" in out                                      # dump_events format
 
 
@@ -77,12 +77,13 @@ def test_goldens(tmp_path, capsys):
     data, _ = make_set(tmp_path)
     assert mg.main([str(data), "--cpp", str(fake_cpp(tmp_path))]) == 0
     prov = json.loads((data / "golden" / "small" / "provenance.json").read_text())
-    assert set(prov["files"]) == {"expected_feedA.bin", "cpp_feedA.bin", "cpp_feedB.bin"}
+    assert set(prov["files"]) == {"expected_feedA.bin", "expected_feedB.bin", "cpp_feedA.bin", "cpp_feedB.bin"}
     assert prov["files"]["expected_feedA.bin"]["sha256"] == prov["files"]["cpp_feedA.bin"]["sha256"]
+    assert prov["files"]["expected_feedB.bin"]["sha256"] == prov["files"]["cpp_feedB.bin"]["sha256"]
     assert prov["build"] == {"published_depth": 5, "tracked_depth": 16, "max_instruments": 64, "book": "capped"}
     assert len(prov["repo"]["commit"]) == 40
     capsys.readouterr()
     bad_data, _ = make_set(tmp_path / "bad")
     assert mg.main([str(bad_data), "--cpp", str(fake_cpp(tmp_path / "bad", corrupt_record=2))]) == 1
-    assert "differs from expected_feedA.bin" in capsys.readouterr().out
+    assert "differs from its expected file" in capsys.readouterr().out
     assert not (bad_data / "golden" / "small" / "cpp_feedA.bin").exists()
