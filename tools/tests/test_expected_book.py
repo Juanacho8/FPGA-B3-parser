@@ -177,12 +177,10 @@ def unappliable_rows():
     no_px = dele(WIN, "0", 100, 5, 1, 2, 0x80, 2, 0)
     no_px["absent"] = ["mDEntryPx"]                                    # DeleteOrder_MBO before v15
     del no_px["fields"]["mDEntryPx"]
-    null_px = dele(WIN, "0", -(1 << 63), 5, 1, 2, 0x80, 2, 0)
-    null_px["null"] = ["mDEntryPx"]
     change = order(2, 0, "0", 100, 3, 1, 2, 0x80, 1)
     change["fields"]["mDUpdateAction"] = 1                             # CHANGE, mDEntryPrevSize null
     change["null"] = ["mDEntryPrevSize"]
-    return new, [("delete_no_price", no_px), ("delete_no_price", null_px), ("change_no_prev_size", change)]
+    return new, [("delete_no_price", no_px), ("change_no_prev_size", change)]
 
 
 def test_unappliable_messages_go_stale_with_cause_7_in_both_books():
@@ -225,3 +223,25 @@ def test_quantities_wrap_like_int64():
     b.add(0, eb.BID, 100, 10, False)
     assert b.top(0, eb.BID, 1)[0][1] == -(1 << 63) + 9
     assert eb.wrap(-(1 << 63) - 1) == (1 << 63) - 1
+
+
+def test_null_price_bucket_in_both_books():
+    null = -(1 << 63)
+    base = order(1, 0, "0", 100, 5, 1, 1, 0x80, 1)
+    new = order(2, 0, "0", null, 4, 2, 2, 0x80, 1)
+    new["null"] = ["mDEntryPx"]
+    change = order(3, 0, "0", null, 3, 2, 3, 0x80, 1)
+    change["fields"].update(mDUpdateAction=1, mDEntryPrevSize=4)
+    change["null"] = ["mDEntryPx"]
+    gone = dele(WIN, "0", null, 3, 2, 4, 0x80, 4, 0)
+    gone["null"] = ["mDEntryPx"]
+    for k in (None, 5):
+        p = eb.run_packets([[base], [new]], [0, 0], TABLE[:1], CLEAN_MANIFEST, status_interval=0, k=k)
+        assert p.book.null_bucket(0, eb.BID) == (4, 1)
+        p = eb.run_packets([[base], [new], [change], [gone]], [0] * 4, TABLE[:1], CLEAN_MANIFEST,
+                           status_interval=0, k=k)
+        assert [header(r)[8] for r in p.records] == [c.BOOK_UPDATE] * 4      # never STALE
+        assert p.book.null_bucket(0, eb.BID) == (0, 0)
+        assert p.book.top(0, eb.BID, 5) == [(100, 5, 1)]                      # the level untouched
+        assert p.book.null_price == 3 and p.book.errors == 0
+        assert p.replay.unappliable["delete_no_price"] == 0

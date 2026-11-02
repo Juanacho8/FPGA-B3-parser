@@ -88,8 +88,11 @@ public:
     void on_message(const R::EventRecord* records, std::size_t n_records, const tracker::Transition* transitions,
                     std::size_t n_transitions) noexcept {
         const R::EventRecord* closer = nullptr;
+        // An unappliable message (DESIGN.md 3.6.4) changes no level; its record
+        // still closes an event like any other.
+        const bool apply_it = !tracker_.unappliable();
         for (std::size_t i = 0; i < n_records; ++i) {
-            if (apply(records[i])) closer = &records[i];
+            if (apply_it ? apply(records[i]) : closes(records[i])) closer = &records[i];
         }
         on_transitions(transitions, n_transitions);
         if (closer != nullptr) close(*closer);
@@ -126,6 +129,13 @@ private:
         }
     };
     static_assert(kMaxInstruments <= 256, "touched slots are stored in one byte");
+
+    // A record that closes the event without being applied (an unappliable
+    // message): EndOfEvent, and not a reset.
+    static bool closes(const R::EventRecord& r) noexcept {
+        return (r.flags & R::flag::END_OF_EVENT) != 0 && r.kind != R::kind::SEQ_RESET &&
+               r.kind != R::kind::CLEAR_CHANNEL;
+    }
 
     // Applies one port 1 record. Returns true when it closes the event.
     bool apply(const R::EventRecord& r) noexcept {
