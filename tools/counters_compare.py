@@ -111,7 +111,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "empty_packets", "messages", "unknown_templates",
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
-               silences=replay.silences,
+               silences=replay.silences, unappliable=replay.unappliable,
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
     late = [r["packet"] for r in (manifest.get("reordered") or {}).get(feed, [])]

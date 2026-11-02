@@ -16,6 +16,8 @@
 //       truncated: ignored. At or better than B (or not truncated) and not in
 //       the slots: consistency error.
 //     Clears: no slots, truncated false.
+//     A DELETE with no price or a CHANGE with no previous size changes
+//     nothing: the tracker marks the instrument STALE (unappliable).
 //     Depth incomplete: truncated and fewer than N valid slots.
 //   Same interface as book_uncapped.hpp, so book_sink.hpp takes either.
 //   Statistics for choosing K (brief section 5, "Measuring K"): per side,
@@ -115,14 +117,11 @@ public:
             ++counters_.null_price_orders;
             return;
         }
+        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         SideState& s = at(slot, side);
         const Match m = match(s, side, price);
         if (!m.found) {
             missing(s, side, price, stale);
-            return;
-        }
-        if (prev == kNullPrice) {
-            error(stale);   // no previous size to apply
             return;
         }
         BookLevel& lv = s.slot[m.index];
@@ -131,10 +130,7 @@ public:
     }
 
     void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
-        if (price == kNullPrice) {
-            ++counters_.null_price_orders;
-            return;
-        }
+        if (price == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         SideState& s = at(slot, side);
         const Match m = match(s, side, price);
         if (!m.found) {

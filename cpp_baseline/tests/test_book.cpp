@@ -230,8 +230,16 @@ TEST_CASE("uncapped book: clears, null price, overflow, consistency errors split
     b.add(0, Side::bid, 102, 1, false);        // the side is full (capacity 2)
     CHECK(b.counters().level_overflow == 1);
     b.add(0, Side::bid, kNull, 1, false);
+    CHECK(b.counters().null_price_orders == 1);
+    // Unappliable (DESIGN.md 4.5): no price on a DELETE, no previous size on a
+    // change. No level changes, nothing counted here: the tracker marks STALE.
     b.remove(0, Side::bid, kNull, 1, false);
-    CHECK(b.counters().null_price_orders == 2);
+    b.change(0, Side::bid, 100, 7, kNull, false);
+    BookLevel top1[1];
+    REQUIRE(b.top(0, Side::bid, top1, 1) == 1);
+    CHECK((top1[0].price == 101 && top1[0].qty == 1));
+    CHECK(b.counters().null_price_orders == 1);
+    CHECK(b.counters().consistency_errors == 0);
     b.remove(0, Side::bid, 99, 1, false);       // no such level, CLEAN
     b.change(0, Side::bid, 98, 1, 2, true);     // no such level, STALE
     b.remove(0, Side::bid, 100, 5, false);      // count 0 with qty left
@@ -357,6 +365,59 @@ TEST_CASE("capped book on port 2: depth-incomplete flags, the first min(N, valid
     CHECK((rs[2].header.record_type == RT::STATE_CHANGE && rs[2].header.state == ST::STALE));
     CHECK(rs[2].header.flags == b3::records::book_flag::DEPTH_INCOMPLETE_BID);   // on the next record, no record of its own
     CHECK(p.levels.stats(Side::bid).depth_incomplete == 1);
+}
+
+// DeleteOrder_MBO without mDEntryPx: blockLength 44, the schema before v15.
+Bytes del_no_px(std::uint64_t sid, char type, std::int64_t qty, std::uint64_t soid, std::uint32_t rpt,
+                std::uint8_t mei) {
+    Bytes b = del(sid, type, 0, qty, soid, rpt, mei);
+    Bytes body(b.begin() + 12, b.begin() + 12 + 44);
+    return message(51, body);
+}
+
+template <class Book>
+void check_unappliable() {
+    using b3::records::cause::UNAPPLIABLE;
+    const std::size_t kDel = b3::tracker::kUnappliableDeleteNoPrice;
+    const std::size_t kChg = b3::tracker::kUnappliableChangeNoPrevSize;
+    struct Case {
+        const char* name;
+        Bytes msg;
+        std::size_t reason;
+    };
+    const Case cases[] = {
+        {"DELETE, price absent", del_no_px(WIN, '0', 5, 1, 2, 0x80), kDel},
+        {"DELETE, price null", del(WIN, '0', kNull, 5, 1, 2, 0x80), kDel},
+        {"CHANGE, previous size null", order(WIN, 1, '0', 100, 3, 1, 2, 0x80, 7, kNull), kChg},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.name);
+        Pipeline<Book> p("200000001 68\n");
+        p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));   // NEW: no previous size, applied
+        CHECK(p.tracker.counters().unappliable[kChg] == 0);
+        p.feed(packet(68, 2, {c.msg}));
+        auto rs = p.records();
+        REQUIRE(rs.size() == 2);
+        CHECK((rs[0].header.record_type == RT::BOOK_UPDATE && rs[0].header.bid_count == 1));
+        CHECK((rs[1].header.record_type == RT::STATE_CHANGE && rs[1].header.state == ST::STALE));
+        CHECK((rs[1].header.cause == UNAPPLIABLE && rs[1].header.seq_num == 2 && rs[1].header.msg_index == 0));
+        CHECK(p.tracker.counters().unappliable[c.reason] == 1);
+        CHECK(p.tracker.state(0).stale);
+        BookLevel lv[1];
+        REQUIRE(p.levels.top(0, Side::bid, lv, 1) == 1);   // the level is untouched
+        CHECK((lv[0].price == 100 && lv[0].qty == 5 && lv[0].order_count == 1));
+        CHECK(p.levels.counters().consistency_errors == 0);
+        CHECK(p.levels.counters().consistency_errors_stale == 0);
+        CHECK((p.events_buf[1].flags & b3::records::flag::BOOK_NOT_CLEAN) != 0);   // port 1 agrees
+    }
+}
+
+TEST_CASE("unappliable DELETE or CHANGE: no level changes, STALE with cause 7 (uncapped book)") {
+    check_unappliable<UncappedBook>();
+}
+
+TEST_CASE("unappliable DELETE or CHANGE: no level changes, STALE with cause 7 (capped book)") {
+    check_unappliable<b3::book::CappedBook<b3::kPublishedDepth, b3::kPublishedDepth>>();
 }
 
 TEST_CASE("B3_PUBLISH_STALE: BOOK_UPDATEs while STALE, marked STALE") {

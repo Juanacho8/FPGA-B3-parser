@@ -169,3 +169,40 @@ def test_capped_mode_flags_depth_incomplete_on_port2():
     assert [header(r)[10] for r in p.records] == [0, c.BOOK_FLAG_DEPTH_INCOMPLETE_BID]
     assert [header(r)[11] for r in p.records] == [2, 1]
     assert eb.book_bytes(p, 0)[18:20] == (2).to_bytes(2, "little")      # K in the file header
+
+
+# ---- Unappliable messages (DESIGN.md 3.6.4, 4.5): STALE with cause 7 ----
+def unappliable_rows():
+    new = order(1, 0, "0", 100, 5, 1, 1, 0x80, 1)                     # NEW: no previous size, applied
+    no_px = dele(WIN, "0", 100, 5, 1, 2, 0x80, 2, 0)
+    no_px["absent"] = ["mDEntryPx"]                                    # DeleteOrder_MBO before v15
+    del no_px["fields"]["mDEntryPx"]
+    null_px = dele(WIN, "0", -(1 << 63), 5, 1, 2, 0x80, 2, 0)
+    null_px["null"] = ["mDEntryPx"]
+    change = order(2, 0, "0", 100, 3, 1, 2, 0x80, 1)
+    change["fields"]["mDUpdateAction"] = 1                             # CHANGE, mDEntryPrevSize null
+    change["null"] = ["mDEntryPrevSize"]
+    return new, [("delete_no_price", no_px), ("delete_no_price", null_px), ("change_no_prev_size", change)]
+
+
+def test_unappliable_messages_go_stale_with_cause_7_in_both_books():
+    new, cases = unappliable_rows()
+    for k in (None, 5):
+        for reason, msg in cases:
+            p = eb.run_packets([[new], [msg]], [0, 0], TABLE[:1], CLEAN_MANIFEST, status_interval=0, k=k)
+            hs = [header(r) for r in p.records]
+            assert [(h[8], h[9], h[13]) for h in hs] == [(c.BOOK_UPDATE, c.BOOK_CLEAN, 0),
+                                                         (c.STATE_CHANGE, c.BOOK_STALE, c.CAUSE_UNAPPLIABLE)]
+            assert hs[0][11] == 1                                       # the NEW was booked
+            assert p.book.top(0, eb.BID, 5) == [(100, 5, 1)]            # the level is untouched
+            assert p.book.errors == 0 and p.book.errors_stale == 0
+            assert p.replay.unappliable[reason] == 1
+            assert p.replay.state[0]["stale"]
+
+
+def test_new_without_previous_size_is_untouched():
+    new, _ = unappliable_rows()
+    assert "mDEntryPrevSize" not in new["fields"] or new["fields"]["mDEntryPrevSize"] == -(1 << 63)
+    p = eb.run_packets([[new]], [0], TABLE[:1], CLEAN_MANIFEST, status_interval=0)
+    assert [header(r)[8] for r in p.records] == [c.BOOK_UPDATE]
+    assert p.replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 0}

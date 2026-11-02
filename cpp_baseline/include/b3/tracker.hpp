@@ -9,6 +9,10 @@
 //     the table: counted, no tracking. In the table: rptSeq must be the
 //     previous + 1, or 1 on the message after its EmptyBook. A jump is
 //     counted and marks that instrument stale.
+//     A DeleteOrder_MBO with a null or absent mDEntryPx, or an Order_MBO
+//     CHANGE with a null or absent mDEntryPrevSize, is unappliable to a
+//     price-level book: counted by reason, and it marks that instrument
+//     stale (cause UNAPPLIABLE).
 //   * EmptyBook clears its instrument's stale flag; ChannelReset clears it
 //     for every table instrument of its channel. rptSeq is not touched by a
 //     ChannelReset: each instrument's EmptyBook restarts it.
@@ -93,8 +97,15 @@ struct TrackerCounters {
     std::uint64_t msg_before_rebuild = 0;             // after a ChannelReset, before its EmptyBook
     std::uint64_t losses = 0;                         // on_loss calls (gaps and discarded tails)
     std::uint64_t silences = 0;                       // channels found silent (on_time)
+    // Messages a price-level book cannot apply (DESIGN.md 3.6.4), by reason:
+    // the instrument goes STALE, cause UNAPPLIABLE.
+    std::array<std::uint64_t, 2> unappliable{};
     std::array<std::uint64_t, decode::kBodyFaults> body_faults{};
 };
+
+inline constexpr std::size_t kUnappliableDeleteNoPrice = 0;
+inline constexpr std::size_t kUnappliableChangeNoPrevSize = 1;
+inline constexpr std::array<std::string_view, 2> kUnappliableNames = {"delete_no_price", "change_no_prev_size"};
 
 class Tracker {
 public:
@@ -185,6 +196,7 @@ public:
                         const auto rpt = get_named<kRptSeq>(typename T::fields{}, root);
                         if (rpt.present()) track_rpt(slot, static_cast<std::uint32_t>(rpt.value), m);
                     }
+                    check_appliable<TemplateId>(slot, m);
                 }
             }
         }
@@ -211,6 +223,29 @@ public:
     const instruments::Table& table() const noexcept { return table_; }
 
 private:
+    // A DELETE with a null or absent price, or a CHANGE (not a NEW) with a
+    // null or absent previous size, changes no level of a price-level book:
+    // the instrument goes STALE instead (DESIGN.md 3.6.4, cause 7).
+    template <std::uint16_t TemplateId>
+    void check_appliable(std::size_t slot, const walker::MessageView& m) noexcept {
+        namespace L = layout;
+        std::size_t reason = 0;
+        if constexpr (TemplateId == L::DeleteOrder_MBO_51::template_id) {
+            if (decode::get<fields::DeleteOrder_MBO_51::mDEntryPx>(m).present()) return;
+            reason = kUnappliableDeleteNoPrice;
+        } else if constexpr (TemplateId == L::Order_MBO_50::template_id) {
+            const auto action = decode::get<fields::Order_MBO_50::mDUpdateAction>(m);
+            if (!action.present() || action.value != L::enums::MDUpdateAction::CHANGE) return;
+            if (decode::get<fields::Order_MBO_50::mDEntryPrevSize>(m).present()) return;
+            reason = kUnappliableChangeNoPrevSize;
+        } else {
+            return;
+        }
+        ++counters_.unappliable[reason];
+        mark_stale(slot, StalePoint{m.packet.channel, m.packet.seq_version, m.packet.seq_num},
+                   records::cause::UNAPPLIABLE);
+    }
+
     struct BodyCheck {
         TrackerCounters& c;
         template <class G> void on_group(std::size_t, std::size_t) noexcept {}

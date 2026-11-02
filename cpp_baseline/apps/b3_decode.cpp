@@ -340,6 +340,8 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
                  static_cast<ull>(sq.resets), static_cast<ull>(sq.reset_mismatches),
                  static_cast<ull>(sq.version_changes), static_cast<ull>(tc.seq_reset_not_first),
                  static_cast<ull>(sq.heartbeat_without_sequence), static_cast<ull>(sq.late_after_gap));
+    counter_map(f, "unappliable", b3::tracker::kUnappliableNames.data(), tc.unappliable.data(), tc.unappliable.size());
+    std::fprintf(f, ",");
     std::fprintf(f, "\"losses\":%llu,\"silences\":%llu,\"unknown_instrument_messages\":%llu,"
                  "\"msg_before_rebuild\":%llu,\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.silences),

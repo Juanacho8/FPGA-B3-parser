@@ -93,8 +93,10 @@ class LevelBook:
         if price == NULL_PRICE:
             self.null_price += 1
             return
+        if prev == NULL_PRICE:
+            return            # unappliable: the replay marks the instrument STALE (DESIGN.md 4.5)
         lv = self._side(slot, side).get(price)
-        if lv is None or prev == NULL_PRICE:
+        if lv is None:
             self._error(stale)
             return
         lv[0] += qty - prev
@@ -103,8 +105,7 @@ class LevelBook:
 
     def remove(self, slot, side, price, qty, stale):
         if price == NULL_PRICE:
-            self.null_price += 1
-            return
+            return            # unappliable: the replay marks the instrument STALE (DESIGN.md 4.5)
         levels = self._side(slot, side)
         lv = levels.get(price)
         if lv is None:
@@ -238,11 +239,10 @@ class CappedBook:
         if price == NULL_PRICE:
             self.null_price += 1
             return
+        if prev == NULL_PRICE:
+            return            # unappliable: the replay marks the instrument STALE
         _, lv = self._find(slot, side, price, stale)
         if lv is None:
-            return
-        if prev == NULL_PRICE:
-            self._error(stale)
             return
         lv[1] += qty - prev
         if lv[1] < 0:
@@ -250,8 +250,7 @@ class CappedBook:
 
     def remove(self, slot, side, price, qty, stale):
         if price == NULL_PRICE:
-            self.null_price += 1
-            return
+            return            # unappliable: the replay marks the instrument STALE
         st, lv = self._find(slot, side, price, stale)
         if lv is None:
             return
@@ -282,8 +281,8 @@ class TransitionReplay(b3replay.Replay):
     """b3replay.Replay, observed: each CLEAN <-> STALE change goes to pending as
     (slot, to_stale, cause, row or None, point), row None for a loss or a
     silence (with its point). The cause is the step that made the change: a
-    silence in advance(), a gap in sequence(), an rptSeq jump inside a
-    message, otherwise the discarded tail after a packet; a clear is the
+    silence in advance(), a gap in sequence(), an unappliable message, an
+    rptSeq jump inside a message, otherwise the discarded tail after a packet; a clear is the
     message's EmptyBook or ChannelReset."""
 
     def __init__(self, table, manifest, feed, silence_ns=b3replay.DEFAULT_SILENCE_NS):
@@ -295,6 +294,11 @@ class TransitionReplay(b3replay.Replay):
     def advance(self, t):
         self._step = c.CAUSE_SILENCE
         super().advance(t)
+        self._step = None
+
+    def unappliable_message(self, slot, point, reason):
+        self._step = c.CAUSE_UNAPPLIABLE
+        super().unappliable_message(slot, point, reason)
         self._step = None
 
     def sequence(self, chan, ch, ver, num):
