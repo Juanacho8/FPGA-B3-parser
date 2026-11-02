@@ -205,4 +205,23 @@ def test_new_without_previous_size_is_untouched():
     assert "mDEntryPrevSize" not in new["fields"] or new["fields"]["mDEntryPrevSize"] == -(1 << 63)
     p = eb.run_packets([[new]], [0], TABLE[:1], CLEAN_MANIFEST, status_interval=0)
     assert [header(r)[8] for r in p.records] == [c.BOOK_UPDATE]
-    assert p.replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 0}
+    assert p.replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 0, "no_side": 0}
+
+
+def test_no_side_is_unappliable_in_both_books():
+    new, _ = unappliable_rows()
+    bad = order(2, 0, "X", 101, 1, 2, 2, 0x80, 1)                     # mDEntryType neither '0' nor '1'
+    for k in (None, 5):
+        p = eb.run_packets([[new], [bad]], [0, 0], TABLE[:1], CLEAN_MANIFEST, status_interval=0, k=k)
+        hs = [header(r) for r in p.records]
+        assert (hs[-1][8], hs[-1][13]) == (c.STATE_CHANGE, c.CAUSE_UNAPPLIABLE)
+        assert p.book.top(0, eb.BID, 5) == [(100, 5, 1)] and p.book.top(0, eb.OFFER, 5) == []
+        assert p.replay.unappliable["no_side"] == 1
+
+
+def test_quantities_wrap_like_int64():
+    b = eb.LevelBook()
+    b.add(0, eb.BID, 100, (1 << 63) - 1, False)
+    b.add(0, eb.BID, 100, 10, False)
+    assert b.top(0, eb.BID, 1)[0][1] == -(1 << 63) + 9
+    assert eb.wrap(-(1 << 63) - 1) == (1 << 63) - 1

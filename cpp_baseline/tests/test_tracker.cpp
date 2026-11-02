@@ -54,10 +54,12 @@ Msg make(std::uint16_t tid, Bytes body, std::uint8_t ch, std::uint32_t seq, std:
     return m;
 }
 
-// Order_MBO NEW: securityID at 0, rptSeq at 52 (LAYOUTS.md 7).
+// Order_MBO NEW: securityID at 0, mDEntryType at 10 (a bid: with no side the
+// order is unappliable, DESIGN.md 3.10), rptSeq at 52 (LAYOUTS.md 7).
 Msg order(std::uint64_t sid, std::uint32_t rpt, std::uint8_t ch, std::uint32_t seq) {
     Bytes b(72, 0);
     put(b, 0, sid, 8);
+    put(b, 10, '0', 1);
     put(b, 52, rpt, 4);
     return make(50, b, ch, seq);
 }

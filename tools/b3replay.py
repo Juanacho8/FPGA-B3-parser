@@ -21,8 +21,8 @@ What it must not do:
 from pathlib import Path
 
 SEQUENCE_RESET, SEQUENCE, EMPTY_BOOK, CHANNEL_RESET = 1, 2, 9, 11
-ORDER_MBO, DELETE_ORDER_MBO = 50, 51
-CHANGE = 1   # Order_MBO mDUpdateAction
+ORDER_MBO, DELETE_ORDER_MBO, MASS_DELETE_ORDERS_MBO = 50, 51, 52
+NEW, CHANGE, DELETE_THRU = 0, 1, 3   # mDUpdateAction
 MAX_VERSION = 65534
 DEFAULT_SILENCE_NS = 3_000_000_000   # 3 heartbeat intervals of 1 s (LAYOUTS.md 12.1)
 
@@ -71,14 +71,30 @@ def missing_field(row, name):
     return name in row.get("null", []) or name in row.get("absent", []) or row["fields"].get(name) is None
 
 
+def action(row):
+    """mDUpdateAction; absent reads 0 (NEW)."""
+    return 0 if "mDUpdateAction" in row.get("absent", []) else row["fields"].get("mDUpdateAction", 0)
+
+
+def no_side(row):
+    return row["fields"].get("mDEntryType") not in ("0", "1") or missing_field(row, "mDEntryType")
+
+
 def unappliable_reason(row):
-    """A DeleteOrder_MBO with no price, or an Order_MBO CHANGE with no
-    previous size: a price-level book cannot apply it (DESIGN.md 3.6.4)."""
+    """A message a price-level book cannot apply (DESIGN.md 3.6.4, 3.10):
+    no side; a DeleteOrder_MBO with no price; an Order_MBO CHANGE with no
+    previous size. The first that holds, in this order."""
     t = row["templateId"]
-    if t == DELETE_ORDER_MBO and missing_field(row, "mDEntryPx"):
-        return "delete_no_price"
-    if t == ORDER_MBO and row["fields"].get("mDUpdateAction") == CHANGE and missing_field(row, "mDEntryPrevSize"):
-        return "change_no_prev_size"
+    if t == DELETE_ORDER_MBO:
+        if no_side(row):
+            return "no_side"
+        return "delete_no_price" if missing_field(row, "mDEntryPx") else None
+    if t == ORDER_MBO and action(row) in (NEW, CHANGE):
+        if no_side(row):
+            return "no_side"
+        return "change_no_prev_size" if action(row) == CHANGE and missing_field(row, "mDEntryPrevSize") else None
+    if t == MASS_DELETE_ORDERS_MBO and action(row) == DELETE_THRU:
+        return "no_side" if no_side(row) else None
     return None
 
 
@@ -101,7 +117,7 @@ class Replay:
                         heartbeat_without_sequence=0,
                         late_after_gap=0)   # the view never holds a late packet: only 0 is derivable
         self.msg_before_rebuild = 0
-        self.unappliable = dict(delete_no_price=0, change_no_prev_size=0)
+        self.unappliable = dict(delete_no_price=0, change_no_prev_size=0, no_side=0)
         self.losses = 0
         self.unknown = 0
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)

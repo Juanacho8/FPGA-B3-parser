@@ -99,7 +99,7 @@ public:
         const Match m = match(s, side, price);
         if (m.found) {
             BookLevel& lv = s.slot[m.index];
-            lv.qty += qty;
+            lv.qty = records::wrap_add(lv.qty, qty);
             lv.order_count += 1;
             if (lv.qty < 0) error(stale);
         } else if (!s.truncated || !worse(side, price, s.boundary)) {
@@ -125,7 +125,7 @@ public:
             return;
         }
         BookLevel& lv = s.slot[m.index];
-        lv.qty += qty - prev;
+        lv.qty = records::wrap_add(lv.qty, records::wrap_sub(qty, prev));
         if (lv.qty < 0) error(stale);
     }
 
@@ -138,7 +138,7 @@ public:
             return;
         }
         BookLevel& lv = s.slot[m.index];
-        lv.qty -= qty;
+        lv.qty = records::wrap_sub(lv.qty, qty);
         if (lv.order_count == 0) {
             error(stale);
             return;

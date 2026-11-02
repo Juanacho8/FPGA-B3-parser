@@ -148,6 +148,8 @@ private:
             const std::size_t slot = table_.find(r.instrument_id);
             if (slot == instruments::Table::kNotFound) {
                 ++counters_.untracked_records;
+            } else if (r.kind != R::kind::CLEAR_BOOK && r.side == R::side::NONE) {
+                // No side: unappliable (DESIGN.md 3.10), the tracker marked it STALE. No level changes.
             } else {
                 const bool stale = tracker_.state(slot).stale;
                 const Side side = r.side == R::side::OFFER ? Side::offer : Side::bid;

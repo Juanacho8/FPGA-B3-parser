@@ -49,6 +49,11 @@ DEFAULT_INTERVAL = 100_000_000
 BID, OFFER = 0, 1
 
 
+def wrap(x):
+    """int64 two's-complement wrap, as the C++ books (records.hpp wrap_add) and the RTL's adders."""
+    return (x + (1 << 63)) % (1 << 64) - (1 << 63)
+
+
 def file_header(n, status_interval, max_instruments=c.DEFAULT_MAX_INSTRUMENTS, k=None):
     """book.bin's header: K (0 for the uncapped book), the STATUS interval at offset 24."""
     return c.book_header(n, k or 0, max_instruments, status_interval).pack()
@@ -84,7 +89,7 @@ class LevelBook:
             levels[price] = [0, 0]
             self.max_depth[side] = max(self.max_depth[side], len(levels))
         lv = levels[price]
-        lv[0] += qty
+        lv[0] = wrap(lv[0] + qty)
         lv[1] += 1
         if lv[0] < 0:
             self._error(stale)
@@ -99,7 +104,7 @@ class LevelBook:
         if lv is None:
             self._error(stale)
             return
-        lv[0] += qty - prev
+        lv[0] = wrap(lv[0] + qty - prev)
         if lv[0] < 0:
             self._error(stale)
 
@@ -111,7 +116,7 @@ class LevelBook:
         if lv is None:
             self._error(stale)
             return
-        lv[0] -= qty
+        lv[0] = wrap(lv[0] - qty)
         if lv[1] == 0:
             self._error(stale)
             return
@@ -203,7 +208,7 @@ class CappedBook:
         levels = st["levels"]
         lv = next((x for x in levels if x[0] == price), None)
         if lv is not None:
-            lv[1] += qty
+            lv[1] = wrap(lv[1] + qty)
             lv[2] += 1
             if lv[1] < 0:
                 self._error(stale)
@@ -244,7 +249,7 @@ class CappedBook:
         _, lv = self._find(slot, side, price, stale)
         if lv is None:
             return
-        lv[1] += qty - prev
+        lv[1] = wrap(lv[1] + qty - prev)
         if lv[1] < 0:
             self._error(stale)
 
@@ -254,7 +259,7 @@ class CappedBook:
         st, lv = self._find(slot, side, price, stale)
         if lv is None:
             return
-        lv[1] -= qty
+        lv[1] = wrap(lv[1] - qty)
         if lv[2] == 0:
             self._error(stale)
             return
@@ -398,6 +403,8 @@ class Port2:
             slot = self.slot.get(e.instrument_id)
             if slot is None:
                 self.counts["untracked_records"] += 1
+            elif e.kind != c.CLEAR_BOOK and e.side == c.SIDE_NONE:
+                pass      # no side: unappliable (DESIGN.md 3.10), the replay marked it STALE
             else:
                 stale = self.stale_now(slot)
                 side = OFFER if e.side == c.SIDE_OFFER else BID

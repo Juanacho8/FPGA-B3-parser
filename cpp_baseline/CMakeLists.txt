@@ -112,6 +112,10 @@ target_link_libraries(b3_pcapinfo PRIVATE b3)
 add_executable(b3_decode apps/b3_decode.cpp)
 target_link_libraries(b3_decode PRIVATE b3)
 
+# Damaged packets through the whole pipeline (make fuzz, Debug: sanitizers).
+add_executable(b3_fuzz apps/b3_fuzz.cpp)
+target_link_libraries(b3_fuzz PRIVATE b3)
+
 # ---- 7. Tests ----
 enable_testing()
 add_executable(b3_tests tests/test_build.cpp tests/test_layouts.cpp tests/test_wire.cpp

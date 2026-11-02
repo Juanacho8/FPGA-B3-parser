@@ -50,6 +50,7 @@
 
 #include "b3/book_params.hpp"
 #include "b3/decode.hpp"
+#include "b3/field_audit.hpp"
 #include "b3/fields.hpp"
 #include "b3/instruments.hpp"
 #include "b3/packet.hpp"
@@ -99,13 +100,16 @@ struct TrackerCounters {
     std::uint64_t silences = 0;                       // channels found silent (on_time)
     // Messages a price-level book cannot apply (DESIGN.md 3.6.4), by reason:
     // the instrument goes STALE, cause UNAPPLIABLE.
-    std::array<std::uint64_t, 2> unappliable{};
+    std::array<std::uint64_t, 3> unappliable{};
+    field_audit::Counts fields;                       // per audited field: absent, null, invalid (DESIGN.md 3.10)
     std::array<std::uint64_t, decode::kBodyFaults> body_faults{};
 };
 
 inline constexpr std::size_t kUnappliableDeleteNoPrice = 0;
 inline constexpr std::size_t kUnappliableChangeNoPrevSize = 1;
-inline constexpr std::array<std::string_view, 2> kUnappliableNames = {"delete_no_price", "change_no_prev_size"};
+inline constexpr std::size_t kUnappliableNoSide = 2;
+inline constexpr std::array<std::string_view, 3> kUnappliableNames = {"delete_no_price", "change_no_prev_size",
+                                                                      "no_side"};
 
 class Tracker {
 public:
@@ -162,6 +166,7 @@ public:
         }
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), time);
+        field_audit::count<TemplateId>(m, counters_.fields);
         if constexpr (TemplateId == L::Sequence_2::template_id) {
             if (m.packet.seq_num == 0) {
                 const auto next = decode::get<fields::Sequence_2::nextSeqNo>(m);
@@ -223,21 +228,40 @@ public:
     const instruments::Table& table() const noexcept { return table_; }
 
 private:
-    // A DELETE with a null or absent price, or a CHANGE (not a NEW) with a
-    // null or absent previous size, changes no level of a price-level book:
-    // the instrument goes STALE instead (DESIGN.md 3.6.4, cause 7).
+    // A message that changes a price-level book but cannot be applied
+    // (DESIGN.md 3.6.4, 3.10): no side, a DELETE with a null or absent price,
+    // or a CHANGE (not a NEW) with a null or absent previous size. No level
+    // changes; the instrument goes STALE instead (cause 7). One reason per
+    // message, the first that holds in this order.
+    template <class V>
+    static bool valid_side(const V& v) noexcept {
+        return v.present() && (v.value == '0' || v.value == '1');
+    }
     template <std::uint16_t TemplateId>
     void check_appliable(std::size_t slot, const walker::MessageView& m) noexcept {
         namespace L = layout;
+        namespace E = L::enums::MDUpdateAction;
         std::size_t reason = 0;
         if constexpr (TemplateId == L::DeleteOrder_MBO_51::template_id) {
-            if (decode::get<fields::DeleteOrder_MBO_51::mDEntryPx>(m).present()) return;
-            reason = kUnappliableDeleteNoPrice;
+            namespace T = fields::DeleteOrder_MBO_51;
+            if (!valid_side(decode::get<T::mDEntryType>(m))) reason = kUnappliableNoSide;
+            else if (!decode::get<T::mDEntryPx>(m).present()) reason = kUnappliableDeleteNoPrice;
+            else return;
         } else if constexpr (TemplateId == L::Order_MBO_50::template_id) {
-            const auto action = decode::get<fields::Order_MBO_50::mDUpdateAction>(m);
-            if (!action.present() || action.value != L::enums::MDUpdateAction::CHANGE) return;
-            if (decode::get<fields::Order_MBO_50::mDEntryPrevSize>(m).present()) return;
-            reason = kUnappliableChangeNoPrevSize;
+            namespace T = fields::Order_MBO_50;
+            const auto a = decode::get<T::mDUpdateAction>(m);
+            const auto action = a.absent() ? 0u : static_cast<unsigned>(a.value);   // absent reads 0 (NEW)
+            if (action != E::NEW && action != E::CHANGE) return;                    // not on port 1
+            if (!valid_side(decode::get<T::mDEntryType>(m))) reason = kUnappliableNoSide;
+            else if (action == E::CHANGE && !decode::get<T::mDEntryPrevSize>(m).present())
+                reason = kUnappliableChangeNoPrevSize;
+            else return;
+        } else if constexpr (TemplateId == L::MassDeleteOrders_MBO_52::template_id) {
+            namespace T = fields::MassDeleteOrders_MBO_52;
+            const auto a = decode::get<T::mDUpdateAction>(m);
+            if ((a.absent() ? 0u : static_cast<unsigned>(a.value)) != E::DELETE_THRU) return;   // not on port 1
+            if (valid_side(decode::get<T::mDEntryType>(m))) return;
+            reason = kUnappliableNoSide;
         } else {
             return;
         }
