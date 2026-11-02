@@ -9,7 +9,7 @@
 //     the table: counted, no tracking. In the table: rptSeq must be the
 //     previous + 1, or 1 on the message after its EmptyBook. A jump is
 //     counted and marks that instrument stale.
-//     A DeleteOrder_MBO with a null or absent mDEntryPx, or an Order_MBO
+//     A DeleteOrder_MBO with an absent mDEntryPx (before v15), or an Order_MBO
 //     CHANGE with a null or absent mDEntryPrevSize, is unappliable to a
 //     price-level book: counted by reason, and it marks that instrument
 //     stale (cause UNAPPLIABLE).
@@ -219,6 +219,10 @@ public:
                    static_cast<std::uint8_t>(m.msg_index), 0);
     }
 
+    // True when the last call's message is unappliable (DESIGN.md 3.6.4): the
+    // price-level books must not apply its record.
+    bool unappliable() const noexcept { return unappliable_; }
+
     // The state changes the last call (on, on_unknown, on_loss) caused.
     const Transition* transitions() const noexcept { return pending_.data(); }
     std::size_t transition_count() const noexcept { return n_pending_; }
@@ -245,7 +249,7 @@ private:
         if constexpr (TemplateId == L::DeleteOrder_MBO_51::template_id) {
             namespace T = fields::DeleteOrder_MBO_51;
             if (!valid_side(decode::get<T::mDEntryType>(m))) reason = kUnappliableNoSide;
-            else if (!decode::get<T::mDEntryPx>(m).present()) reason = kUnappliableDeleteNoPrice;
+            else if (decode::get<T::mDEntryPx>(m).absent()) reason = kUnappliableDeleteNoPrice;   // null: a market order
             else return;
         } else if constexpr (TemplateId == L::Order_MBO_50::template_id) {
             namespace T = fields::Order_MBO_50;
@@ -266,6 +270,7 @@ private:
             return;
         }
         ++counters_.unappliable[reason];
+        unappliable_ = true;
         mark_stale(slot, StalePoint{m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    records::cause::UNAPPLIABLE);
     }
@@ -293,6 +298,7 @@ private:
 
     void begin_call(const StalePoint& at, std::uint8_t msg_index, std::uint64_t time) noexcept {
         n_pending_ = 0;
+        unappliable_ = false;
         call_at_ = at;
         call_index_ = msg_index;
         call_time_ = time;
@@ -336,6 +342,7 @@ private:
     // One call changes each instrument at most once.
     std::array<Transition, kMaxInstruments> pending_{};
     std::size_t n_pending_ = 0;
+    bool unappliable_ = false;
     StalePoint call_at_{};
     std::uint8_t call_index_ = 0;
     std::uint64_t call_time_ = 0;

@@ -163,16 +163,27 @@ TEST_CASE("capped: consistency error better than B; worse than B ignored") {
     CHECK(fresh.counters().consistency_errors == 1);
 }
 
-TEST_CASE("capped: an unappliable DELETE or CHANGE changes no slot") {
+TEST_CASE("capped: an unappliable CHANGE changes no slot; null prices go to the bucket") {
     Book b;
     add(b, 100, Side::bid, 5);
-    b.remove(0, Side::bid, Book::kNullPrice, 5, false);    // no price
-    b.change(0, Side::bid, 100, 1, Book::kNullPrice, false);   // no previous size
+    b.change(0, Side::bid, 100, 1, Book::kNullPrice, false);   // no previous size: unappliable
     BookLevel lv[1];
     REQUIRE(b.top(0, Side::bid, lv, 1) == 1);
     CHECK((lv[0].price == 100 && lv[0].qty == 5));
-    CHECK(b.counters().consistency_errors == 0);
     CHECK(b.counters().null_price_orders == 0);
+    b.add(0, Side::bid, Book::kNullPrice, 7, false);           // the bucket, not a slot
+    CHECK(b.depth(0, Side::bid) == 1);
+    CHECK((b.null_bucket(0, Side::bid).qty == 7 && b.null_bucket(0, Side::bid).count == 1));
+    b.change(0, Side::bid, Book::kNullPrice, 2, 7, false);
+    b.remove(0, Side::bid, Book::kNullPrice, 2, false);
+    CHECK(b.null_bucket(0, Side::bid).count == 0);
+    CHECK(b.counters().consistency_errors == 0);
+    b.remove(0, Side::bid, Book::kNullPrice, 1, false);        // the bucket is empty: a consistency error
+    CHECK(b.counters().consistency_errors == 1);
+    add(b, 50, Side::bid);
+    b.add(0, Side::bid, Book::kNullPrice, 1, false);
+    b.clear_side(0, Side::bid);                                // cleared with the side
+    CHECK(b.null_bucket(0, Side::bid).count == 0);
 }
 
 TEST_CASE("capped: bid and offer ordering are mirror images") {

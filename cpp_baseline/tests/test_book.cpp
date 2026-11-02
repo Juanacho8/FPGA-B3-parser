@@ -229,16 +229,16 @@ TEST_CASE("uncapped book: clears, null price, overflow, consistency errors split
     b.add(0, Side::bid, 101, 1, false);
     b.add(0, Side::bid, 102, 1, false);        // the side is full (capacity 2)
     CHECK(b.counters().level_overflow == 1);
+    // A null price: the null-price bucket (DESIGN.md 4.5), outside the levels.
     b.add(0, Side::bid, kNull, 1, false);
-    CHECK(b.counters().null_price_orders == 1);
-    // Unappliable (DESIGN.md 4.5): no price on a DELETE, no previous size on a
-    // change. No level changes, nothing counted here: the tracker marks STALE.
     b.remove(0, Side::bid, kNull, 1, false);
+    CHECK(b.counters().null_price_orders == 2);
+    CHECK(b.null_bucket(0, Side::bid).count == 0);
+    // Unappliable: no previous size on a change. No level changes; the tracker marks STALE.
     b.change(0, Side::bid, 100, 7, kNull, false);
     BookLevel top1[1];
     REQUIRE(b.top(0, Side::bid, top1, 1) == 1);
     CHECK((top1[0].price == 101 && top1[0].qty == 1));
-    CHECK(b.counters().null_price_orders == 1);
     CHECK(b.counters().consistency_errors == 0);
     b.remove(0, Side::bid, 99, 1, false);       // no such level, CLEAN
     b.change(0, Side::bid, 98, 1, 2, true);     // no such level, STALE
@@ -251,7 +251,7 @@ TEST_CASE("uncapped book: clears, null price, overflow, consistency errors split
     CHECK(b.depth(0, Side::offer) == 1);
     b.clear(0);
     CHECK(b.depth(0, Side::offer) == 0);
-    CHECK(b.state_bytes() == 2 * 2 * sizeof(BookLevel) + 2 * sizeof(std::size_t));
+    CHECK(b.state_bytes() == 2 * 2 * sizeof(BookLevel) + 2 * sizeof(std::size_t) + 2 * sizeof(b3::book::NullBucket));
 }
 
 // ---- Port 2 ----
@@ -376,6 +376,39 @@ Bytes del_no_px(std::uint64_t sid, char type, std::int64_t qty, std::uint64_t so
 }
 
 template <class Book>
+void check_null_bucket() {
+    // NEW, CHANGE and DELETE at a present null price: the bucket, no STATE_CHANGE.
+    Pipeline<Book> p("200000001 68\n");
+    p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));
+    p.feed(packet(68, 2, {order(WIN, 0, '0', kNull, 4, 2, 2, 0x80)}));           // market order NEW
+    CHECK((p.levels.null_bucket(0, Side::bid).qty == 4 && p.levels.null_bucket(0, Side::bid).count == 1));
+    p.feed(packet(68, 3, {order(WIN, 1, '0', kNull, 3, 2, 3, 0x80, 7, 4)}));      // CHANGE 4 -> 3
+    CHECK(p.levels.null_bucket(0, Side::bid).qty == 3);
+    p.feed(packet(68, 4, {del(WIN, '0', kNull, 3, 2, 4, 0x80)}));                 // its DELETE, null price
+    CHECK(p.levels.null_bucket(0, Side::bid).count == 0);
+    for (const auto& r : p.records()) CHECK(r.header.record_type == RT::BOOK_UPDATE);   // never STALE
+    BookLevel lv[2];
+    REQUIRE(p.levels.top(0, Side::bid, lv, 2) == 1);                             // the level untouched
+    CHECK((lv[0].price == 100 && lv[0].qty == 5));
+    CHECK(p.levels.counters().null_price_orders == 3);
+    CHECK(p.levels.counters().consistency_errors == 0);
+    CHECK(p.tracker.counters().unappliable[b3::tracker::kUnappliableDeleteNoPrice] == 0);
+    // A CHANGE at a null price with no previous size stays unappliable.
+    p.feed(packet(68, 5, {order(WIN, 1, '0', kNull, 3, 2, 5, 0x80, 7, kNull)}));
+    const auto rs = p.records();
+    CHECK((rs.back().header.record_type == RT::STATE_CHANGE &&
+           rs.back().header.cause == b3::records::cause::UNAPPLIABLE));
+}
+
+TEST_CASE("null-price bucket: NEW, CHANGE, DELETE at a null price (uncapped book)") {
+    check_null_bucket<UncappedBook>();
+}
+
+TEST_CASE("null-price bucket: NEW, CHANGE, DELETE at a null price (capped book)") {
+    check_null_bucket<b3::book::CappedBook<b3::kPublishedDepth, b3::kPublishedDepth>>();
+}
+
+template <class Book>
 void check_unappliable() {
     using b3::records::cause::UNAPPLIABLE;
     const std::size_t kDel = b3::tracker::kUnappliableDeleteNoPrice;
@@ -387,7 +420,6 @@ void check_unappliable() {
     };
     const Case cases[] = {
         {"DELETE, price absent", del_no_px(WIN, '0', 5, 1, 2, 0x80), kDel},
-        {"DELETE, price null", del(WIN, '0', kNull, 5, 1, 2, 0x80), kDel},
         {"CHANGE, previous size null", order(WIN, 1, '0', 100, 3, 1, 2, 0x80, 7, kNull), kChg},
         {"NEW, no side", order(WIN, 0, 'X', 100, 3, 2, 2, 0x80), b3::tracker::kUnappliableNoSide},
         {"CHANGE, no side", order(WIN, 1, 'X', 100, 3, 1, 2, 0x80, 7, 5), b3::tracker::kUnappliableNoSide},

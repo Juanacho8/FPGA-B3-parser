@@ -9,9 +9,9 @@
 //   change (qty += new size - previous size), remove (qty -= size,
 //   count -= 1, the level goes at count 0), and the clears. Trades never get
 //   here. A new level past the capacity is counted and dropped. Null-price
-//   orders are counted and kept out of the levels. A DELETE with no price
-//   or a change with no previous size changes nothing: the tracker marks
-//   the instrument STALE (unappliable). Consistency errors are
+//   orders (market on auction) go to a per-side null-price bucket outside
+//   the levels, not published. A change with no previous size changes
+//   nothing: the tracker marks the instrument STALE (unappliable). Consistency errors are
 //   counted, split by whether the instrument was CLEAN or STALE.
 //
 // What it must not do:
@@ -42,15 +42,50 @@ struct BookCounters {
     std::uint64_t null_price_orders = 0;       // ADD/MODIFY/DELETE at a null price, outside the levels
 };
 
+// The null-price bucket of one side (DESIGN.md 4.5): the total qty and order
+// count of the orders at a null price (market on auction). Treated like one
+// more level, so its consistency rules are a level's: a change or delete on
+// an empty bucket, a qty going negative, count 0 with qty left. Each call
+// returns true on a consistency error. Not published on port 2 in v1.
+struct NullBucket {
+    std::int64_t qty = 0;
+    std::uint32_t count = 0;
+
+    bool add(std::int64_t q) noexcept {
+        qty = records::wrap_add(qty, q);
+        count += 1;
+        return qty < 0;
+    }
+    bool change(std::int64_t q, std::int64_t prev) noexcept {
+        if (count == 0) return true;   // no such order at a null price
+        qty = records::wrap_add(qty, records::wrap_sub(q, prev));
+        return qty < 0;
+    }
+    bool remove(std::int64_t q) noexcept {
+        if (count == 0) return true;
+        qty = records::wrap_sub(qty, q);
+        count -= 1;
+        if (count == 0) {
+            const bool left = qty != 0;   // count 0 with qty left
+            qty = 0;
+            return left;
+        }
+        return qty < 0;
+    }
+    void clear() noexcept { *this = NullBucket{}; }
+};
+
 class UncappedBook {
 public:
     static constexpr std::int64_t kNullPrice = std::numeric_limits<std::int64_t>::min();
 
     UncappedBook(std::size_t instruments, std::size_t levels_per_side)
-        : cap_(levels_per_side), size_(instruments * 2, 0), levels_(instruments * 2 * levels_per_side) {}
+        : cap_(levels_per_side), size_(instruments * 2, 0), levels_(instruments * 2 * levels_per_side),
+          null_(instruments * 2) {}
 
     std::size_t state_bytes() const noexcept {
-        return levels_.size() * sizeof(BookLevel) + size_.size() * sizeof(std::size_t);
+        return levels_.size() * sizeof(BookLevel) + size_.size() * sizeof(std::size_t) +
+               null_.size() * sizeof(NullBucket);
     }
     std::size_t levels_per_side() const noexcept { return cap_; }
     const BookCounters& counters() const noexcept { return counters_; }
@@ -66,6 +101,7 @@ public:
     void add(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
+            if (null_[index(slot, side)].add(qty)) error(stale);
             return;
         }
         BookLevel* lv = find_or_insert(slot, side, price);
@@ -77,11 +113,12 @@ public:
 
     void change(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, std::int64_t prev,
                 bool stale) noexcept {
+        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
+            if (null_[index(slot, side)].change(qty, prev)) error(stale);
             return;
         }
-        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         BookLevel* lv = find(slot, side, price);
         if (lv == nullptr) {
             error(stale);
@@ -91,8 +128,15 @@ public:
         check(*lv, stale);
     }
 
+    // A null price here is a present null (a market order's DELETE): the
+    // bucket. An absent price (before v15) is unappliable and never gets here
+    // (book_sink.hpp skips the message).
     void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
-        if (price == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
+        if (price == kNullPrice) {
+            ++counters_.null_price_orders;
+            if (null_[index(slot, side)].remove(qty)) error(stale);
+            return;
+        }
         BookLevel* lv = find(slot, side, price);
         if (lv == nullptr) {
             error(stale);
@@ -112,7 +156,11 @@ public:
         check(*lv, stale);
     }
 
-    void clear_side(std::size_t slot, Side side) noexcept { size_[index(slot, side)] = 0; }
+    void clear_side(std::size_t slot, Side side) noexcept {
+        size_[index(slot, side)] = 0;
+        null_[index(slot, side)].clear();
+    }
+    const NullBucket& null_bucket(std::size_t slot, Side side) const noexcept { return null_[index(slot, side)]; }
     void clear(std::size_t slot) noexcept {
         clear_side(slot, Side::bid);
         clear_side(slot, Side::offer);
@@ -181,6 +229,7 @@ private:
     std::size_t cap_;
     std::vector<std::size_t> size_;
     std::vector<BookLevel> levels_;
+    std::vector<NullBucket> null_;
     std::size_t max_depth_[2] = {0, 0};
     BookCounters counters_;
 };

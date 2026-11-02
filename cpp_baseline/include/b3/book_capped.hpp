@@ -16,8 +16,9 @@
 //       truncated: ignored. At or better than B (or not truncated) and not in
 //       the slots: consistency error.
 //     Clears: no slots, truncated false.
-//     A DELETE with no price or a CHANGE with no previous size changes
-//     nothing: the tracker marks the instrument STALE (unappliable).
+//     Orders at a null price (market on auction) go to the side's
+//     null-price bucket (qty, count), outside the slots, not published. A
+//     CHANGE with no previous size changes nothing (unappliable).
 //     Depth incomplete: truncated and fewer than N valid slots.
 //   Same interface as book_uncapped.hpp, so book_sink.hpp takes either.
 //   Statistics for choosing K (brief section 5, "Measuring K"): per side,
@@ -71,6 +72,7 @@ public:
     struct SideState {
         std::array<BookLevel, K> slot{};   // best first; slots >= valid are don't-care
         std::int64_t boundary = 0;         // B, meaningful while truncated
+        NullBucket null;                   // orders at a null price, outside the slots
         std::uint8_t valid = 0;
         bool truncated = false;
     };
@@ -93,6 +95,7 @@ public:
     void add(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
+            if (at(slot, side).null.add(qty)) error(stale);
             return;
         }
         SideState& s = at(slot, side);
@@ -113,11 +116,12 @@ public:
 
     void change(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, std::int64_t prev,
                 bool stale) noexcept {
+        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
+            if (at(slot, side).null.change(qty, prev)) error(stale);
             return;
         }
-        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         SideState& s = at(slot, side);
         const Match m = match(s, side, price);
         if (!m.found) {
@@ -129,8 +133,14 @@ public:
         if (lv.qty < 0) error(stale);
     }
 
+    // A null price is a present null (a market order's DELETE): the bucket.
+    // An absent price is unappliable and never gets here (book_sink.hpp).
     void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
-        if (price == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
+        if (price == kNullPrice) {
+            ++counters_.null_price_orders;
+            if (at(slot, side).null.remove(qty)) error(stale);
+            return;
+        }
         SideState& s = at(slot, side);
         const Match m = match(s, side, price);
         if (!m.found) {
@@ -158,6 +168,7 @@ public:
         s.valid = 0;            // RTL: reset valid and truncated; the slots become don't-care
         s.truncated = false;
         s.boundary = 0;
+        s.null.clear();
         note(slot, side);
     }
     void clear(std::size_t slot) noexcept {
@@ -175,6 +186,7 @@ public:
     std::size_t depth(std::size_t slot, Side side) const noexcept { return at(slot, side).valid; }
     bool truncated(std::size_t slot, Side side) const noexcept { return at(slot, side).truncated; }
     std::int64_t boundary(std::size_t slot, Side side) const noexcept { return at(slot, side).boundary; }
+    const NullBucket& null_bucket(std::size_t slot, Side side) const noexcept { return at(slot, side).null; }
     bool depth_incomplete(std::size_t slot, Side side) const noexcept {
         const SideState& s = at(slot, side);
         return s.truncated && s.valid < N;

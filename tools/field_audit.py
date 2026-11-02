@@ -69,8 +69,8 @@ RULES = {
         "Absent reads 0. A value other than '0' (bid) or '1' (offer) gives side 0: " + UNAPPLIABLE
         + " (`no_side`)", when=("NEW", "CHANGE"), side=True, reason="no_side"),
     ("Order_MBO_50", "mDEntryPx"): Rule(
-        "Null: a market-on-auction order, price INT64_MIN on port 1; the price-level books count it "
-        "(`null_price_orders`) and keep it out of the levels, the MBO book keeps the order",
+        "Null: a market-on-auction order, price INT64_MIN on port 1; the price-level books apply it to the "
+        "side's null-price bucket (4.5, not published), the MBO book keeps the order",
         when=("NEW", "CHANGE")),
     ("Order_MBO_50", "mDEntrySize"): Rule(
         "Absent reads 0. Every value is applied (two's-complement arithmetic); a level's qty going negative "
@@ -87,8 +87,9 @@ RULES = {
         "Absent reads 0. A value other than '0' or '1' gives side 0: " + UNAPPLIABLE + " (`no_side`)",
         side=True, reason="no_side"),
     ("DeleteOrder_MBO_51", "mDEntryPx"): Rule(
-        "Null, or absent before v15: price INT64_MIN, " + UNAPPLIABLE + " (`delete_no_price`); the MBO book "
-        "removes the order by id", reason="delete_no_price"),
+        "Absent (before v15): price INT64_MIN, " + UNAPPLIABLE + " (`delete_no_price`); the MBO book "
+        "removes the order by id. Null: a market order's DELETE, applied to the null-price bucket",
+        reason="delete_no_price"),
     ("DeleteOrder_MBO_51", "mDEntrySize"): Rule(
         "Absent reads 0. Every value is applied; a qty going negative, or a level at count 0 with qty left, "
         "is a consistency error"),

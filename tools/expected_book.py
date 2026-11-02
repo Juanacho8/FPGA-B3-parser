@@ -59,12 +59,47 @@ def file_header(n, status_interval, max_instruments=c.DEFAULT_MAX_INSTRUMENTS, k
     return c.book_header(n, k or 0, max_instruments, status_interval).pack()
 
 
-class LevelBook:
+class NullBuckets:
+    """The per-side null-price buckets of a price-level book (DESIGN.md 4.5):
+    [qty, count] of the orders at a null price (market on auction), with a
+    level's consistency rules. Not published on port 2 in v1."""
+
+    def _bucket(self, slot, side):
+        return self.null.setdefault((slot, side), [0, 0])
+
+    def _null(self, op, slot, side, qty, prev, stale):
+        self.null_price += 1
+        b = self._bucket(slot, side)
+        if op == "add":
+            b[0] = wrap(b[0] + qty)
+            b[1] += 1
+            bad = b[0] < 0
+        elif b[1] == 0:
+            bad = True                    # a change or delete with no order at a null price
+        elif op == "change":
+            b[0] = wrap(b[0] + qty - prev)
+            bad = b[0] < 0
+        else:
+            b[0] = wrap(b[0] - qty)
+            b[1] -= 1
+            if b[1] == 0:
+                bad, b[0] = b[0] != 0, 0
+            else:
+                bad = b[0] < 0
+        if bad:
+            self._error(stale)
+
+    def null_bucket(self, slot, side):
+        return tuple(self._bucket(slot, side))
+
+
+class LevelBook(NullBuckets):
     """Price levels per (slot, side): {price: [qty, count]}. DESIGN.md 4.5."""
 
     def __init__(self, cap=DEFAULT_LEVELS):
         self.cap = cap
         self.sides = {}
+        self.null = {}
         self.level_overflow = self.errors = self.errors_stale = self.null_price = 0
         self.max_depth = {BID: 0, OFFER: 0}
 
@@ -79,7 +114,7 @@ class LevelBook:
 
     def add(self, slot, side, price, qty, stale):
         if price == NULL_PRICE:
-            self.null_price += 1
+            self._null("add", slot, side, qty, 0, stale)
             return
         levels = self._side(slot, side)
         if price not in levels:
@@ -95,11 +130,11 @@ class LevelBook:
             self._error(stale)
 
     def change(self, slot, side, price, qty, prev, stale):
-        if price == NULL_PRICE:
-            self.null_price += 1
-            return
         if prev == NULL_PRICE:
             return            # unappliable: the replay marks the instrument STALE (DESIGN.md 4.5)
+        if price == NULL_PRICE:
+            self._null("change", slot, side, qty, prev, stale)
+            return
         lv = self._side(slot, side).get(price)
         if lv is None:
             self._error(stale)
@@ -109,8 +144,9 @@ class LevelBook:
             self._error(stale)
 
     def remove(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:
-            return            # unappliable: the replay marks the instrument STALE (DESIGN.md 4.5)
+        if price == NULL_PRICE:       # a present null: a market order (an absent price never gets here)
+            self._null("remove", slot, side, qty, 0, stale)
+            return
         levels = self._side(slot, side)
         lv = levels.get(price)
         if lv is None:
@@ -132,6 +168,7 @@ class LevelBook:
     def clear(self, slot, side=None):
         for s in ((BID, OFFER) if side is None else (side,)):
             self.sides[(slot, s)] = {}
+            self.null.pop((slot, s), None)
 
     def top(self, slot, side, n):
         levels = self._side(slot, side)
@@ -139,7 +176,7 @@ class LevelBook:
         return [(p, levels[p][0], levels[p][1]) for p in prices]
 
 
-class CappedBook:
+class CappedBook(NullBuckets):
     """The capped book (brief section 5, DESIGN.md 4.2), a second
     implementation beside the C++ book_capped.hpp: per (slot, side) a
     best-first list of at most K [price, qty, count] levels, a truncated
@@ -149,6 +186,7 @@ class CappedBook:
     def __init__(self, k, n):
         self.k, self.n = k, n
         self.sides = {}
+        self.null = {}
         self.errors = self.errors_stale = self.null_price = 0
         self.level_overflow = 0
         self.stats = {s: dict(truncations=0, levels_dropped=0, ignored=0, depth_incomplete=0,
@@ -202,7 +240,7 @@ class CappedBook:
 
     def add(self, slot, side, price, qty, stale):
         if price == NULL_PRICE:
-            self.null_price += 1
+            self._null("add", slot, side, qty, 0, stale)
             return
         st = self._side(slot, side)
         levels = st["levels"]
@@ -241,11 +279,11 @@ class CappedBook:
         return st, lv
 
     def change(self, slot, side, price, qty, prev, stale):
-        if price == NULL_PRICE:
-            self.null_price += 1
-            return
         if prev == NULL_PRICE:
             return            # unappliable: the replay marks the instrument STALE
+        if price == NULL_PRICE:
+            self._null("change", slot, side, qty, prev, stale)
+            return
         _, lv = self._find(slot, side, price, stale)
         if lv is None:
             return
@@ -254,8 +292,9 @@ class CappedBook:
             self._error(stale)
 
     def remove(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:
-            return            # unappliable: the replay marks the instrument STALE
+        if price == NULL_PRICE:       # a present null: a market order
+            self._null("remove", slot, side, qty, 0, stale)
+            return
         st, lv = self._find(slot, side, price, stale)
         if lv is None:
             return
@@ -276,6 +315,7 @@ class CappedBook:
     def clear(self, slot, side=None):
         for s in ((BID, OFFER) if side is None else (side,)):
             self.sides[(slot, s)] = {"levels": [], "truncated": False, "b": 0}
+            self.null.pop((slot, s), None)
             self._note(slot, s)
 
     def top(self, slot, side, n):
@@ -452,8 +492,11 @@ class Port2:
 
     def on_message(self, events):
         closer = None
+        skip = self.replay.last_unappliable      # changes no level (DESIGN.md 3.6.4); still closes
         for e in events:
-            if self.apply(e):
+            closes = (e.flags & c.FLAG_END_OF_EVENT and e.kind not in (c.SEQ_RESET, c.CLEAR_CHANNEL)) if skip \
+                else self.apply(e)
+            if closes:
                 closer = e
         self.transitions()
         if closer is not None:

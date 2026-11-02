@@ -82,13 +82,14 @@ def no_side(row):
 
 def unappliable_reason(row):
     """A message a price-level book cannot apply (DESIGN.md 3.6.4, 3.10):
-    no side; a DeleteOrder_MBO with no price; an Order_MBO CHANGE with no
+    no side; a DeleteOrder_MBO with an absent price (a null one is a market
+    order, applied to the null-price bucket); an Order_MBO CHANGE with no
     previous size. The first that holds, in this order."""
     t = row["templateId"]
     if t == DELETE_ORDER_MBO:
         if no_side(row):
             return "no_side"
-        return "delete_no_price" if missing_field(row, "mDEntryPx") else None
+        return "delete_no_price" if "mDEntryPx" in row.get("absent", []) else None   # null: a market order
     if t == ORDER_MBO and action(row) in (NEW, CHANGE):
         if no_side(row):
             return "no_side"
@@ -118,6 +119,7 @@ class Replay:
                         late_after_gap=0)   # the view never holds a late packet: only 0 is derivable
         self.msg_before_rebuild = 0
         self.unappliable = dict(delete_no_price=0, change_no_prev_size=0, no_side=0)
+        self.last_unappliable = None
         self.losses = 0
         self.unknown = 0
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
@@ -213,6 +215,7 @@ class Replay:
             st["first"] = list(point)
 
     def message(self, row, c):
+        self.last_unappliable = None   # set when this message is unappliable
         t, f = row["templateId"], row["fields"]
         ch = row["channel"]
         if t == SEQUENCE and row["sequenceNumber"] == 0:
@@ -252,6 +255,7 @@ class Replay:
         """A message a price-level book cannot apply: counted by reason, and
         its instrument goes stale (DESIGN.md 3.6.4, cause 7)."""
         self.unappliable[reason] += 1
+        self.last_unappliable = reason
         self.stale(slot, point)
 
 
