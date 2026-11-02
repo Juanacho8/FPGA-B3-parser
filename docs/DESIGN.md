@@ -99,7 +99,7 @@ Default header (N = 5, K = 16, 64 instruments), events.bin:
 | 0 | END_OF_EVENT | matchEventIndicator bit 7. Always 1 on an END_OF_EVENT marker |
 | 1 | RECOVERY | matchEventIndicator bit 5 (RecoveryMsg) |
 | 2 | IMPLIED | matchEventIndicator bit 4 |
-| 3 | BOOK_NOT_CLEAN | The record's instrument is a table instrument (4.4) whose state is not CLEAN (today: STALE, 3.6.4: a loss, an rptSeq jump or a silence) once this message has been applied: a gap or a silence is marked before the packet that reveals it, so its records carry the bit; an rptSeq jump marks its own message; an instrument's EmptyBook and a ChannelReset clear it first, so their records do not. Records with no table instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET, END_OF_EVENT, or a securityID not in the table) have 0 |
+| 3 | BOOK_NOT_CLEAN | The record's instrument is a table instrument (4.4) whose state is not CLEAN (today: STALE, 3.6.4: a loss, an rptSeq jump, a silence or an unappliable message) once this message has been applied: a gap or a silence is marked before the packet that reveals it, so its records carry the bit; an rptSeq jump and an unappliable message mark their own message; an instrument's EmptyBook and a ChannelReset clear it first, so their records do not. Records with no table instrument (channel-wide SESSION, CLEAR_CHANNEL, SEQ_RESET, END_OF_EVENT, or a securityID not in the table) have 0 |
 | 4–7 | reserved, 0 | |
 
 A message without a matchEventIndicator (ExecutionSummary, SequenceReset) has flags 0. An END_OF_EVENT marker takes bits 1 and 2 from the closing message's matchEventIndicator.
@@ -301,6 +301,7 @@ Per table instrument (4.4), on dispatch (`Tracker`). Flags only: there is no boo
 * **rptSeq**: every message with a securityID in the table and an rptSeq field. It must be the previous + 1, or 1 on the message after the instrument's EmptyBook. A jump is counted (`rpt_seq_gaps`) and marks **that instrument** stale, at the packet holding the message. The first message seen sets the starting value. A ChannelReset does not touch rptSeq; in every generator set each instrument's first message after a ChannelReset (or a SequenceReset) is its own EmptyBook, which restarts it.
 * **Losses** mark **every table instrument of the channel** stale: a sequence gap (stale point: channel, sequenceVersion and the first missing sequenceNumber) and a discarded tail (a malformed packet, or messages past msg_index 255; stale point: the packet itself). A decoder cannot know what the lost bytes held, so a loss is assumed to have held a message for each instrument of the channel, or a channel-wide one. A gap is marked before the packet that reveals it is dispatched; a discarded tail after the packet's complete messages.
 * **Silence** (`spec/LAYOUTS.md` 12.1: no message for 3 heartbeat intervals means the stream is down): each channel's last datagram is remembered (any datagram with a packet header: a heartbeat, a duplicate, a late packet). When time next advances (a datagram arrives, on any channel), every channel that has sent nothing for more than the **silence limit** (3 s of capture time by default, `b3_decode --silence-ns`, 0 turns it off) marks every CLEAN table instrument of it STALE, once per silence. Stale point: (channel, its sequenceVersion, its next expected sequenceNumber). The check runs before the datagram that advanced time is looked at, so that datagram's own channel is judged by its previous one. Counted (`silences`).
+* **Unappliable messages**: a DeleteOrder_MBO for a table instrument whose mDEntryPx is null or absent (absent before schema v15), or an Order_MBO **CHANGE** whose mDEntryPrevSize is null or absent, cannot be applied to a price-level book (4.5: it does not know which level, or by how much). It marks **that instrument** stale at the packet holding the message (STATE_CHANGE cause 7), after the rptSeq check, and is counted by reason (`unappliable`: `delete_no_price`, `change_no_prev_size`). An Order_MBO **NEW** never carries a previous size and is never unappliable. The MBO book (4.8) still applies such a message by order id.
 * **Clearing**: an instrument's **EmptyBook** clears its stale flag; a **ChannelReset** clears it for every table instrument of its channel. Nothing else does.
 * **Before the rebuild**: after a ChannelReset, a message for a table instrument of that channel arriving before the instrument's own EmptyBook is counted (`msg_before_rebuild`). B3 may interleave such messages (generator open item J); the generator never does, and no rule here depends on it.
 * Reported per instrument: rptSeq gaps, the number of times it went stale, whether it is stale at the end, and its **first stale point** (channel, sequenceVersion, sequenceNumber), kept even after a clear.
@@ -436,7 +437,7 @@ Levels: bid level i (0 = best) at offset 48 + 24·i, offer level i at 48 + 24·(
 |---|---|---|
 | 0 | CLEAN | The book can be trusted |
 | 1 | HOLDING | Reserved for step 11 (a hole held in the arbitration window) |
-| 2 | STALE | A loss, an rptSeq jump or a silence (3.6.4); cleared by the instrument's EmptyBook or a ChannelReset |
+| 2 | STALE | A loss, an rptSeq jump, a silence or an unappliable message (3.6.4); cleared by the instrument's EmptyBook or a ChannelReset |
 | 3 | RECOVERING | Reserved for step 12 (snapshot recovery) |
 
 **Cause** (byte 45, STATE_CHANGE only; 0 on BOOK_UPDATE and STATUS):
@@ -449,8 +450,9 @@ Levels: bid level i (0 = best) at offset 48 + 24·i, offer level i at 48 + 24·(
 | 4 | Silence | CLEAN → STALE: the channel sent nothing for more than the silence limit (3.6.4) |
 | 5 | EmptyBook | STALE → CLEAN: the instrument's EmptyBook |
 | 6 | ChannelReset | STALE → CLEAN: its channel's ChannelReset |
+| 7 | Unappliable message | CLEAN → STALE: a DELETE with no price, or a CHANGE with no previous size, which no price-level book can apply (3.6.4, 4.5) |
 
-0 and 7–255 are never written on a STATE_CHANGE.
+0 and 8–255 are never written on a STATE_CHANGE.
 
 **Flags** (byte 42):
 
@@ -473,7 +475,7 @@ Levels: bid level i (0 = best) at offset 48 + 24·i, offer level i at 48 + 24·(
 | Port 1 record | Capped book |
 |---|---|
 | ADD at price p | The level is in the slots: qty += qty, count += 1. Otherwise, if not truncated or p is at or better than B: insert in sorted position; if that makes K + 1 levels, the worst is dropped, `truncated` is set, and B becomes the new worst slot's price. Truncated and p worse than B: ignored |
-| MODIFY, DELETE | The level is in the slots: applied as in 4.5 (a DELETE removes the slot at count 0, **B unchanged**). Not in the slots: worse than B while truncated, ignored; otherwise (at or better than B, or not truncated) a **consistency error** |
+| MODIFY, DELETE | Unappliable (no previous size, no price): no slot changes, as in 4.5. The level is in the slots: applied as in 4.5 (a DELETE removes the slot at count 0, **B unchanged**). Not in the slots: worse than B while truncated, ignored; otherwise (at or better than B, or not truncated) a **consistency error** |
 | CLEAR_SIDE, CLEAR_BOOK, CLEAR_CHANNEL | No slots, `truncated` false |
 
 "Better" is a higher price for bids, a lower one for offers. Null prices are counted and kept out of the slots, as in 4.5; consistency errors are split CLEAN / STALE, as in 4.5.
@@ -499,7 +501,7 @@ A loss (a gap, before the packet that reveals it; a discarded tail, after the pa
 | Record | Written when | Identity, exch_time | state | Levels |
 |---|---|---|---|---|
 | BOOK_UPDATE | At a close, one per touched instrument, in order of first touch, whose state is CLEAN. While STALE nothing is written, unless the build sets `B3_PUBLISH_STALE`: then it is written with state STALE | The closing record's (a marker's identity is its closing message's) | CLEAN (or STALE) | The book's top N |
-| STATE_CHANGE | The moment an instrument's state changes: CLEAN → STALE on a loss, an rptSeq jump or a silence (3.6.4); STALE → CLEAN on its EmptyBook or a ChannelReset. Even with no book change | The causing message's identity and time field; for a loss or a silence, (channel, sequenceVersion, the stale point's sequenceNumber, msg_index 0) and exch_time 0 | The new state; cause at offset 45 (4.1) | The book's top N if the new state is CLEAN, else zeros |
+| STATE_CHANGE | The moment an instrument's state changes: CLEAN → STALE on a loss, an rptSeq jump, a silence or an unappliable message (3.6.4); STALE → CLEAN on its EmptyBook or a ChannelReset. Even with no book change | The causing message's identity and time field; for a loss or a silence, (channel, sequenceVersion, the stale point's sequenceNumber, msg_index 0) and exch_time 0 | The new state; cause at offset 45 (4.1) | The book's top N if the new state is CLEAN, else zeros |
 | STATUS | Ticks at T0 + k × interval, k ≥ 1 (default 100 ms, `b3_decode --status-interval-ns`), T0 = the capture time of the file's first datagram. When a datagram's capture time reaches one or more ticks not yet written, **one** STATUS for the latest of them, before the datagram; ticks_skipped = how many earlier ticks it stands for (none after the last datagram) | All 0, instrument_id 0; capture_time = the tick; offset 24 = ticks_skipped | 0 | Zeros |
 
 **Resets** (3.5): a SequenceReset or ChannelReset closes nothing. Its record clears the channel's touched set, discarding the open event without a BOOK_UPDATE. A ChannelReset then clears every table instrument's book on its channel and **touches** each of them, so the channel's next close publishes their (empty or rebuilt) books. Each that was STALE gets a **STATE_CHANGE to CLEAN at the reset**, carrying its empty book (bid_count and offer_count 0); the ones already CLEAN get none. Nothing is written mid-event (brief open item E).
@@ -525,13 +527,13 @@ The instruments the decoder tracks (rptSeq and stale flags now, books from step 
 | Port 1 record | Update |
 |---|---|
 | ADD at price p | Level p: qty += qty, count += 1; a new level if none |
-| MODIFY | Level p: qty += qty − previous qty (aux) |
-| DELETE | Level p: qty −= qty, count −= 1; the level is removed when count reaches 0 |
+| MODIFY | Level p: qty += qty − previous qty (aux). With no previous size (aux INT64_MIN): **unappliable**, no level changes |
+| DELETE | Level p: qty −= qty, count −= 1; the level is removed when count reaches 0. With no price (INT64_MIN): **unappliable**, no level changes |
 | CLEAR_SIDE | One side emptied |
 | CLEAR_BOOK | Both sides emptied |
 | CLEAR_CHANNEL | Every table instrument of the channel emptied |
 
-Trades never touch the book. A **null price** (INT64_MIN, a market-on-auction order) is counted (`null_price_orders`) and kept out of the levels. **Consistency errors** are counted, split by the instrument's state when they happen: a MODIFY or DELETE on a level that does not exist (ignored), a qty or count going negative, a level reaching count 0 with qty not 0. While CLEAN there must be none; while STALE they are expected (the lost messages built the levels).
+Trades never touch the book. A **null price** on an ADD or a MODIFY (INT64_MIN, a market-on-auction order) is counted (`null_price_orders`) and kept out of the levels. An **unappliable** message (a DELETE with no price, a MODIFY with no previous size) changes no level and is not a consistency error: the tracker marks the instrument STALE with cause 7 (3.6.4) and counts it, in both the capped and the uncapped book. **Consistency errors** are counted, split by the instrument's state when they happen: a MODIFY or DELETE on a level that does not exist (ignored), a qty or count going negative, a level reaching count 0 with qty not 0. While CLEAN there must be none; while STALE they are expected (the lost messages built the levels).
 
 ### 4.6 Future items
 

@@ -5,7 +5,8 @@ What it does:
   packet through the rules of docs/DESIGN.md 3.6.3 (sequencing) and 3.6.4
   (rptSeq and stale flags), from the manifest's missing packets and faults:
   a gap or a discarded malformed tail marks every table instrument of the
-  channel stale, an rptSeq jump one instrument, EmptyBook and ChannelReset
+  channel stale, an rptSeq jump or an unappliable message (a DELETE with no
+  price, a CHANGE with no previous size) one instrument, EmptyBook and ChannelReset
   clear. With capture times (tools/b3feed.py drives advance() and saw() from
   the feed's pcap), a channel silent for more than the silence limit marks
   its table instruments stale too (DESIGN.md 3.6.4, spec/LAYOUTS.md 12.1). It is the one derivation of stale state shared by
@@ -20,6 +21,8 @@ What it must not do:
 from pathlib import Path
 
 SEQUENCE_RESET, SEQUENCE, EMPTY_BOOK, CHANNEL_RESET = 1, 2, 9, 11
+ORDER_MBO, DELETE_ORDER_MBO = 50, 51
+CHANGE = 1   # Order_MBO mDUpdateAction
 MAX_VERSION = 65534
 DEFAULT_SILENCE_NS = 3_000_000_000   # 3 heartbeat intervals of 1 s (LAYOUTS.md 12.1)
 
@@ -63,6 +66,22 @@ def packets(rows):
         yield current
 
 
+def missing_field(row, name):
+    """True when the row's field is null or absent (or not given)."""
+    return name in row.get("null", []) or name in row.get("absent", []) or row["fields"].get(name) is None
+
+
+def unappliable_reason(row):
+    """A DeleteOrder_MBO with no price, or an Order_MBO CHANGE with no
+    previous size: a price-level book cannot apply it (DESIGN.md 3.6.4)."""
+    t = row["templateId"]
+    if t == DELETE_ORDER_MBO and missing_field(row, "mDEntryPx"):
+        return "delete_no_price"
+    if t == ORDER_MBO and row["fields"].get("mDUpdateAction") == CHANGE and missing_field(row, "mDEntryPrevSize"):
+        return "change_no_prev_size"
+    return None
+
+
 class Replay:
     """The sequencer and tracker rules over the answer keys' rows."""
 
@@ -82,6 +101,7 @@ class Replay:
                         heartbeat_without_sequence=0,
                         late_after_gap=0)   # the view never holds a late packet: only 0 is derivable
         self.msg_before_rebuild = 0
+        self.unappliable = dict(delete_no_price=0, change_no_prev_size=0)
         self.losses = 0
         self.unknown = 0
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
@@ -208,6 +228,15 @@ class Replay:
                 st["gaps"] += 1
                 self.stale(slot, (ch, row["sequenceVersion"], row["sequenceNumber"]))
             st.update(have=True, last=f["rptSeq"])
+        reason = unappliable_reason(row)
+        if reason:
+            self.unappliable_message(slot, (ch, row["sequenceVersion"], row["sequenceNumber"]), reason)
+
+    def unappliable_message(self, slot, point, reason):
+        """A message a price-level book cannot apply: counted by reason, and
+        its instrument goes stale (DESIGN.md 3.6.4, cause 7)."""
+        self.unappliable[reason] += 1
+        self.stale(slot, point)
 
 
     def is_stale(self, security_id):

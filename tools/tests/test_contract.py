@@ -72,7 +72,7 @@ def test_book_constant_values_are_fixed():
     assert (c.BOOK_CLEAN, c.BOOK_HOLDING, c.BOOK_STALE, c.BOOK_RECOVERING) == (0, 1, 2, 3)
     assert (c.BOOK_FLAG_RECOVERY, c.BOOK_FLAG_DEPTH_INCOMPLETE_BID, c.BOOK_FLAG_DEPTH_INCOMPLETE_OFFER) == (1, 2, 4)
     assert [c.CAUSE_GAP, c.CAUSE_DISCARDED_TAIL, c.CAUSE_RPT_SEQ_JUMP, c.CAUSE_SILENCE, c.CAUSE_EMPTY_BOOK,
-            c.CAUSE_CHANNEL_RESET] == list(range(1, 7))
+            c.CAUSE_CHANNEL_RESET, c.CAUSE_UNAPPLIABLE] == list(range(1, 8))
 
 
 def test_read_events_rejects_bad_files():

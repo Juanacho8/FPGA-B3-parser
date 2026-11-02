@@ -155,6 +155,7 @@ inline constexpr std::uint8_t RPT_SEQ_JUMP = 3;
 inline constexpr std::uint8_t SILENCE = 4;
 inline constexpr std::uint8_t EMPTY_BOOK = 5;
 inline constexpr std::uint8_t CHANNEL_RESET = 6;
+inline constexpr std::uint8_t UNAPPLIABLE = 7;   // a CHANGE or DELETE the price-level books cannot apply
 }  // namespace cause
 
 struct BookLevel {

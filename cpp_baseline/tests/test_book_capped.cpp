@@ -163,6 +163,18 @@ TEST_CASE("capped: consistency error better than B; worse than B ignored") {
     CHECK(fresh.counters().consistency_errors == 1);
 }
 
+TEST_CASE("capped: an unappliable DELETE or CHANGE changes no slot") {
+    Book b;
+    add(b, 100, Side::bid, 5);
+    b.remove(0, Side::bid, Book::kNullPrice, 5, false);    // no price
+    b.change(0, Side::bid, 100, 1, Book::kNullPrice, false);   // no previous size
+    BookLevel lv[1];
+    REQUIRE(b.top(0, Side::bid, lv, 1) == 1);
+    CHECK((lv[0].price == 100 && lv[0].qty == 5));
+    CHECK(b.counters().consistency_errors == 0);
+    CHECK(b.counters().null_price_orders == 0);
+}
+
 TEST_CASE("capped: bid and offer ordering are mirror images") {
     Book b;
     for (std::int64_t p : {100, 102, 101, 103, 104}) add(b, p, Side::offer);

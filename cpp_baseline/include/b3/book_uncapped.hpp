@@ -9,7 +9,9 @@
 //   change (qty += new size - previous size), remove (qty -= size,
 //   count -= 1, the level goes at count 0), and the clears. Trades never get
 //   here. A new level past the capacity is counted and dropped. Null-price
-//   orders are counted and kept out of the levels. Consistency errors are
+//   orders are counted and kept out of the levels. A DELETE with no price
+//   or a change with no previous size changes nothing: the tracker marks
+//   the instrument STALE (unappliable). Consistency errors are
 //   counted, split by whether the instrument was CLEAN or STALE.
 //
 // What it must not do:
@@ -79,9 +81,10 @@ public:
             ++counters_.null_price_orders;
             return;
         }
+        if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         BookLevel* lv = find(slot, side, price);
-        if (lv == nullptr || prev == kNullPrice) {
-            error(stale);            // no such level, or no previous size to apply
+        if (lv == nullptr) {
+            error(stale);
             return;
         }
         lv->qty += qty - prev;
@@ -89,10 +92,7 @@ public:
     }
 
     void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
-        if (price == kNullPrice) {
-            ++counters_.null_price_orders;
-            return;
-        }
+        if (price == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         BookLevel* lv = find(slot, side, price);
         if (lv == nullptr) {
             error(stale);

@@ -300,3 +300,18 @@ def test_book_not_clean_bit_follows_the_replay():
         (c.SEQ_RESET, 0),                                   # no instrument
         (c.CLEAR_BOOK, 0), (c.ADD, 0)]                      # rebuilt
     assert not any(e.flags & c.FLAG_BOOK_NOT_CLEAN for e in ie.convert(rows))   # no replay: never
+
+
+def test_book_not_clean_bit_after_an_unappliable_change():
+    import b3replay
+    manifest = {"missing": {"A": [], "B": []}}
+    rows = [order(0, seq=1), order(1, seq=2), order(0, seq=3)]   # NEW, CHANGE without mDEntryPrevSize, NEW
+    for r in rows:
+        r["fields"].update(securityID=7, rptSeq=r["sequenceNumber"])
+    rows[1]["null"] = ["mDEntryPrevSize"]
+    rows[1]["fields"].pop("mDEntryPrevSize", None)
+    replay = b3replay.Replay([(7, 68)], manifest, "A")
+    out = list(ie.convert(rows, replay))
+    assert [(e.kind, e.flags & c.FLAG_BOOK_NOT_CLEAN) for e in out] == [
+        (c.ADD, 0), (c.MODIFY, c.FLAG_BOOK_NOT_CLEAN), (c.ADD, c.FLAG_BOOK_NOT_CLEAN)]   # its own record too
+    assert replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 1}
