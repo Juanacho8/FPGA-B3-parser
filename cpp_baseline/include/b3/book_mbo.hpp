@@ -140,6 +140,18 @@ public:
         erase(at);
     }
 
+    // A DELETE with no side (DESIGN.md 3.10): found by id, side and price not
+    // checked; the instrument is STALE, so a fault counts as STALE.
+    void remove_by_id(std::size_t slot, std::int64_t qty, std::uint64_t id, bool stale) noexcept {
+        const std::uint32_t at = find(slot, id);
+        if (at == kNone) {
+            fault(MboFault::delete_missing, stale);
+            return;
+        }
+        if (pool_[at].qty != qty) fault(MboFault::delete_qty, stale);
+        erase(at);
+    }
+
     void clear_side(std::size_t slot, Side side) noexcept {
         std::uint32_t& head = heads_[list(slot, side)];
         while (head != kNone) erase(head);
@@ -192,7 +204,7 @@ public:
         std::size_t m = 0;
         for (std::size_t i = 0; i < k; ++i) {
             if (m > 0 && out[m - 1].price == scratch_[i].price) {
-                out[m - 1].qty += scratch_[i].qty;
+                out[m - 1].qty = records::wrap_add(out[m - 1].qty, scratch_[i].qty);
                 out[m - 1].order_count += 1;
             } else if (m < n) {
                 out[m++] = scratch_[i];

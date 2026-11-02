@@ -101,7 +101,14 @@ private:
         if (r.kind == K::ADD || r.kind == K::MODIFY || r.kind == K::DELETE || r.kind == K::CLEAR_SIDE ||
             r.kind == K::CLEAR_BOOK) {
             const std::size_t slot = table_.find(r.instrument_id);
-            if (slot != instruments::Table::kNotFound) {
+            const bool no_side = r.kind != K::CLEAR_BOOK && r.side == records::side::NONE;
+            if (slot != instruments::Table::kNotFound && no_side && r.kind == K::DELETE) {
+                // No side (DESIGN.md 3.10): found by id alone.
+                mbo_.remove_by_id(slot, r.qty, r.order_id, tracker_.state(slot).stale);
+                touched.add(slot);
+            } else if (slot != instruments::Table::kNotFound && no_side) {
+                // An ADD, MODIFY or CLEAR_SIDE with no side cannot be booked; the instrument is STALE.
+            } else if (slot != instruments::Table::kNotFound) {
                 const bool stale = tracker_.state(slot).stale;
                 const Side side = r.side == records::side::OFFER ? Side::offer : Side::bid;
                 switch (r.kind) {

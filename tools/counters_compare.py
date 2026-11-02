@@ -59,6 +59,7 @@ sys.path.insert(0, str(REPO / "tools"))
 import b3feed             # noqa: E402
 import b3intent           # noqa: E402
 import decode_crosscheck  # noqa: E402
+import field_audit        # noqa: E402
 import gen_instruments    # noqa: E402
 
 from b3replay import Broken, Replay, packets, read_table  # noqa: E402,F401  (shared with intent_to_events)
@@ -112,6 +113,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
                silences=replay.silences, unappliable=replay.unappliable,
+               fields=field_audit.counts(rows),
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
     late = [r["packet"] for r in (manifest.get("reordered") or {}).get(feed, [])]

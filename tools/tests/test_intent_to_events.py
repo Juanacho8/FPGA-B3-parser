@@ -314,4 +314,4 @@ def test_book_not_clean_bit_after_an_unappliable_change():
     out = list(ie.convert(rows, replay))
     assert [(e.kind, e.flags & c.FLAG_BOOK_NOT_CLEAN) for e in out] == [
         (c.ADD, 0), (c.MODIFY, c.FLAG_BOOK_NOT_CLEAN), (c.ADD, c.FLAG_BOOK_NOT_CLEAN)]   # its own record too
-    assert replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 1}
+    assert replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 1, "no_side": 0}

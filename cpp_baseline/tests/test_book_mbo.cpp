@@ -16,6 +16,7 @@
 #include <doctest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "b3/book_mbo.hpp"
@@ -237,4 +238,17 @@ TEST_CASE("mbo check: per-price totals equal the uncapped book's on a hand-built
     u.clear(0);
     check.on_message(&reset, 1);
     CHECK(mbo.resting(0) == 0);
+}
+
+TEST_CASE("mbo: a DELETE with no side is found by id alone; quantities wrap") {
+    MboBook b(1, 8);
+    b.add(0, Side::offer, 101, 4, 9, false);
+    b.remove_by_id(0, 4, 9, true);
+    CHECK(b.resting(0) == 0);
+    CHECK(total_faults(b) == 0);
+    b.remove_by_id(0, 4, 9, true);   // gone: a missing order, counted STALE
+    CHECK(fault(b, MboFault::delete_missing, true) == 1);
+    b.add(0, Side::bid, 100, std::numeric_limits<std::int64_t>::max(), 1, false);
+    b.add(0, Side::bid, 100, 2, 2, false);
+    CHECK(levels(b, Side::bid)[0].qty == std::numeric_limits<std::int64_t>::min() + 1);   // no overflow trap
 }

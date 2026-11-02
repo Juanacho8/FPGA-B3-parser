@@ -389,6 +389,10 @@ void check_unappliable() {
         {"DELETE, price absent", del_no_px(WIN, '0', 5, 1, 2, 0x80), kDel},
         {"DELETE, price null", del(WIN, '0', kNull, 5, 1, 2, 0x80), kDel},
         {"CHANGE, previous size null", order(WIN, 1, '0', 100, 3, 1, 2, 0x80, 7, kNull), kChg},
+        {"NEW, no side", order(WIN, 0, 'X', 100, 3, 2, 2, 0x80), b3::tracker::kUnappliableNoSide},
+        {"CHANGE, no side", order(WIN, 1, 'X', 100, 3, 1, 2, 0x80, 7, 5), b3::tracker::kUnappliableNoSide},
+        {"DELETE, no side", del(WIN, 'X', 100, 5, 1, 2, 0x80), b3::tracker::kUnappliableNoSide},
+        {"DELETE_THRU, no side", mass_delete(WIN, 'X', 2, 0x80), b3::tracker::kUnappliableNoSide},
     };
     for (const auto& c : cases) {
         CAPTURE(c.name);

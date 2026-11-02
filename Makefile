@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -57,7 +57,15 @@ cpp-debug:
 cpp-debug-k4:
 	$(call cpp_build,debug-k4,-DCMAKE_BUILD_TYPE=Debug -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=4)
 
-cpp-test: layouts-check cpp-debug cpp-debug-k4
+# The field audit (DESIGN.md 3.10, cpp_baseline/include/b3/field_audit.hpp),
+# generated from tools/field_audit.py's rules and the parsed schema.
+field-audit:
+	$(PYTHON) tools/field_audit.py
+
+field-audit-check:
+	$(PYTHON) tools/field_audit.py --check
+
+cpp-test: layouts-check field-audit-check cpp-debug cpp-debug-k4
 	ctest --test-dir $(CPP_BUILD)/debug --output-on-failure
 	ctest --test-dir $(CPP_BUILD)/debug-k4 --output-on-failure
 
@@ -147,6 +155,17 @@ book-oracle: cpp-book-variants
 # checkpoint. Fails on any difference.
 mbo-check: cpp-uncapped
 	$(PYTHON) tools/mbo_check.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
+
+# Damaged packets from the small set's feedA.pcap through the whole pipeline
+# in the Debug (sanitizer) build: any crash or undefined behaviour aborts with
+# the iteration and mutation; tools/fuzz_report.py prints the outcomes per
+# mutation kind. FUZZ_ITERATIONS and FUZZ_SEED override the defaults.
+FUZZ_ITERATIONS ?= 1600
+FUZZ_SEED ?= 1
+
+fuzz: cpp-debug
+	$(PYTHON) tools/fuzz_report.py --fuzz $(CPP_BUILD)/debug/b3_fuzz --iterations $(FUZZ_ITERATIONS) \
+	  --seed $(FUZZ_SEED) $(B3_DATA)/small/feedA.pcap
 
 # Goldens: each set's expected and C++ events.bin, and capped book.bin for
 # K = 16 and K = 32 at N = 5, under $(B3_DATA)/golden/, with provenance.json.

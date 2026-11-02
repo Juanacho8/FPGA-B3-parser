@@ -70,7 +70,7 @@ public:
         }
         BookLevel* lv = find_or_insert(slot, side, price);
         if (lv == nullptr) return;   // overflow, counted
-        lv->qty += qty;
+        lv->qty = records::wrap_add(lv->qty, qty);
         lv->order_count += 1;
         check(*lv, stale);
     }
@@ -87,7 +87,7 @@ public:
             error(stale);
             return;
         }
-        lv->qty += qty - prev;
+        lv->qty = records::wrap_add(lv->qty, records::wrap_sub(qty, prev));
         check(*lv, stale);
     }
 
@@ -98,7 +98,7 @@ public:
             error(stale);
             return;
         }
-        lv->qty -= qty;
+        lv->qty = records::wrap_sub(lv->qty, qty);
         if (lv->order_count == 0) {
             error(stale);
             return;

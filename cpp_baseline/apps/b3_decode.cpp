@@ -71,6 +71,7 @@
 #include "b3/book_params.hpp"
 #include "b3/book_sink.hpp"
 #include "b3/book_uncapped.hpp"
+#include "b3/field_audit.hpp"
 #include "b3/instruments.hpp"
 #include "b3/mbo_check.hpp"
 #include "b3/tracker.hpp"
@@ -341,7 +342,15 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
                  static_cast<ull>(sq.version_changes), static_cast<ull>(tc.seq_reset_not_first),
                  static_cast<ull>(sq.heartbeat_without_sequence), static_cast<ull>(sq.late_after_gap));
     counter_map(f, "unappliable", b3::tracker::kUnappliableNames.data(), tc.unappliable.data(), tc.unappliable.size());
-    std::fprintf(f, ",");
+    // DESIGN.md 3.10: per audited field, [absent, null, invalid].
+    std::fprintf(f, ",\"fields\":{");
+    for (std::size_t i = 0; i < b3::field_audit::kRows; ++i) {
+        std::fprintf(f, "%s\"%.*s\":[%llu,%llu,%llu]", i ? "," : "",
+                     static_cast<int>(b3::field_audit::kRowNames[i].size()), b3::field_audit::kRowNames[i].data(),
+                     static_cast<ull>(tc.fields.absent[i]), static_cast<ull>(tc.fields.null[i]),
+                     static_cast<ull>(tc.fields.invalid[i]));
+    }
+    std::fprintf(f, "},");
     std::fprintf(f, "\"losses\":%llu,\"silences\":%llu,\"unknown_instrument_messages\":%llu,"
                  "\"msg_before_rebuild\":%llu,\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.silences),

@@ -127,6 +127,16 @@ inline FileHeader events_header() noexcept {
     return h;
 }
 
+// Two's-complement (wrapping) int64 arithmetic for book quantities: a damaged
+// size never overflows into undefined behaviour, and the result is what the
+// RTL's adders give (DESIGN.md 4.5).
+constexpr std::int64_t wrap_add(std::int64_t a, std::int64_t b) noexcept {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) + static_cast<std::uint64_t>(b));
+}
+constexpr std::int64_t wrap_sub(std::int64_t a, std::int64_t b) noexcept {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) - static_cast<std::uint64_t>(b));
+}
+
 // ---- Port 2: book records (DESIGN.md 4.1) ----
 namespace record_type {
 inline constexpr std::uint8_t BOOK_UPDATE = 1;
