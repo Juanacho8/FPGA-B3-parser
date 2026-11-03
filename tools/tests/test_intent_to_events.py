@@ -258,8 +258,8 @@ def test_silence_marks_the_channel_not_clean(tmp_path):
     (tmp_path / "t.txt").write_text("7 68\n8 70\n")
     out = tmp_path / "e.bin"
     assert ie.main([str(path), "-o", str(out), "--instruments", str(tmp_path / "t.txt")]) == 0
-    flags = [e.flags & c.FLAG_BOOK_NOT_CLEAN for e in c.read_events(out.read_bytes())[1]]
-    assert flags == [0, 0, 0, c.FLAG_BOOK_NOT_CLEAN]   # 70 was not silent; 68 is STALE after
+    flags = [e.flags & c.FLAG_FEED_NOT_CLEAN for e in c.read_events(out.read_bytes())[1]]
+    assert flags == [0, 0, 0, c.FLAG_FEED_NOT_CLEAN]   # 70 was not silent; 68 is STALE after
 
 
 @pytest.mark.parametrize("feed", ["A", "B"])
@@ -282,8 +282,8 @@ def test_every_generated_set(needs_data, tmp_path, feed):
         assert all(1 <= e.kind <= 12 for e in events), name
 
 
-# ---- Flag bit 3: book not clean (DESIGN.md 3.3) ----
-def test_book_not_clean_bit_follows_the_replay():
+# ---- Flag bit 3: feed not clean (DESIGN.md 3.3) ----
+def test_feed_not_clean_bit_follows_the_replay():
     import b3replay
     manifest = {"missing": {"A": [[68, 1, 2]], "B": []}}
     table = [(7, 68)]
@@ -295,14 +295,14 @@ def test_book_not_clean_bit_follows_the_replay():
             r["fields"].update(securityID=7, rptSeq=r["sequenceNumber"])
     rows[-1]["fields"]["rptSeq"] = 1                       # restarts after the EmptyBook
     out = list(ie.convert(rows, b3replay.Replay(table, manifest, "A")))
-    assert [(e.kind, e.flags & c.FLAG_BOOK_NOT_CLEAN) for e in out] == [
-        (c.ADD, 0), (c.ADD, c.FLAG_BOOK_NOT_CLEAN),         # after the gap at 2
+    assert [(e.kind, e.flags & c.FLAG_FEED_NOT_CLEAN) for e in out] == [
+        (c.ADD, 0), (c.ADD, c.FLAG_FEED_NOT_CLEAN),         # after the gap at 2
         (c.SEQ_RESET, 0),                                   # no instrument
         (c.CLEAR_BOOK, 0), (c.ADD, 0)]                      # rebuilt
-    assert not any(e.flags & c.FLAG_BOOK_NOT_CLEAN for e in ie.convert(rows))   # no replay: never
+    assert not any(e.flags & c.FLAG_FEED_NOT_CLEAN for e in ie.convert(rows))   # no replay: never
 
 
-def test_book_not_clean_bit_after_an_unappliable_change():
+def test_feed_not_clean_bit_after_an_unappliable_change():
     import b3replay
     manifest = {"missing": {"A": [], "B": []}}
     rows = [order(0, seq=1), order(1, seq=2), order(0, seq=3)]   # NEW, CHANGE without mDEntryPrevSize, NEW
@@ -312,6 +312,6 @@ def test_book_not_clean_bit_after_an_unappliable_change():
     rows[1]["fields"].pop("mDEntryPrevSize", None)
     replay = b3replay.Replay([(7, 68)], manifest, "A")
     out = list(ie.convert(rows, replay))
-    assert [(e.kind, e.flags & c.FLAG_BOOK_NOT_CLEAN) for e in out] == [
-        (c.ADD, 0), (c.MODIFY, c.FLAG_BOOK_NOT_CLEAN), (c.ADD, c.FLAG_BOOK_NOT_CLEAN)]   # its own record too
+    assert [(e.kind, e.flags & c.FLAG_FEED_NOT_CLEAN) for e in out] == [
+        (c.ADD, 0), (c.MODIFY, c.FLAG_FEED_NOT_CLEAN), (c.ADD, c.FLAG_FEED_NOT_CLEAN)]   # its own record too
     assert replay.unappliable == {"delete_no_price": 0, "change_no_prev_size": 1, "no_side": 0}

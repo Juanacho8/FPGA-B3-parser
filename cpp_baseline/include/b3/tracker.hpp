@@ -13,8 +13,6 @@
 //     CHANGE with a null or absent mDEntryPrevSize, is unappliable to a
 //     price-level book: counted by reason, and it marks that instrument
 //     stale (cause UNAPPLIABLE).
-//   * on_book_fault(): a price-level book's consistency error while CLEAN
-//     marks that instrument stale at the message (cause CONSISTENCY_FAULT).
 //   * EmptyBook clears its instrument's stale flag; ChannelReset clears it
 //     for every table instrument of its channel. rptSeq is not touched by a
 //     ChannelReset: each instrument's EmptyBook restarts it.
@@ -104,7 +102,6 @@ struct TrackerCounters {
     // the instrument goes STALE, cause UNAPPLIABLE.
     std::array<std::uint64_t, 3> unappliable{};
     field_audit::Counts fields;                       // per audited field: absent, null, invalid (DESIGN.md 3.10)
-    std::uint64_t book_faults = 0;                    // consistency faults a price-level book reported while CLEAN
     std::array<std::uint64_t, decode::kBodyFaults> body_faults{};
 };
 
@@ -220,16 +217,6 @@ public:
     void on_unknown(const walker::MessageView& m) noexcept {
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), 0);
-    }
-
-    // A price-level book found a consistency error applying the last call's
-    // message while the instrument was CLEAN (DESIGN.md 3.6.4): it goes STALE
-    // at that message (cause CONSISTENCY_FAULT). The state change joins the
-    // call's own, for the book sink to write.
-    void on_book_fault(std::size_t slot) noexcept {
-        if (state_[slot].stale) return;
-        ++counters_.book_faults;
-        mark_stale(slot, call_at_, records::cause::CONSISTENCY_FAULT);
     }
 
     // True when the last call's message is unappliable (DESIGN.md 3.6.4): the

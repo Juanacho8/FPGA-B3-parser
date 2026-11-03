@@ -73,11 +73,6 @@ class TransitionReplay(b3replay.Replay):
         super().advance(t)
         self._step = None
 
-    def book_fault(self, slot, point, row=None):
-        self._step, self._row = c.CAUSE_CONSISTENCY_FAULT, row
-        super().book_fault(slot, point, row)
-        self._step = self._row = None
-
     def unappliable_message(self, slot, point, reason):
         self._step = c.CAUSE_UNAPPLIABLE
         super().unappliable_message(slot, point, reason)
@@ -130,8 +125,13 @@ class Port2:
         self.next_tick = None
         self.capture = 0
         self.touched = {}     # channel -> {slot: recovery} in order of first touch
-        self._row = None
-        self.counts = dict(book_updates=0, state_changes=0, statuses=0, untracked_records=0)
+        self.counts = dict(book_updates=0, state_changes=0, statuses=0, untracked_records=0, consistency_faults=0)
+        # Book state (DESIGN.md 3.6.4): the feed state (the replay) or a
+        # consistency fault since the instrument's last clear.
+        self.faulted = set()
+        self.book_stale = {}      # slot -> the state port 2 last wrote
+        self.extra = {}           # slot -> "fault" or "clear": this message's changes beside the replay's
+        self._rec = None          # this message's port 1 record, for their identity
 
     def begin_datagram(self, t):
         """Time reaches t: one STATUS for the latest tick due, ticks_skipped
@@ -165,7 +165,9 @@ class Port2:
         self.records.append(rec.pack(self.n))
 
     def stale_now(self, slot):
-        return self.replay.state[slot]["stale"]
+        """The book state: STALE when the feed state is not clean or a
+        consistency fault happened since the last clear."""
+        return self.replay.state[slot]["stale"] or slot in self.faulted
 
     def apply(self, e):
         touched = self.touched.setdefault(e.channel, {})
@@ -176,6 +178,9 @@ class Port2:
                     if ch == e.channel:
                         self.book.clear(slot)
                         touched[slot] = touched.get(slot, False) or bool(e.flags & c.FLAG_RECOVERY)
+                        if slot in self.faulted:          # a ChannelReset clears a fault too
+                            self.faulted.discard(slot)
+                            self.extra[slot] = "clear"
             return False
         if e.kind in (c.ADD, c.MODIFY, c.DELETE, c.CLEAR_SIDE, c.CLEAR_BOOK):
             slot = self.slot.get(e.instrument_id)
@@ -185,26 +190,51 @@ class Port2:
                 pass      # no side: unappliable (DESIGN.md 3.10), the replay marked it STALE
             else:
                 if b3books.apply(self.book, slot, e, self.stale_now(slot)):
-                    # A consistency error while CLEAN: STALE, cause 8 (DESIGN.md 3.6.4).
-                    self.replay.book_fault(slot, (e.channel, e.seq_version, e.seq_num), self._row)
+                    # A consistency error while CLEAN: the book goes STALE, cause 8
+                    # (DESIGN.md 3.6.4); the feed state, and so port 1, is untouched.
+                    self.faulted.add(slot)
+                    self.extra[slot] = "fault"
+                if e.kind == c.CLEAR_BOOK and slot in self.faulted:   # EmptyBook clears a fault too
+                    self.faulted.discard(slot)
+                    self.extra[slot] = "clear"
                 touched[slot] = touched.get(slot, False) or bool(e.flags & c.FLAG_RECOVERY)
         return bool(e.flags & c.FLAG_END_OF_EVENT)
 
     def transitions(self):
-        for slot, to_stale, cause, row, point in self.replay.pending:
-            if row is None:
-                ident, exch = (point[2], point[1], point[0], 0), 0
+        """A STATE_CHANGE for every book-state change, in table slot order: one
+        the replay (feed state) made takes its cause and identity; a fault
+        (cause 8) or the clear of a faulted-only book (its EmptyBook or
+        ChannelReset) takes this message's record's."""
+        feed = {entry[0]: entry for entry in self.replay.pending}
+        for slot in sorted(set(feed) | set(self.extra)):
+            now = self.stale_now(slot)
+            if now == self.book_stale.get(slot, False):
+                continue
+            self.book_stale[slot] = now
+            if slot in feed:
+                _, _, cause, row, point = feed[slot]
+                if row is None:
+                    ident, exch = (point[2], point[1], point[0], 0), 0
+                else:
+                    ident = (row["sequenceNumber"], row["sequenceVersion"], row["channel"], row["index"])
+                    exch = time_field(row)
             else:
-                ident = (row["sequenceNumber"], row["sequenceVersion"], row["channel"], row["index"])
-                exch = time_field(row)
+                e = self._rec
+                ident, exch = (e.seq_num, e.seq_version, e.channel, e.msg_index), e.exch_time
+                if self.extra[slot] == "fault":
+                    cause = c.CAUSE_CONSISTENCY_FAULT
+                    self.counts["consistency_faults"] += 1
+                else:
+                    cause = c.CAUSE_CHANNEL_RESET if e.kind == c.CLEAR_CHANNEL else c.CAUSE_EMPTY_BOOK
             sid = self.table[slot][0]
-            if to_stale:
+            if now:
                 self.emit(c.STATE_CHANGE, ident, sid, exch, c.BOOK_STALE, self.depth_flags(slot), cause=cause)
             else:
                 self.emit(c.STATE_CHANGE, ident, sid, exch, c.BOOK_CLEAN, self.depth_flags(slot), slot=slot,
                           cause=cause)
             self.counts["state_changes"] += 1
         self.replay.pending.clear()
+        self.extra.clear()
 
     def close(self, e):
         touched = self.touched.setdefault(e.channel, {})
@@ -219,7 +249,7 @@ class Port2:
         touched.clear()
 
     def on_message(self, events, row=None):
-        self._row = row           # the message, for a consistency fault's identity
+        self._rec = events[0] if events else None
         closer = None
         skip = self.replay.last_unappliable      # changes no level (DESIGN.md 3.6.4); still closes
         for e in events:
@@ -253,7 +283,7 @@ def run(folder, feed, table=None, n=c.DEFAULT_PUBLISHED_DEPTH, levels=DEFAULT_LE
         port2.on_message(list(closer.process(row, replay)), row)
         key = b3intent.row_key(row)
         if key in checkpoints:
-            snapshots[key] = {sid: ("STALE" if replay.state[slot]["stale"] else "CLEAN",
+            snapshots[key] = {sid: ("STALE" if port2.stale_now(slot) else "CLEAN",
                                     port2.depth_flags(slot) >> 1,
                                     port2.book.top(slot, BID, n), port2.book.top(slot, OFFER, n))
                               for slot, (sid, _) in enumerate(table)}

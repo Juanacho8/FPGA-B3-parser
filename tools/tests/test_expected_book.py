@@ -259,25 +259,23 @@ def test_consistency_fault_goes_stale_with_cause_8_in_both_books():
             assert [(h[8], h[9], h[13]) for h in hs] == [(c.BOOK_UPDATE, c.BOOK_CLEAN, 0),
                                                          (c.STATE_CHANGE, c.BOOK_STALE, c.CAUSE_CONSISTENCY_FAULT)], name
             assert (hs[1][1], hs[1][4]) == (2, 0)                    # the message's identity
-            assert p.replay.book_faults == 1 and p.book.errors == 1
+            assert p.counts["consistency_faults"] == 1 and p.book.errors == 1
+            assert p.stale_now(0) and not p.replay.state[0]["stale"]   # book STALE, feed clean
 
 
-def test_port1_bit_3_after_a_consistency_fault():
-    import b3books
+def test_split_a_fault_leaves_port1_clean_and_a_gap_sets_both():
     import b3replay
     import intent_to_events as ie
     base, msg, later = (order(1, 0, "0", 100, 5, 1, 1, 0x80, 1), dele(WIN, "0", 99, 5, 7, 2, 0x80, 2, 0),
                         order(3, 0, "0", 101, 1, 3, 3, 0x80, 1))
-    replay = b3replay.Replay(TABLE[:1], CLEAN_MANIFEST, "A")
-    feed = b3books.BookFeed(TABLE[:1], replay, 16)
-    closer, out = ie.Closer(), []
-
-    def on_row(row):
-        events = list(closer.process(row, replay))
-        out.extend(events)
-        feed.feed(row, events)
-
-    for pkt in ([base], [msg], [later]):
-        replay.packet(pkt, on_row=on_row)
-    assert [e.flags & c.FLAG_BOOK_NOT_CLEAN for e in out] == [0, 0, c.FLAG_BOOK_NOT_CLEAN]   # own record clean
-    assert replay.book_faults == 1
+    # A consistency fault: port 2 STALE (cause 8), port 1 (the feed state) clean.
+    p = eb.run_packets([[base], [msg], [later]], [0] * 3, TABLE[:1], CLEAN_MANIFEST, status_interval=0)
+    assert [(header(r)[9], header(r)[13]) for r in p.records][-1] == (c.BOOK_STALE, c.CAUSE_CONSISTENCY_FAULT)
+    out = list(ie.convert([base, msg, later], b3replay.Replay(TABLE[:1], CLEAN_MANIFEST, "A")))
+    assert [e.flags & c.FLAG_FEED_NOT_CLEAN for e in out] == [0, 0, 0]
+    # A gap: both.
+    gap = {"missing": {"A": [[68, 1, 2]], "B": []}}
+    p = eb.run_packets([[base], [later]], [0, 0], TABLE[:1], gap, status_interval=0)
+    assert [(header(r)[9], header(r)[13]) for r in p.records][-1] == (c.BOOK_STALE, c.CAUSE_GAP)
+    out = list(ie.convert([base, later], b3replay.Replay(TABLE[:1], gap, "A")))
+    assert [e.flags & c.FLAG_FEED_NOT_CLEAN for e in out] == [0, c.FLAG_FEED_NOT_CLEAN]
