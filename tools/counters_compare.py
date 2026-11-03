@@ -86,6 +86,18 @@ def check_unreliable_shape(manifest, where):
     return books
 
 
+def version_counts(rows):
+    """{"channel": {"version": n}}: the messages the decoder dispatches, per
+    channel and message header schema version (31 counts 31 and later)."""
+    out = {}
+    for r in rows:
+        v = str(min(r["version"], 31))
+        ch = out.setdefault(str(r["channel"]), {})
+        ch[v] = ch.get(v, 0) + 1
+    return {ch: dict(sorted(vs.items(), key=lambda kv: int(kv[0]))) for ch, vs in
+            sorted(out.items(), key=lambda kv: int(kv[0]))}
+
+
 def expected_counters(folder, manifest, feed, table):
     counts, _ = decode_crosscheck.expected(folder / "intent.jsonl", manifest, feed)
     rows = [r for _, r in b3intent.feed_rows(folder / "intent.jsonl", manifest, feed)]
@@ -113,7 +125,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
                silences=replay.silences, unappliable=replay.unappliable,
-               fields=field_audit.counts(rows),
+               fields=field_audit.counts(rows), versions=version_counts(rows),
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))
     late = [r["packet"] for r in (manifest.get("reordered") or {}).get(feed, [])]
@@ -150,7 +162,12 @@ def check_unreliable(books, ids, got, feed_missing):
     return problems
 
 
+EXACT = ("versions",)   # compared whole: a channel or version only the C++ saw is a difference too
+
+
 def diff(want, got, path=""):
+    if path.rstrip(".") in EXACT:
+        return [] if want == got else [f"{path.rstrip('.')}: keys {want!r}, c++ {got!r}"]
     if isinstance(want, dict) and isinstance(got, dict):
         out = []
         for k in want:

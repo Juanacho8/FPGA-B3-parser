@@ -102,6 +102,10 @@ struct TrackerCounters {
     // the instrument goes STALE, cause UNAPPLIABLE.
     std::array<std::uint64_t, 3> unappliable{};
     field_audit::Counts fields;                       // per audited field: absent, null, invalid (DESIGN.md 3.10)
+    // Dispatched messages per (channel, message header schema version); the
+    // last column counts every version at or above it.
+    static constexpr std::size_t kVersions = 32;
+    std::array<std::array<std::uint64_t, kVersions>, 256> versions{};
     std::array<std::uint64_t, decode::kBodyFaults> body_faults{};
 };
 
@@ -167,6 +171,7 @@ public:
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), time);
         field_audit::count<TemplateId>(m, counters_.fields);
+        count_version(m);
         if constexpr (TemplateId == L::Sequence_2::template_id) {
             if (m.packet.seq_num == 0) {
                 const auto next = decode::get<fields::Sequence_2::nextSeqNo>(m);
@@ -217,6 +222,7 @@ public:
     void on_unknown(const walker::MessageView& m) noexcept {
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), 0);
+        count_version(m);
     }
 
     // True when the last call's message is unappliable (DESIGN.md 3.6.4): the
@@ -284,6 +290,11 @@ private:
             ++c.body_faults[static_cast<std::size_t>(r)];
         }
     };
+
+    void count_version(const walker::MessageView& m) noexcept {
+        const std::size_t v = m.version < TrackerCounters::kVersions ? m.version : TrackerCounters::kVersions - 1;
+        ++counters_.versions[m.packet.channel][v];
+    }
 
     void track_rpt(std::size_t slot, std::uint32_t rpt, const walker::MessageView& m) noexcept {
         InstrumentState& st = state_[slot];
