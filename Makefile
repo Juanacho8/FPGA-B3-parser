@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -155,6 +155,22 @@ book-oracle: cpp-book-variants
 # checkpoint. Fails on any difference.
 mbo-check: cpp-uncapped
 	$(PYTHON) tools/mbo_check.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
+
+# The quick loop: every build, the unit tests (C++ under sanitizers, and the
+# tools'), and every compare target on the small set and the scenarios only:
+# no large or burst set, no goldens, no fuzz. The full run (every target on
+# every set, goldens, fuzz) stays the gate before every commit. The sets are
+# cloned into $(FAST_DATA) (copy-on-write on APFS: the tools' rglob does not
+# follow symlinked folders).
+FAST_DATA := $(CPP_BUILD)/fast_data
+FAST_TARGETS := field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare \
+                events-compare mbo-check book-compare book-oracle
+
+check-fast: cpp-test cpp-release cpp-book-variants
+	rm -rf $(FAST_DATA) && mkdir -p $(FAST_DATA)
+	for s in small scenarios; do cp -cR $(B3_DATA)/$$s $(FAST_DATA)/ 2>/dev/null || cp -R $(B3_DATA)/$$s $(FAST_DATA)/; done
+	set -e; for t in $(FAST_TARGETS); do echo "== $$t"; $(MAKE) --no-print-directory $$t B3_DATA=$(FAST_DATA); done
+	$(PYTHON) -m pytest -q tools/tests
 
 # Damaged packets from the small set's feedA.pcap through the whole pipeline
 # in the Debug (sanitizer) build: any crash or undefined behaviour aborts with
