@@ -351,6 +351,21 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
                      static_cast<ull>(tc.fields.invalid[i]));
     }
     std::fprintf(f, "},");
+    // Messages per channel and schema version: {"channel": {"version": n}};
+    // version 31 counts that version and every later one.
+    std::fprintf(f, "\"versions\":{");
+    bool first_ch = true;
+    for (std::size_t ch = 0; ch < tc.versions.size(); ++ch) {
+        bool first_v = true;
+        for (std::size_t v = 0; v < tc.versions[ch].size(); ++v) {
+            if (tc.versions[ch][v] == 0) continue;
+            if (first_v) std::fprintf(f, "%s\"%zu\":{", first_ch ? "" : ",", ch);
+            std::fprintf(f, "%s\"%zu\":%llu", first_v ? "" : ",", v, static_cast<ull>(tc.versions[ch][v]));
+            first_v = first_ch = false;
+        }
+        if (!first_v) std::fprintf(f, "}");
+    }
+    std::fprintf(f, "},");
     std::fprintf(f, "\"losses\":%llu,\"silences\":%llu,\"unknown_instrument_messages\":%llu,"
                  "\"msg_before_rebuild\":%llu,\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.silences),

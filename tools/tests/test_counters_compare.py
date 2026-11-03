@@ -112,3 +112,11 @@ def test_late_packets_expect_no_gap_and_the_manifest_list(tmp_path):
     assert all(v["first_stale"] is None for v in want["instruments"].values())
     want_b, _ = cc.expected_counters(tmp_path, m, "B", TABLE)
     assert "reordered" not in want_b  # nothing late on B: the key is not expected yet
+
+
+def test_versions_are_counted_per_channel_and_compared_whole():
+    rows_ = [{"channel": 68, "version": 17}, {"channel": 68, "version": 14}, {"channel": 70, "version": 40}]
+    assert cc.version_counts(rows_) == {"68": {"14": 1, "17": 1}, "70": {"31": 1}}
+    want = {"versions": {"68": {"17": 2}}}
+    assert cc.diff(want, {"versions": {"68": {"17": 2}}}) == []
+    assert cc.diff(want, {"versions": {"68": {"17": 2, "18": 1}}})          # a version only the C++ saw

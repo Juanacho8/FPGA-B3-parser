@@ -323,7 +323,7 @@ events.bin describes one feed's pcap, decoded alone (A/B arbitration comes in st
 
 ### 3.8 Not on port 1, but counted
 
-Statistics, News, heartbeats and unknown templates appear in decode.jsonl and the counters JSON. Duplicates and discarded malformed tails appear only in the counters. Neither file is specified here.
+Statistics, News, heartbeats and unknown templates appear in decode.jsonl and the counters JSON. The counters JSON also counts every dispatched message per channel and message header schema version (`versions`: `{"channel": {"version": n}}`, 31 standing for 31 and later), checked by `tools/counters_compare.py` against intent.jsonl. Duplicates and discarded malformed tails appear only in the counters. Neither file is specified here.
 
 ### 3.9 Worked examples
 
