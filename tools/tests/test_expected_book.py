@@ -245,3 +245,39 @@ def test_null_price_bucket_in_both_books():
         assert p.book.top(0, eb.BID, 5) == [(100, 5, 1)]                      # the level untouched
         assert p.book.null_price == 3 and p.book.errors == 0
         assert p.replay.unappliable["delete_no_price"] == 0
+
+
+def test_consistency_fault_goes_stale_with_cause_8_in_both_books():
+    base = order(1, 0, "0", 100, 5, 1, 1, 0x80, 1)
+    cases = {"delete on a missing level": dele(WIN, "0", 99, 5, 7, 2, 0x80, 2, 0),
+             "count 0 with qty left": dele(WIN, "0", 100, 4, 1, 2, 0x80, 2, 0)}
+    later = order(3, 0, "0", 101, 1, 3, 3, 0x80, 1)
+    for k in (None, 5):
+        for name, msg in cases.items():
+            p = eb.run_packets([[base], [msg], [later]], [0] * 3, TABLE[:1], CLEAN_MANIFEST, status_interval=0, k=k)
+            hs = [header(r) for r in p.records]
+            assert [(h[8], h[9], h[13]) for h in hs] == [(c.BOOK_UPDATE, c.BOOK_CLEAN, 0),
+                                                         (c.STATE_CHANGE, c.BOOK_STALE, c.CAUSE_CONSISTENCY_FAULT)], name
+            assert (hs[1][1], hs[1][4]) == (2, 0)                    # the message's identity
+            assert p.replay.book_faults == 1 and p.book.errors == 1
+
+
+def test_port1_bit_3_after_a_consistency_fault():
+    import b3books
+    import b3replay
+    import intent_to_events as ie
+    base, msg, later = (order(1, 0, "0", 100, 5, 1, 1, 0x80, 1), dele(WIN, "0", 99, 5, 7, 2, 0x80, 2, 0),
+                        order(3, 0, "0", 101, 1, 3, 3, 0x80, 1))
+    replay = b3replay.Replay(TABLE[:1], CLEAN_MANIFEST, "A")
+    feed = b3books.BookFeed(TABLE[:1], replay, 16)
+    closer, out = ie.Closer(), []
+
+    def on_row(row):
+        events = list(closer.process(row, replay))
+        out.extend(events)
+        feed.feed(row, events)
+
+    for pkt in ([base], [msg], [later]):
+        replay.packet(pkt, on_row=on_row)
+    assert [e.flags & c.FLAG_BOOK_NOT_CLEAN for e in out] == [0, 0, c.FLAG_BOOK_NOT_CLEAN]   # own record clean
+    assert replay.book_faults == 1

@@ -400,6 +400,50 @@ void check_null_bucket() {
            rs.back().header.cause == b3::records::cause::UNAPPLIABLE));
 }
 
+template <class Book>
+void check_consistency_fault() {
+    using b3::records::cause::CONSISTENCY_FAULT;
+    struct Case {
+        const char* name;
+        Bytes msg;
+    };
+    const Case cases[] = {
+        {"DELETE on a missing level", del(WIN, '0', 99, 5, 7, 2, 0x80)},
+        {"MODIFY on a missing level", order(WIN, 1, '0', 99, 3, 7, 2, 0x80, 7, 5)},
+        {"qty going negative", order(WIN, 1, '0', 100, 0, 1, 2, 0x80, 7, 9)},     // 5 + (0 - 9) < 0
+        {"count 0 with qty left", del(WIN, '0', 100, 4, 1, 2, 0x80)},           // removes 4 of 5
+        {"DELETE at a null price, empty bucket", del(WIN, '0', kNull, 1, 7, 2, 0x80)},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.name);
+        Pipeline<Book> p("200000001 68\n");
+        p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));
+        p.feed(packet(68, 2, {c.msg}));
+        p.feed(packet(68, 3, {order(WIN, 0, '0', 101, 1, 3, 3, 0x80)}));
+        const auto rs = p.records();
+        REQUIRE(rs.size() >= 2);
+        CHECK((rs[1].header.record_type == RT::STATE_CHANGE && rs[1].header.state == ST::STALE));
+        CHECK((rs[1].header.cause == CONSISTENCY_FAULT && rs[1].header.seq_num == 2 && rs[1].header.msg_index == 0));
+        CHECK(rs[1].header.exch_time == p.events_buf[1].exch_time);              // the message's time field
+        CHECK(rs.size() == 2);                                                    // nothing published while STALE
+        CHECK(p.levels.counters().consistency_errors == 1);
+        CHECK(p.tracker.counters().book_faults == 1);
+        CHECK(p.tracker.state(0).stale);
+        // Port 1: the faulting message's own record was written before the book
+        // saw it, so it is clean; the next carries bit 3.
+        CHECK((p.events_buf[1].flags & b3::records::flag::BOOK_NOT_CLEAN) == 0);
+        CHECK((p.events_buf[2].flags & b3::records::flag::BOOK_NOT_CLEAN) != 0);
+    }
+}
+
+TEST_CASE("consistency fault while CLEAN: STALE with cause 8 (uncapped book)") {
+    check_consistency_fault<UncappedBook>();
+}
+
+TEST_CASE("consistency fault while CLEAN: STALE with cause 8 (capped book)") {
+    check_consistency_fault<b3::book::CappedBook<b3::kPublishedDepth, b3::kPublishedDepth>>();
+}
+
 TEST_CASE("null-price bucket: NEW, CHANGE, DELETE at a null price (uncapped book)") {
     check_null_bucket<UncappedBook>();
 }

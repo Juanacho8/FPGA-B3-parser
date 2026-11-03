@@ -13,7 +13,7 @@ What it does:
     * port 1 records come from tools/intent_to_events.py's Closer and the
       stale state from tools/b3replay.py's Replay (observed through a
       subclass, never changed), the answer keys port 1 is checked against
-    * a small Python price-level book (LevelBook, or CappedBook, below) applies them, and
+    * a small Python price-level book (tools/b3books.py: LevelBook, or CappedBook) applies them, and
       the emission rules of DESIGN.md 4.3 write BOOK_UPDATE, STATE_CHANGE
       and STATUS records with output sequence numbers
   The generator's tests/book_builder.py is not used: it asserts strict
@@ -37,289 +37,21 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 sys.path.insert(0, str(REPO / "feed_generator" / "tests"))
 
+import b3books               # noqa: E402
 import b3contract as c       # noqa: E402
 import b3feed                # noqa: E402
 import b3intent              # noqa: E402
 import b3replay              # noqa: E402
 import intent_to_events      # noqa: E402
+from b3books import (BID, DEFAULT_LEVELS, NULL_PRICE, OFFER, CappedBook, LevelBook,   # noqa: E402,F401
+                     NullBuckets, wrap)
 
-NULL_PRICE = -(1 << 63)
-DEFAULT_LEVELS = 1024
 DEFAULT_INTERVAL = 100_000_000
-BID, OFFER = 0, 1
-
-
-def wrap(x):
-    """int64 two's-complement wrap, as the C++ books (records.hpp wrap_add) and the RTL's adders."""
-    return (x + (1 << 63)) % (1 << 64) - (1 << 63)
 
 
 def file_header(n, status_interval, max_instruments=c.DEFAULT_MAX_INSTRUMENTS, k=None):
     """book.bin's header: K (0 for the uncapped book), the STATUS interval at offset 24."""
     return c.book_header(n, k or 0, max_instruments, status_interval).pack()
-
-
-class NullBuckets:
-    """The per-side null-price buckets of a price-level book (DESIGN.md 4.5):
-    [qty, count] of the orders at a null price (market on auction), with a
-    level's consistency rules. Not published on port 2 in v1."""
-
-    def _bucket(self, slot, side):
-        return self.null.setdefault((slot, side), [0, 0])
-
-    def _null(self, op, slot, side, qty, prev, stale):
-        self.null_price += 1
-        b = self._bucket(slot, side)
-        if op == "add":
-            b[0] = wrap(b[0] + qty)
-            b[1] += 1
-            bad = b[0] < 0
-        elif b[1] == 0:
-            bad = True                    # a change or delete with no order at a null price
-        elif op == "change":
-            b[0] = wrap(b[0] + qty - prev)
-            bad = b[0] < 0
-        else:
-            b[0] = wrap(b[0] - qty)
-            b[1] -= 1
-            if b[1] == 0:
-                bad, b[0] = b[0] != 0, 0
-            else:
-                bad = b[0] < 0
-        if bad:
-            self._error(stale)
-
-    def null_bucket(self, slot, side):
-        return tuple(self._bucket(slot, side))
-
-
-class LevelBook(NullBuckets):
-    """Price levels per (slot, side): {price: [qty, count]}. DESIGN.md 4.5."""
-
-    def __init__(self, cap=DEFAULT_LEVELS):
-        self.cap = cap
-        self.sides = {}
-        self.null = {}
-        self.level_overflow = self.errors = self.errors_stale = self.null_price = 0
-        self.max_depth = {BID: 0, OFFER: 0}
-
-    def _side(self, slot, side):
-        return self.sides.setdefault((slot, side), {})
-
-    def _error(self, stale):
-        if stale:
-            self.errors_stale += 1
-        else:
-            self.errors += 1
-
-    def add(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:
-            self._null("add", slot, side, qty, 0, stale)
-            return
-        levels = self._side(slot, side)
-        if price not in levels:
-            if len(levels) == self.cap:
-                self.level_overflow += 1
-                return
-            levels[price] = [0, 0]
-            self.max_depth[side] = max(self.max_depth[side], len(levels))
-        lv = levels[price]
-        lv[0] = wrap(lv[0] + qty)
-        lv[1] += 1
-        if lv[0] < 0:
-            self._error(stale)
-
-    def change(self, slot, side, price, qty, prev, stale):
-        if prev == NULL_PRICE:
-            return            # unappliable: the replay marks the instrument STALE (DESIGN.md 4.5)
-        if price == NULL_PRICE:
-            self._null("change", slot, side, qty, prev, stale)
-            return
-        lv = self._side(slot, side).get(price)
-        if lv is None:
-            self._error(stale)
-            return
-        lv[0] = wrap(lv[0] + qty - prev)
-        if lv[0] < 0:
-            self._error(stale)
-
-    def remove(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:       # a present null: a market order (an absent price never gets here)
-            self._null("remove", slot, side, qty, 0, stale)
-            return
-        levels = self._side(slot, side)
-        lv = levels.get(price)
-        if lv is None:
-            self._error(stale)
-            return
-        lv[0] = wrap(lv[0] - qty)
-        if lv[1] == 0:
-            self._error(stale)
-            return
-        lv[1] -= 1
-        if lv[1] == 0:
-            if lv[0] != 0:
-                self._error(stale)
-            del levels[price]
-            return
-        if lv[0] < 0:
-            self._error(stale)
-
-    def clear(self, slot, side=None):
-        for s in ((BID, OFFER) if side is None else (side,)):
-            self.sides[(slot, s)] = {}
-            self.null.pop((slot, s), None)
-
-    def top(self, slot, side, n):
-        levels = self._side(slot, side)
-        prices = sorted(levels, reverse=(side == BID))[:n]
-        return [(p, levels[p][0], levels[p][1]) for p in prices]
-
-
-class CappedBook(NullBuckets):
-    """The capped book (brief section 5, DESIGN.md 4.2), a second
-    implementation beside the C++ book_capped.hpp: per (slot, side) a
-    best-first list of at most K [price, qty, count] levels, a truncated
-    flag and the boundary price B. Kept simple (list scans and inserts), so
-    it shares no code or structure with the C++'s slot shifting."""
-
-    def __init__(self, k, n):
-        self.k, self.n = k, n
-        self.sides = {}
-        self.null = {}
-        self.errors = self.errors_stale = self.null_price = 0
-        self.level_overflow = 0
-        self.stats = {s: dict(truncations=0, levels_dropped=0, ignored=0, depth_incomplete=0,
-                              depth_incomplete_ns=0, depth_incomplete_max_ns=0, max_valid=0)
-                      for s in (BID, OFFER)}
-        self.now = 0
-        self.since = {}   # (slot, side) -> start of the open depth-incomplete episode
-
-    def _side(self, slot, side):
-        return self.sides.setdefault((slot, side), {"levels": [], "truncated": False, "b": 0})
-
-    def _error(self, stale):
-        if stale:
-            self.errors_stale += 1
-        else:
-            self.errors += 1
-
-    @staticmethod
-    def _better(side, a, b):
-        return a > b if side == BID else a < b
-
-    def _untracked(self, st, side, price):
-        """Worse than B while truncated: the region the slots do not know."""
-        return st["truncated"] and self._better(side, st["b"], price)
-
-    def set_time(self, t):
-        self.now = t
-
-    def depth_incomplete(self, slot, side):
-        st = self._side(slot, side)
-        return st["truncated"] and len(st["levels"]) < self.n
-
-    def _note(self, slot, side):
-        key = (slot, side)
-        on = self.depth_incomplete(slot, side)
-        if on and key not in self.since:
-            self.since[key] = self.now
-            self.stats[side]["depth_incomplete"] += 1
-        elif not on and key in self.since:
-            self._close(key, self.now)
-
-    def _close(self, key, t):
-        d = t - self.since.pop(key)
-        st = self.stats[key[1]]
-        st["depth_incomplete_ns"] += d
-        st["depth_incomplete_max_ns"] = max(st["depth_incomplete_max_ns"], d)
-
-    def finish(self, t):
-        for key in list(self.since):
-            self._close(key, t)
-
-    def add(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:
-            self._null("add", slot, side, qty, 0, stale)
-            return
-        st = self._side(slot, side)
-        levels = st["levels"]
-        lv = next((x for x in levels if x[0] == price), None)
-        if lv is not None:
-            lv[1] = wrap(lv[1] + qty)
-            lv[2] += 1
-            if lv[1] < 0:
-                self._error(stale)
-        elif self._untracked(st, side, price):
-            self.stats[side]["ignored"] += 1
-        else:
-            pos = sum(1 for x in levels if self._better(side, x[0], price))
-            levels.insert(pos, [price, qty, 1])
-            if qty < 0:
-                self._error(stale)
-            stats = self.stats[side]
-            if len(levels) > self.k:
-                levels.pop()                      # the worst of K + 1
-                stats["levels_dropped"] += 1
-                if not st["truncated"]:
-                    stats["truncations"] += 1
-                st["truncated"] = True
-                st["b"] = levels[-1][0]
-            stats["max_valid"] = max(stats["max_valid"], len(levels))
-        self._note(slot, side)
-
-    def _find(self, slot, side, price, stale):
-        st = self._side(slot, side)
-        lv = next((x for x in st["levels"] if x[0] == price), None)
-        if lv is None:
-            if self._untracked(st, side, price):
-                self.stats[side]["ignored"] += 1
-            else:
-                self._error(stale)
-        return st, lv
-
-    def change(self, slot, side, price, qty, prev, stale):
-        if prev == NULL_PRICE:
-            return            # unappliable: the replay marks the instrument STALE
-        if price == NULL_PRICE:
-            self._null("change", slot, side, qty, prev, stale)
-            return
-        _, lv = self._find(slot, side, price, stale)
-        if lv is None:
-            return
-        lv[1] = wrap(lv[1] + qty - prev)
-        if lv[1] < 0:
-            self._error(stale)
-
-    def remove(self, slot, side, price, qty, stale):
-        if price == NULL_PRICE:       # a present null: a market order
-            self._null("remove", slot, side, qty, 0, stale)
-            return
-        st, lv = self._find(slot, side, price, stale)
-        if lv is None:
-            return
-        lv[1] = wrap(lv[1] - qty)
-        if lv[2] == 0:
-            self._error(stale)
-            return
-        lv[2] -= 1
-        if lv[2] == 0:
-            if lv[1] != 0:
-                self._error(stale)
-            st["levels"].remove(lv)            # B unchanged
-            self._note(slot, side)
-            return
-        if lv[1] < 0:
-            self._error(stale)
-
-    def clear(self, slot, side=None):
-        for s in ((BID, OFFER) if side is None else (side,)):
-            self.sides[(slot, s)] = {"levels": [], "truncated": False, "b": 0}
-            self.null.pop((slot, s), None)
-            self._note(slot, s)
-
-    def top(self, slot, side, n):
-        return [tuple(x) for x in self._side(slot, side)["levels"][:n]]
 
 
 class TransitionReplay(b3replay.Replay):
@@ -340,6 +72,11 @@ class TransitionReplay(b3replay.Replay):
         self._step = c.CAUSE_SILENCE
         super().advance(t)
         self._step = None
+
+    def book_fault(self, slot, point, row=None):
+        self._step, self._row = c.CAUSE_CONSISTENCY_FAULT, row
+        super().book_fault(slot, point, row)
+        self._step = self._row = None
 
     def unappliable_message(self, slot, point, reason):
         self._step = c.CAUSE_UNAPPLIABLE
@@ -393,6 +130,7 @@ class Port2:
         self.next_tick = None
         self.capture = 0
         self.touched = {}     # channel -> {slot: recovery} in order of first touch
+        self._row = None
         self.counts = dict(book_updates=0, state_changes=0, statuses=0, untracked_records=0)
 
     def begin_datagram(self, t):
@@ -446,19 +184,9 @@ class Port2:
             elif e.kind != c.CLEAR_BOOK and e.side == c.SIDE_NONE:
                 pass      # no side: unappliable (DESIGN.md 3.10), the replay marked it STALE
             else:
-                stale = self.stale_now(slot)
-                side = OFFER if e.side == c.SIDE_OFFER else BID
-                if e.kind == c.ADD:
-                    self.book.add(slot, side, e.price, e.qty, stale)
-                elif e.kind == c.MODIFY:
-                    prev = e.aux - (1 << 64) if e.aux >= 1 << 63 else e.aux
-                    self.book.change(slot, side, e.price, e.qty, prev, stale)
-                elif e.kind == c.DELETE:
-                    self.book.remove(slot, side, e.price, e.qty, stale)
-                elif e.kind == c.CLEAR_SIDE:
-                    self.book.clear(slot, side)
-                else:
-                    self.book.clear(slot)
+                if b3books.apply(self.book, slot, e, self.stale_now(slot)):
+                    # A consistency error while CLEAN: STALE, cause 8 (DESIGN.md 3.6.4).
+                    self.replay.book_fault(slot, (e.channel, e.seq_version, e.seq_num), self._row)
                 touched[slot] = touched.get(slot, False) or bool(e.flags & c.FLAG_RECOVERY)
         return bool(e.flags & c.FLAG_END_OF_EVENT)
 
@@ -490,7 +218,8 @@ class Port2:
             self.counts["book_updates"] += 1
         touched.clear()
 
-    def on_message(self, events):
+    def on_message(self, events, row=None):
+        self._row = row           # the message, for a consistency fault's identity
         closer = None
         skip = self.replay.last_unappliable      # changes no level (DESIGN.md 3.6.4); still closes
         for e in events:
@@ -521,7 +250,7 @@ def run(folder, feed, table=None, n=c.DEFAULT_PUBLISHED_DEPTH, levels=DEFAULT_LE
     checkpoints = checkpoints or set()
 
     def on_row(row):
-        port2.on_message(list(closer.process(row, replay)))
+        port2.on_message(list(closer.process(row, replay)), row)
         key = b3intent.row_key(row)
         if key in checkpoints:
             snapshots[key] = {sid: ("STALE" if replay.state[slot]["stale"] else "CLEAN",
@@ -552,7 +281,7 @@ def run_packets(packets, times, table, manifest, feed="A", n=c.DEFAULT_PUBLISHED
         replay.advance(t)
         port2.transitions()
         replay.saw(pkt[0]["channel"], t)
-        replay.packet(pkt, on_row=lambda row: port2.on_message(list(closer.process(row, replay))))
+        replay.packet(pkt, on_row=lambda row: port2.on_message(list(closer.process(row, replay)), row))
         port2.transitions()
     if k is not None and times:
         port2.book.finish(times[-1])

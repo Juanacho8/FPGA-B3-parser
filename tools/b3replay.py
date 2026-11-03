@@ -120,6 +120,7 @@ class Replay:
         self.msg_before_rebuild = 0
         self.unappliable = dict(delete_no_price=0, change_no_prev_size=0, no_side=0)
         self.last_unappliable = None
+        self.book_faults = 0
         self.losses = 0
         self.unknown = 0
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
@@ -250,6 +251,15 @@ class Replay:
         reason = unappliable_reason(row)
         if reason:
             self.unappliable_message(slot, (ch, row["sequenceVersion"], row["sequenceNumber"]), reason)
+
+    def book_fault(self, slot, point, row=None):
+        """A price-level book found a consistency error applying a message
+        while the instrument was CLEAN (tools/b3books.py): it goes stale at
+        the message (DESIGN.md 3.6.4, cause 8). Counted."""
+        if self.state[slot]["stale"]:
+            return
+        self.book_faults += 1
+        self.stale(slot, point)
 
     def unappliable_message(self, slot, point, reason):
         """A message a price-level book cannot apply: counted by reason, and

@@ -11,7 +11,9 @@ What it does:
       Feed B's own packet order from its pcap (tools/b3feed.py), the same
       way tools/expected_book.py does for port 2.
     * Across builds: the records (everything after the header) must be the
-      same in every build; only the header's N and K may differ.
+      same in every build whose keys agree; only the header's N and K may
+      differ. The key is computed per (N, K): after a consistency fault
+      while CLEAN, bit 3 follows the build's book (DESIGN.md 3.6.4).
   The first difference is reported with its packet and message position, in
   dump_events.py's format. The C++'s counts of SequenceReset/ChannelReset
   arriving with an event open are reported (DESIGN.md 3.5 does not close an
@@ -107,13 +109,22 @@ def main(argv=None):
                     continue
                 records_by_build = {}
                 problems = []
-                # The answer key, in this feed's own packet order (tools/b3feed.py).
-                try:
-                    want_records = intent_to_events.convert_feed(
-                        intent, manifest, feed, pcap, b3replay.read_table(table_path()))
-                    want_error = None
-                except b3replay.Broken as e:
-                    want_records, want_error = None, e
+                # The answer key, in this feed's own packet order (tools/b3feed.py),
+                # per (N, K): after a consistency fault while CLEAN, bit 3 follows the
+                # build's book (DESIGN.md 3.6.4), so each book has its own key.
+                keys = {}
+
+                def key(n, k):
+                    if (n, k) not in keys:
+                        try:
+                            keys[(n, k)] = (intent_to_events.convert_feed(
+                                intent, manifest, feed, pcap, b3replay.read_table(table_path()),
+                                tracked_depth=k, published_depth=n), None)
+                        except b3replay.Broken as e:
+                            keys[(n, k)] = (None, e)
+                    return keys[(n, k)]
+
+                want_by_build = {}
                 for build, binary in builds:
                     checked += 1
                     got_path = tmp / f"cpp_{build}.bin"
@@ -127,6 +138,8 @@ def main(argv=None):
                     records_by_build[build] = data[header.header_size:]
                     want_header = c.events_header(header.published_depth, header.tracked_depth,
                                                   header.max_instruments)
+                    want_records, want_error = key(header.published_depth, header.tracked_depth)
+                    want_by_build[build] = want_records
                     if want_records is None:
                         problems.append(f"{build}: answer key: {want_error}")
                         continue
@@ -138,7 +151,10 @@ def main(argv=None):
                             [f"{build}: bytes differ outside the records"]
                 base_build = builds[0][0]
                 for build, recs in records_by_build.items():
-                    if recs != records_by_build[base_build]:
+                    # Builds whose keys agree (every build, unless a consistency fault
+                    # while CLEAN makes the books disagree) must write the same records.
+                    if want_by_build.get(build) == want_by_build.get(base_build) and \
+                            recs != records_by_build[base_build]:
                         problems.append(f"records of build {build} differ from {base_build}")
                 reason = b3intent.expected_failure(manifest)
                 if problems and reason:

@@ -56,7 +56,7 @@ using BuildBook = std::conditional_t<kBookMode == BookMode::Capped, CappedBook<>
 template <class Book = BuildBook, bool PublishStale = kPublishStale>
 class BookSink {
 public:
-    BookSink(const instruments::Table& table, const tracker::Tracker& tracker, Book& book,
+    BookSink(const instruments::Table& table, tracker::Tracker& tracker, Book& book,
              R::BookRecord* buffer, std::size_t capacity, std::uint64_t status_interval_ns) noexcept
         : table_(table), tracker_(tracker), book_(book), buf_(buffer), cap_(capacity),
           interval_(status_interval_ns) {}
@@ -84,9 +84,11 @@ public:
     }
 
     // One message: its port 1 records (0 or 1, from the event sink) and the
-    // tracker's state changes for it.
-    void on_message(const R::EventRecord* records, std::size_t n_records, const tracker::Transition* transitions,
-                    std::size_t n_transitions) noexcept {
+    // tracker's state changes for it. A consistency fault found applying the
+    // record adds one (cause 8), so the changes are read back from the tracker
+    // after the apply: the arguments are the tracker's own list.
+    void on_message(const R::EventRecord* records, std::size_t n_records, const tracker::Transition*,
+                    std::size_t) noexcept {
         const R::EventRecord* closer = nullptr;
         // An unappliable message (DESIGN.md 3.6.4) changes no level; its record
         // still closes an event like any other.
@@ -94,7 +96,7 @@ public:
         for (std::size_t i = 0; i < n_records; ++i) {
             if (apply_it ? apply(records[i]) : closes(records[i])) closer = &records[i];
         }
-        on_transitions(transitions, n_transitions);
+        on_transitions(tracker_.transitions(), tracker_.transition_count());
         if (closer != nullptr) close(*closer);
     }
 
@@ -163,6 +165,7 @@ private:
             } else {
                 const bool stale = tracker_.state(slot).stale;
                 const Side side = r.side == R::side::OFFER ? Side::offer : Side::bid;
+                const std::uint64_t errors = book_.counters().consistency_errors;
                 switch (r.kind) {
                     case R::kind::ADD: book_.add(slot, side, r.price, r.qty, stale); break;
                     case R::kind::MODIFY:
@@ -172,6 +175,8 @@ private:
                     case R::kind::CLEAR_SIDE: book_.clear_side(slot, side); break;
                     default: book_.clear(slot); break;   // CLEAR_BOOK
                 }
+                // A consistency error while CLEAN: the instrument goes STALE (cause 8).
+                if (book_.counters().consistency_errors != errors) tracker_.on_book_fault(slot);
                 touched.add(slot, (r.flags & R::flag::RECOVERY) != 0);
             }
         }
@@ -241,7 +246,7 @@ private:
     }
 
     const instruments::Table& table_;
-    const tracker::Tracker& tracker_;
+    tracker::Tracker& tracker_;   // reads states; reports consistency faults back
     Book& book_;
     R::BookRecord* buf_;
     std::size_t cap_;
