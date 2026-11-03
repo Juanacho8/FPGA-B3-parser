@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "b3/stage.hpp"
 #include "b3/decode.hpp"
 #include "b3/fields.hpp"
 #include "b3/records.hpp"
@@ -90,7 +91,7 @@ inline std::uint64_t session_word(std::uint8_t session, std::uint8_t sub_or_stat
 // Fills r's kind-specific fields for template Id. Returns false when the
 // message is not on port 1 (DESIGN.md 3.2).
 template <std::uint16_t Id>
-inline bool fill(const walker::MessageView& m, R::EventRecord& r) noexcept {
+B3_STAGE inline bool fill(const walker::MessageView& m, R::EventRecord& r) noexcept {
     if constexpr (Id == L::Order_MBO_50::template_id) {
         namespace T = F::Order_MBO_50;
         const auto action = value_or_null<T::mDUpdateAction>(m);
@@ -211,7 +212,7 @@ public:
         : buf_(buffer), cap_(capacity), tracker_(tracker) {}
 
     template <std::uint16_t Id>
-    void on(const walker::MessageView& m) noexcept {
+    B3_STAGE void on(const walker::MessageView& m) noexcept {
         using T = fields::Template<Id>;
         const std::uint8_t ch = m.packet.channel;
         R::EventRecord r;

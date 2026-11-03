@@ -37,6 +37,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "b3/stage.hpp"
 #include "b3/book_capped.hpp"
 #include "b3/book_params.hpp"
 #include "b3/book_uncapped.hpp"
@@ -92,7 +93,7 @@ public:
 
     // One message: its port 1 records (0 or 1, from the event sink) and the
     // tracker's feed-state changes for it.
-    void on_message(const R::EventRecord* records, std::size_t n_records, const tracker::Transition* transitions,
+    B3_STAGE void on_message(const R::EventRecord* records, std::size_t n_records, const tracker::Transition* transitions,
                     std::size_t n_transitions) noexcept {
         const R::EventRecord* closer = nullptr;
         // An unappliable message (DESIGN.md 3.6.4) changes no level; its record

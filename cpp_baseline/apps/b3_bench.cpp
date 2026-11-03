@@ -9,17 +9,18 @@
 //      byte for byte, and the file header with this build's N and K. Port 2:
 //      the whole file. On any difference it prints the first one and reports
 //      no timings (exit 1).
-//   3. Timed passes (--passes, default 30), each on fresh state. Per packet,
+//   3. Timed passes (--passes, default 30, of each kind), each on fresh
+//      state: a throughput pass, with no clock reads in the pipeline (timed
+//      whole and in batches of packets, divided: averages with no tick error;
+//      messages and packets per second), and a latency pass. Per packet,
 //      from the moment its payload is handed to the packet decoder:
 //        port 1 latency: to the last port 1 record written for that packet
 //        port 2 latency: to the last port 2 record written because of it
 //                        (only packets that produce port 2 output)
 //      Timestamps are read in the pipeline only when a record was just
-//      written. The clock is the system counter (mach_absolute_time on macOS,
-//      cntvct_el0 elsewhere on arm64); its tick is reported, and a
-//      percentile within 2 ticks is marked. Each pass is also timed whole and
-//      in batches of packets, divided, for averages with no tick error.
-//      Throughput: messages and packets per second over the whole file.
+//      written, from the arm64 system counter directly (cntvct_el0); its tick
+//      is reported, and a percentile within 2 ticks is marked. The latency
+//      pass's own time shows what the stamps cost.
 //   4. Reports per latency p50, p90, p99, p99.9 and max (the median over
 //      passes) and their spread over passes (min to max), as one JSON file
 //      and a short markdown table (--out PREFIX: PREFIX.json, PREFIX.md),
@@ -33,7 +34,7 @@
 //   do I/O, allocate or print inside a timed pass.
 //
 // Usage: b3_bench --instruments FILE --golden-events FILE --golden-book FILE
-//                 [--passes N] [--batch N] [--status-interval-ns N] [--allow-battery]
+//                 [--passes N] [--batch N] [--status-interval-ns N] [--allow-battery] [--no-latency]
 //                 [--out PREFIX] FILE.pcap
 
 #include <algorithm>
@@ -79,33 +80,40 @@ using Book = b3::book::BuildBook;
 using Sink = b3::book::BookSink<>;
 
 // ---- The clock ----
+// The arm64 system counter, read directly (0.3 ns a read here; the
+// mach_absolute_time call costs about 6.5 ns, and an isb before the read
+// about 10). Without an isb the read may move a few ns against the code
+// around it, well under the counter's 41.67 ns tick.
 inline std::uint64_t ticks() noexcept {
-#if defined(__APPLE__)
-    return mach_absolute_time();   // reads the arm64 system counter (cntvct_el0)
-#elif defined(__aarch64__)
+#if defined(__aarch64__)
     std::uint64_t v;
-    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+    asm volatile("mrs %0, cntvct_el0" : "=r"(v)::"memory");
     return v;
+#elif defined(__APPLE__)
+    return mach_absolute_time();
 #else
-#error "b3_bench needs mach_absolute_time or cntvct_el0"
+#error "b3_bench needs cntvct_el0 or mach_absolute_time"
 #endif
 }
 
 double tick_ns() {
-#if defined(__APPLE__)
-    mach_timebase_info_data_t tb;
-    mach_timebase_info(&tb);
-    return static_cast<double>(tb.numer) / tb.denom;
-#else
+#if defined(__aarch64__)
     std::uint64_t f;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
     return 1e9 / static_cast<double>(f);
+#else
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return static_cast<double>(tb.numer) / tb.denom;
 #endif
 }
 
 // ---- The pipeline, as b3_decode runs it, with the latency stamps ----
 constexpr std::uint64_t kNone = ~0ull;
 
+// Stamp: latency passes read the clock when a record was just written;
+// throughput passes do not read it inside the pipeline at all.
+template <bool Stamp>
 struct Pipeline {
     b3::packet::PacketDecoder<> decoder;
     b3::walker::Walker walker;
@@ -135,17 +143,23 @@ struct Pipeline {
         const std::size_t before = events.size();
         events.on<Id>(m);
         const std::size_t n = events.size() - before;
-        if (n) last1 = ticks();
-        const std::size_t b = sink.size() + sink.counters().overflow;
+        if constexpr (Stamp) {
+            if (n) last1 = ticks();
+        }
+        const std::size_t b = sink.size();
         sink.on_message(events.data() + before, n, tracker.transitions(), tracker.transition_count());
-        if (sink.size() + sink.counters().overflow != b) last2 = ticks();
+        if constexpr (Stamp) {
+            if (sink.size() != b) last2 = ticks();
+        }
     }
     void on_unknown(const b3::walker::MessageView& m) noexcept { tracker.on_unknown(m); }
 
     void transitions() noexcept {
         const std::size_t b = sink.size();
         sink.on_transitions(tracker.transitions(), tracker.transition_count());
-        if (sink.size() != b) last2 = ticks();
+        if constexpr (Stamp) {
+            if (sink.size() != b) last2 = ticks();
+        }
     }
 
     // One datagram; returns the moment its payload went to the packet decoder.
@@ -155,7 +169,7 @@ struct Pipeline {
         sink.on_transitions(tracker.transitions(), tracker.transition_count());
         if (p.payload_len >= b3::layout::packet_header::size) tracker.saw(p.payload[0], p.timestamp_ns);
         last1 = last2 = kNone;
-        const std::uint64_t t0 = ticks();
+        const std::uint64_t t0 = Stamp ? ticks() : 0;
         b3::packet::PacketHeader header;
         if (!decoder.decode(p.payload, p.payload_len, header)) return t0;
         const auto& verdict = decoder.sequencer().last();
@@ -274,6 +288,7 @@ int main(int argc, char** argv) {
     std::size_t batch = 1024;
     std::uint64_t interval = 100'000'000;
     bool allow_battery = false;
+    bool latency = true;   // --no-latency: throughput passes only (for a profiler: no stamps, no sorting)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--instruments" && i + 1 < argc) instruments_path = argv[++i];
@@ -284,6 +299,7 @@ int main(int argc, char** argv) {
         else if (a == "--status-interval-ns" && i + 1 < argc) interval = std::stoull(argv[++i]);
         else if (a == "--out" && i + 1 < argc) out_prefix = argv[++i];
         else if (a == "--allow-battery") allow_battery = true;
+        else if (a == "--no-latency") latency = false;
         else path = a;
     }
     if (path.empty() || instruments_path.empty() || golden_events.empty() || golden_book.empty() || passes < 1) {
@@ -314,14 +330,18 @@ int main(int argc, char** argv) {
     std::vector<std::uint64_t> t0(pk.size()), l1(pk.size()), l2(pk.size());
     const std::uint64_t silence = b3::tracker::Tracker::kDefaultSilenceNs;
 
-    auto run = [&](std::vector<std::uint64_t>* batches) {
-        auto pipe = std::make_unique<Pipeline>(table, ev.data(), ev.size(), bk.get(), bk_cap, interval, silence);
+    // One pass on fresh state; a latency pass (Stamp) keeps each packet's stamps.
+    auto run = [&]<bool Stamp>(std::vector<std::uint64_t>* batches) {
+        auto pipe = std::make_unique<Pipeline<Stamp>>(table, ev.data(), ev.size(), bk.get(), bk_cap, interval, silence);
         const std::uint64_t start = ticks();
         std::uint64_t batch_start = start;
         for (std::size_t i = 0; i < pk.size(); ++i) {
-            t0[i] = pipe->feed(pk[i]);
-            l1[i] = pipe->last1;
-            l2[i] = pipe->last2;
+            const std::uint64_t t = pipe->feed(pk[i]);
+            if constexpr (Stamp) {
+                t0[i] = t;
+                l1[i] = pipe->last1;
+                l2[i] = pipe->last2;
+            }
             if (batches && (i + 1) % batch == 0) {
                 const std::uint64_t now = ticks();
                 batches->push_back(now - batch_start);
@@ -333,7 +353,7 @@ int main(int argc, char** argv) {
     };
 
     // ---- Warm-up pass and the correctness gate ----
-    auto [warm, warm_ticks] = run(nullptr);
+    auto [warm, warm_ticks] = run.template operator()<false>(nullptr);
     (void)warm_ticks;
     std::vector<std::uint8_t> want_ev, want_bk;
     if (!read_file(golden_events, want_ev) || !read_file(golden_book, want_bk)) {
@@ -369,11 +389,13 @@ int main(int argc, char** argv) {
     }
     warm.reset();
 
-    // ---- Timed passes ----
+    // ---- Timed passes: alternately a throughput pass (no clock reads inside
+    // the pipeline: the whole-pass and batch times) and a latency pass (the
+    // per-packet stamps; its own whole-pass time shows what the stamps cost).
     const double tns = tick_ns();
     struct PassResult {
         Pct p1, p2;
-        double ns_per_packet, ns_per_message, batch_ns_per_packet;
+        double ns_per_packet, ns_per_message, batch_ns_per_packet, stamped_ns_per_message;
         std::size_t n1, n2;
     };
     std::vector<PassResult> res;
@@ -384,10 +406,19 @@ int main(int argc, char** argv) {
     v2.reserve(pk.size());
     for (int pass = 0; pass < passes; ++pass) {
         batches.clear();
-        auto [pipe, total] = run(&batches);
-        pipe.reset();
+        auto [tp, total] = run.template operator()<false>(&batches);
+        tp.reset();
         v1.clear();
         v2.clear();
+        std::uint64_t stamped = 0;
+        if (!latency) {
+            res.push_back({{}, {}, static_cast<double>(total) * tns / pk.size(),
+                           static_cast<double>(total) * tns / static_cast<double>(messages), 0, 0, 0, 0});
+            continue;
+        }
+        auto [lp, st] = run.template operator()<true>(nullptr);
+        lp.reset();
+        stamped = st;
         for (std::size_t i = 0; i < pk.size(); ++i) {
             if (l1[i] != kNone) v1.push_back(static_cast<double>(l1[i] - t0[i]) * tns);
             if (l2[i] != kNone) v2.push_back(static_cast<double>(l2[i] - t0[i]) * tns);
@@ -395,7 +426,8 @@ int main(int argc, char** argv) {
         std::vector<double> bm;
         for (auto b : batches) bm.push_back(static_cast<double>(b) * tns / static_cast<double>(batch));
         res.push_back({percentiles(v1), percentiles(v2), static_cast<double>(total) * tns / pk.size(),
-                       static_cast<double>(total) * tns / static_cast<double>(messages), median(bm), v1.size(), v2.size()});
+                       static_cast<double>(total) * tns / static_cast<double>(messages), median(bm),
+                       static_cast<double>(stamped) * tns / static_cast<double>(messages), v1.size(), v2.size()});
     }
 
     // ---- Report ----
@@ -412,6 +444,7 @@ int main(int argc, char** argv) {
     const auto pkt = agg([](const PassResult& r) { return r.ns_per_packet; });
     const auto msg = agg([](const PassResult& r) { return r.ns_per_message; });
     const auto bat = agg([](const PassResult& r) { return r.batch_ns_per_packet; });
+    const auto stamped = agg([](const PassResult& r) { return r.stamped_ns_per_message; });
     const Row lat[] = {
         {"port1_p50", agg([](const PassResult& r) { return r.p1.p50; })},
         {"port1_p90", agg([](const PassResult& r) { return r.p1.p90; })},
@@ -456,7 +489,10 @@ int main(int argc, char** argv) {
         return std::string(b);
     };
     j += "  \"ns_per_packet\": " + trio(pkt) + ",\n  \"ns_per_message\": " + trio(msg) +
-         ",\n  \"batch_ns_per_packet\": " + trio(bat) + ",\n";
+         ",\n  \"batch_ns_per_packet\": " + trio(bat) + ",\n  \"latency_pass_ns_per_message\": " + trio(stamped) +
+         ",\n  \"timing_note\": \"throughput from passes with no clock reads in the pipeline; latencies from separate "
+         "passes that read the counter when a record is written (their cost: latency_pass_ns_per_message - "
+         "ns_per_message)\",\n";
     char tp[200];
     std::snprintf(tp, sizeof tp, "  \"packets_per_s\": %.0f, \"messages_per_s\": %.0f,\n", 1e9 / pkt[0], 1e9 / msg[0]);
     j += tp;
@@ -484,9 +520,9 @@ int main(int argc, char** argv) {
     md += std::string("**") + book + (k ? " K=" + std::to_string(k) : "") + ", N=" + std::to_string(b3::kPublishedDepth) +
           (b3::kTimed ? ", timed" : "") + "** on `" + path + "`" + (invalid ? " — **INVALID (battery or low power)**" : "") +
           "\n\n";
-    char hd[256];
-    std::snprintf(hd, sizeof hd, "%zu packets, %zu messages; %d passes; clock tick %.2f ns. Throughput %.2f M msg/s, %.2f M pkt/s (%.1f ns/msg; batch average %.1f ns/pkt).\n\n",
-                  pk.size(), messages, passes, tns, 1e3 / msg[0], 1e3 / pkt[0], msg[0], bat[0]);
+    char hd[400];
+    std::snprintf(hd, sizeof hd, "%zu packets, %zu messages; %d throughput and %d latency passes; clock tick %.2f ns. Throughput %.2f M msg/s, %.2f M pkt/s (%.1f ns/msg; median over 1024-packet batches %.1f ns/pkt). Latency passes: %.1f ns/msg with the stamps.\n\n",
+                  pk.size(), messages, passes, passes, tns, 1e3 / msg[0], 1e3 / pkt[0], msg[0], bat[0], stamped[0]);
     md += hd;
     md += "| Latency (ns, median over passes, min–max) | p50 | p90 | p99 | p99.9 | max |\n|---|---|---|---|---|---|\n";
     md += "| Port 1 (" + std::to_string(res[0].n1) + " packets) | " + cell(lat[0].v) + " | " + cell(lat[1].v) + " | " +

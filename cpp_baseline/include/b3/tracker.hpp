@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "b3/stage.hpp"
 #include "b3/book_params.hpp"
 #include "b3/decode.hpp"
 #include "b3/field_audit.hpp"
@@ -161,7 +162,7 @@ public:
     }
 
     template <std::uint16_t TemplateId>
-    void on(const walker::MessageView& m) noexcept {
+    B3_STAGE void on(const walker::MessageView& m) noexcept {
         using T = fields::Template<TemplateId>;
         namespace L = layout;
         std::uint64_t time = 0;
@@ -250,7 +251,7 @@ private:
         return v.present() && (v.value == '0' || v.value == '1');
     }
     template <std::uint16_t TemplateId>
-    void check_appliable(std::size_t slot, const walker::MessageView& m) noexcept {
+    B3_STAGE void check_appliable(std::size_t slot, const walker::MessageView& m) noexcept {
         namespace L = layout;
         namespace E = L::enums::MDUpdateAction;
         std::size_t reason = 0;

@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "b3/stage.hpp"
 #include "b3/framing.hpp"
 #include "b3/layouts.hpp"
 #include "b3/packet.hpp"
@@ -128,7 +129,7 @@ public:
     // Returns true when part of the packet was discarded (a malformed tail,
     // or messages past msg_index 255): a loss on its channel.
     template <class Sink>
-    bool walk(const packet::PacketHeader& header, const std::uint8_t* payload, std::size_t len,
+    B3_STAGE bool walk(const packet::PacketHeader& header, const std::uint8_t* payload, std::size_t len,
               Sink& sink) {
         ++counters_.packets;
         std::size_t pos = layout::packet_header::size;
