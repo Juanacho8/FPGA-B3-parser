@@ -427,13 +427,37 @@ void check_consistency_fault() {
         CHECK(rs[1].header.exch_time == p.events_buf[1].exch_time);              // the message's time field
         CHECK(rs.size() == 2);                                                    // nothing published while STALE
         CHECK(p.levels.counters().consistency_errors == 1);
-        CHECK(p.tracker.counters().book_faults == 1);
-        CHECK(p.tracker.state(0).stale);
-        // Port 1: the faulting message's own record was written before the book
-        // saw it, so it is clean; the next carries bit 3.
-        CHECK((p.events_buf[1].flags & b3::records::flag::BOOK_NOT_CLEAN) == 0);
-        CHECK((p.events_buf[2].flags & b3::records::flag::BOOK_NOT_CLEAN) != 0);
+        CHECK(p.book.counters().consistency_faults == 1);
+        // The split (DESIGN.md 3.6.4): the book is STALE, the feed is not, and
+        // port 1 (the feed state) stays clean.
+        CHECK(p.book.stale(0));
+        CHECK(!p.tracker.state(0).stale);
+        CHECK((p.events_buf[1].flags & b3::records::flag::FEED_NOT_CLEAN) == 0);
+        CHECK((p.events_buf[2].flags & b3::records::flag::FEED_NOT_CLEAN) == 0);
     }
+    // The fault is cleared by the instrument's EmptyBook, which the feed state
+    // never saw as STALE: the STATE_CHANGE to CLEAN still carries cause 5.
+    Pipeline<Book> p("200000001 68\n");
+    p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));
+    p.feed(packet(68, 2, {del(WIN, '0', 99, 5, 7, 2, 0x80)}));
+    p.feed(packet(68, 3, {empty_book(WIN, 0xA0, 555)}));
+    const auto rs = p.records();
+    REQUIRE(rs.size() == 4);
+    CHECK((rs[2].header.record_type == RT::STATE_CHANGE && rs[2].header.state == ST::CLEAN));
+    CHECK((rs[2].header.cause == b3::records::cause::EMPTY_BOOK && rs[2].header.exch_time == 555));
+    CHECK((rs[3].header.record_type == RT::BOOK_UPDATE && rs[3].header.state == ST::CLEAN));   // its close
+    CHECK(!p.book.stale(0));
+}
+
+TEST_CASE("a gap sets both: port 1 bit 3 and port 2 STALE") {
+    Pipeline<> p("200000001 68\n");
+    p.feed(packet(68, 1, {order(WIN, 0, '0', 100, 5, 1, 1, 0x80)}));
+    p.feed(packet(68, 3, {order(WIN, 0, '0', 101, 1, 2, 3, 0x80)}));   // 2 lost
+    const auto rs = p.records();
+    REQUIRE(rs.size() == 2);
+    CHECK((rs[1].header.state == ST::STALE && rs[1].header.cause == b3::records::cause::GAP));
+    CHECK((p.events_buf[1].flags & b3::records::flag::FEED_NOT_CLEAN) != 0);
+    CHECK((p.tracker.state(0).stale && p.book.stale(0)));
 }
 
 TEST_CASE("consistency fault while CLEAN: STALE with cause 8 (uncapped book)") {
@@ -488,7 +512,7 @@ void check_unappliable() {
         CHECK((lv[0].price == 100 && lv[0].qty == 5 && lv[0].order_count == 1));
         CHECK(p.levels.counters().consistency_errors == 0);
         CHECK(p.levels.counters().consistency_errors_stale == 0);
-        CHECK((p.events_buf[1].flags & b3::records::flag::BOOK_NOT_CLEAN) != 0);   // port 1 agrees
+        CHECK((p.events_buf[1].flags & b3::records::flag::FEED_NOT_CLEAN) != 0);   // port 1 agrees
     }
 }
 

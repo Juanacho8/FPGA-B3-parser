@@ -46,7 +46,7 @@ namespace flag {
 inline constexpr std::uint8_t END_OF_EVENT = 0x01;   // matchEventIndicator bit 7
 inline constexpr std::uint8_t RECOVERY = 0x02;       // bit 5, RecoveryMsg
 inline constexpr std::uint8_t IMPLIED = 0x04;        // bit 4
-inline constexpr std::uint8_t BOOK_NOT_CLEAN = 0x08; // its table instrument is not CLEAN (today: STALE)
+inline constexpr std::uint8_t FEED_NOT_CLEAN = 0x08; // its table instrument's feed state is not clean (DESIGN.md 3.6.4)
 }  // namespace flag
 
 // ---- Side, byte 10 ----
@@ -166,7 +166,7 @@ inline constexpr std::uint8_t SILENCE = 4;
 inline constexpr std::uint8_t EMPTY_BOOK = 5;
 inline constexpr std::uint8_t CHANNEL_RESET = 6;
 inline constexpr std::uint8_t UNAPPLIABLE = 7;   // a CHANGE or DELETE the price-level books cannot apply
-inline constexpr std::uint8_t CONSISTENCY_FAULT = 8;   // a price-level book's consistency error while CLEAN
+inline constexpr std::uint8_t CONSISTENCY_FAULT = 8;   // a price-level book's consistency error while CLEAN (port 2 only)
 }  // namespace cause
 
 struct BookLevel {

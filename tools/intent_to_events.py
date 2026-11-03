@@ -176,7 +176,7 @@ class Closer:
         if event and replay is not None and event.instrument_id and replay.is_stale(event.instrument_id):
             # Bit 3: the record's table instrument is not CLEAN, in the state
             # the message left (DESIGN.md 3.3, 3.6.4).
-            event = dataclasses.replace(event, flags=event.flags | c.FLAG_BOOK_NOT_CLEAN)
+            event = dataclasses.replace(event, flags=event.flags | c.FLAG_FEED_NOT_CLEAN)
         mei = match_event_indicator(row)
         ch = row["channel"]
         if row["templateId"] in RESETS:
@@ -214,34 +214,22 @@ def end_of_event_marker(row, mei):
                    exch_time=field(row, TIME_FIELD[t]) if t in TIME_FIELD else 0)
 
 
-def convert_feed(intent, manifest, feed, pcap, table, silence_ns=b3replay.DEFAULT_SILENCE_NS,
-                 tracked_depth=c.DEFAULT_TRACKED_DEPTH, published_depth=c.DEFAULT_PUBLISHED_DEPTH):
+def convert_feed(intent, manifest, feed, pcap, table, silence_ns=b3replay.DEFAULT_SILENCE_NS):
     """Port 1 records of one feed, in its pcap's order (tools/b3feed.py), with
-    the "book not clean" flag from the per-feed stale replay. A price-level
-    book runs beside it (tools/b3books.py: the capped book with K =
-    tracked_depth, or the uncapped book for 0), as in the C++ build with
-    those parameters: a consistency fault while CLEAN marks its instrument
-    STALE, which later records' bit 3 shows (DESIGN.md 3.6.4, cause 8)."""
-    import b3books
+    the "feed not clean" flag from the per-feed stale replay."""
     import b3feed
     replay = b3replay.Replay(table, manifest, feed, silence_ns)
-    book = b3books.BookFeed(table, replay, tracked_depth, published_depth)
     closer = Closer()
     out = []
-
-    def on_row(row):
-        events = list(closer.process(row, replay))
-        out.extend(events)
-        book.feed(row, events)      # after the records: the faulting message's own record is clean
-
-    b3feed.drive(intent, manifest, feed, pcap, replay, on_row=on_row)
+    b3feed.drive(intent, manifest, feed, pcap, replay,
+                 on_row=lambda row: out.extend(closer.process(row, replay)))
     return out
 
 
 def convert(rows, replay=None):
     """Port 1 records for decoded rows, in order. With replay (a
     b3replay.Replay for the rows' feed), records of stale table instruments
-    carry the "book not clean" flag."""
+    carry the "feed not clean" flag."""
     closer = Closer()
     if replay is None:
         for row in rows:
@@ -262,8 +250,7 @@ def main(argv=None):
     ap.add_argument("--feed", default="A", choices=("A", "B"))
     ap.add_argument("--published-depth", type=int, default=c.DEFAULT_PUBLISHED_DEPTH)
     ap.add_argument("--tracked-depth", type=int, default=c.DEFAULT_TRACKED_DEPTH,
-                    help="K: recorded in the file header, and the book whose consistency faults bit 3 "
-                         "follows (0 = uncapped)")
+                    help="K recorded in the file header (0 = uncapped)")
     ap.add_argument("--max-instruments", type=int, default=c.DEFAULT_MAX_INSTRUMENTS)
     ap.add_argument("--instruments", help="instrument table (default: the generator config's, as "
                                           "tools/gen_instruments.py writes it)")
@@ -275,8 +262,7 @@ def main(argv=None):
     table = b3replay.read_table(args.instruments) if args.instruments else b3replay.default_table()
     pcap = Path(args.pcap) if args.pcap else Path(args.intent).with_name(f"feed{args.feed}.pcap")
     try:
-        events = convert_feed(args.intent, manifest, args.feed, pcap, table, args.silence_ns,
-                              args.tracked_depth, args.published_depth)
+        events = convert_feed(args.intent, manifest, args.feed, pcap, table, args.silence_ns)
     except b3replay.Broken as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

@@ -11,7 +11,7 @@ What it does:
   the feed's pcap), a channel silent for more than the silence limit marks
   its table instruments stale too (DESIGN.md 3.6.4, spec/LAYOUTS.md 12.1). It is the one derivation of stale state shared by
   tools/counters_compare.py (counters, first stale points) and
-  tools/intent_to_events.py (port 1's "book not clean" flag).
+  tools/intent_to_events.py (port 1's "feed not clean" flag).
   Every gap it finds must be packets the manifest lists as missing.
 
 What it must not do:
@@ -120,7 +120,6 @@ class Replay:
         self.msg_before_rebuild = 0
         self.unappliable = dict(delete_no_price=0, change_no_prev_size=0, no_side=0)
         self.last_unappliable = None
-        self.book_faults = 0
         self.losses = 0
         self.unknown = 0
         self.state = [dict(have=False, last=0, stale=False, first=None, gaps=0, events=0, rebuild=False)
@@ -251,15 +250,6 @@ class Replay:
         reason = unappliable_reason(row)
         if reason:
             self.unappliable_message(slot, (ch, row["sequenceVersion"], row["sequenceNumber"]), reason)
-
-    def book_fault(self, slot, point, row=None):
-        """A price-level book found a consistency error applying a message
-        while the instrument was CLEAN (tools/b3books.py): it goes stale at
-        the message (DESIGN.md 3.6.4, cause 8). Counted."""
-        if self.state[slot]["stale"]:
-            return
-        self.book_faults += 1
-        self.stale(slot, point)
 
     def unappliable_message(self, slot, point, reason):
         """A message a price-level book cannot apply: counted by reason, and

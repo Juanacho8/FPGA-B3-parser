@@ -72,7 +72,7 @@ KIND_NAMES = {ADD: "ADD", MODIFY: "MODIFY", DELETE: "DELETE", CLEAR_SIDE: "CLEAR
 FLAG_END_OF_EVENT = 0x01
 FLAG_RECOVERY = 0x02
 FLAG_IMPLIED = 0x04
-FLAG_BOOK_NOT_CLEAN = 0x08   # its table instrument's book is not CLEAN (today: STALE)
+FLAG_FEED_NOT_CLEAN = 0x08   # its table instrument's feed state is not clean (DESIGN.md 3.6.4)
 
 # Side (byte 10)
 SIDE_NONE, SIDE_BID, SIDE_OFFER = 0, 1, 2

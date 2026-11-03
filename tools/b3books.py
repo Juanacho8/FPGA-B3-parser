@@ -6,11 +6,10 @@ What it does:
   side, the RTL's algorithm), each with its per-side null-price bucket.
   apply() applies one port 1 record to one table instrument's book, the way
   cpp_baseline/include/b3/book_sink.hpp does, and says whether it found a
-  consistency error while the instrument was CLEAN: the replay then marks
-  the instrument STALE (b3replay.Replay.book_fault, cause 8). BookFeed runs
-  a book beside a replay for the keys that need only its faults (the port 1
-  converter and the counters key): after a consistency fault, port 1's bit 3
-  and the tracker's counters follow the book (DESIGN.md 3.6.4).
+  consistency error while the instrument was CLEAN: the port 2 key
+  (tools/expected_book.py) then marks the book STALE (cause 8). Only port 2
+  depends on a book: port 1 and the counters follow the feed state alone
+  (DESIGN.md 3.6.4).
 
 What it must not do:
   Import b3gen, or read any C++ output.
@@ -318,33 +317,3 @@ def apply(book, slot, e, stale):
         book.clear(slot)
     return book.errors != errors
 
-
-BOOK_KINDS = (c.ADD, c.MODIFY, c.DELETE, c.CLEAR_SIDE, c.CLEAR_BOOK)
-
-
-class BookFeed:
-    """A price-level book beside a replay, for its consistency faults only.
-    feed(row, events) after each message's port 1 records: an unappliable
-    message is skipped, a ChannelReset clears its channel, and a fault while
-    CLEAN calls replay.book_fault(slot, point, row)."""
-
-    def __init__(self, table, replay, k=None, n=c.DEFAULT_PUBLISHED_DEPTH):
-        self.table = table
-        self.slot = {sid: i for i, (sid, _) in enumerate(table)}
-        self.replay = replay
-        self.book = make_book(k, n)
-
-    def feed(self, row, events):
-        if self.replay.last_unappliable:
-            return
-        for e in events:
-            if e.kind == c.CLEAR_CHANNEL:
-                for slot, (_, ch) in enumerate(self.table):
-                    if ch == e.channel:
-                        self.book.clear(slot)
-            elif e.kind in BOOK_KINDS:
-                slot = self.slot.get(e.instrument_id)
-                if slot is not None:
-                    stale = self.replay.state[slot]["stale"]
-                    if apply(self.book, slot, e, stale):
-                        self.replay.book_fault(slot, (e.channel, e.seq_version, e.seq_num), row)

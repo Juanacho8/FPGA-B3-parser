@@ -136,7 +136,7 @@ struct DecodeSink {
             *checkpoint_out += std::to_string(m.packet.channel) + " " + std::to_string(m.packet.seq_version) + " " +
                                std::to_string(m.packet.seq_num) + " " + std::to_string(m.msg_index) + " " +
                                std::to_string((*table)[slot].security_id) + " " +
-                               (tracker->state(slot).stale ? "STALE" : "CLEAN") + " " +
+                               (book->stale(slot) ? "STALE" : "CLEAN") + " " +   // the book state
                                std::to_string((levels->depth_incomplete(slot, b3::book::Side::bid) ? 1 : 0) |
                                               (levels->depth_incomplete(slot, b3::book::Side::offer) ? 2 : 0));
             for (const auto side : {b3::book::Side::bid, b3::book::Side::offer}) {
@@ -159,7 +159,7 @@ struct DecodeSink {
             *mbo_checkpoint_out += std::to_string(m.packet.channel) + " " + std::to_string(m.packet.seq_version) + " " +
                                    std::to_string(m.packet.seq_num) + " " + std::to_string(m.msg_index) + " " +
                                    std::to_string((*table)[slot].security_id) + " " +
-                                   (tracker->state(slot).stale ? "STALE" : "CLEAN") + " 0";
+                                   (book->stale(slot) ? "STALE" : "CLEAN") + " 0";
             for (const auto side : {b3::book::Side::bid, b3::book::Side::offer}) {
                 const std::size_t n = mbo->levels(slot, side, lv, b3::kPublishedDepth);
                 *mbo_checkpoint_out += " " + std::to_string(n);
@@ -351,7 +351,6 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
                      static_cast<ull>(tc.fields.invalid[i]));
     }
     std::fprintf(f, "},");
-    std::fprintf(f, "\"book_faults\":%llu,", static_cast<ull>(tc.book_faults));
     std::fprintf(f, "\"losses\":%llu,\"silences\":%llu,\"unknown_instrument_messages\":%llu,"
                  "\"msg_before_rebuild\":%llu,\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.silences),
@@ -484,11 +483,7 @@ int main(int argc, char** argv) {
         }
         // Port 1 buffer: at most one record per complete message (a record or
         // a marker, never both), counted once over the loaded capture.
-        // The book also runs for --events and --counters: a consistency fault
-        // marks its instrument STALE (DESIGN.md 3.6.4, cause 8), which port 1's
-        // bit 3 and the tracker's counters follow.
-        const bool want_book = !book_path.empty() || !checkpoints_path.empty() || want_mbo || !events_path.empty() ||
-                               !counters_path.empty();
+        const bool want_book = !book_path.empty() || !checkpoints_path.empty() || want_mbo;
         if (want_mbo && b3::kBookMode != b3::BookMode::Uncapped) {
             std::fprintf(stderr, "b3_decode: --mbo checks against the uncapped book: use the B3_BOOK=uncapped build\n");
             return 2;
@@ -510,7 +505,7 @@ int main(int argc, char** argv) {
                                                               silence_ns);
         sink->tracker = tracker.get();
         if (!events_path.empty() || want_book) {
-            // After the tracker: the "book not clean" bit reads its state (DESIGN.md 3.3).
+            // After the tracker: the "feed not clean" bit reads its state (DESIGN.md 3.3).
             event_sink = std::make_unique<b3::event_sink::EventSink>(event_buffer.data(), event_buffer.size(),
                                                                      tracker.get());
             sink->events = event_sink.get();
@@ -657,6 +652,7 @@ int main(int argc, char** argv) {
                         b3::kBookMode == b3::BookMode::Capped ? "capped" : "uncapped", b3::kPublishedDepth,
                         b3::kBookMode == b3::BookMode::Capped ? b3::kTrackedDepth : std::size_t{0},
                         levels->state_bytes());
+            std::printf(",\"consistency_faults\":%llu", static_cast<ull>(bc.consistency_faults));
             print_book_shape(*levels);
             std::printf("}");
         }
