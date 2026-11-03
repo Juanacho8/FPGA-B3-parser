@@ -15,10 +15,10 @@ What it does:
       the MBO book (a per-order rebuild against the generator's own book)
     * no pool or table overflow
   Reports the MBO book's state size, peak resting orders per instrument and
-  in total. Sets in b3intent.EXPECTED_FAILURES report XFAIL whatever their
-  result (shown): these checks compare the C++ with itself and with the key
-  only at CLEAN points, so a pass is no sign the missing feature works, and
-  is no XPASS. Fails on any difference, or if nothing was checked.
+  in total. Every set is checked the same way, the reorder scenario
+  included: these checks compare the C++ with itself and with the key at
+  CLEAN points, which hold whatever the decoder's sequencing does. Fails on
+  any difference, or if nothing was checked.
 
 What it must not do:
   Import b3gen, or use C++ output to compute what it expects.
@@ -72,7 +72,7 @@ def main(argv=None):
     if not sets:
         print(f"error: no generator sets under {root}: run make data", file=sys.stderr)
         return 2
-    checked = failed = xfail = 0
+    checked = failed = 0
     key_total = 0
     peak_total = peak_instrument = 0
     stale_faults = 0
@@ -84,7 +84,6 @@ def main(argv=None):
         for folder in sets:
             name = folder.relative_to(root)
             manifest = b3intent.load_manifest(folder / "intent.jsonl")
-            reason = b3intent.expected_failure(manifest)
             ids = counters_compare.names_to_ids(folder / "intent.jsonl")
             plan = book_compare.checkpoint_plan(folder / "book_key.jsonl", ids)
             placements = sorted({p for p, *_ in plan})
@@ -118,13 +117,7 @@ def main(argv=None):
                 stale = sum(mbo["faults_stale"].values())
                 stale_faults += stale
                 label = f"{name}/{pcap.name}"
-                if reason:
-                    # Always XFAIL: these checks compare the C++ with itself and with the key at
-                    # CLEAN points only, so passing them says nothing about the missing feature.
-                    xfail += 1
-                    print(f"XFAIL {label}: {reason} (" + (f"{len(problems)} differences, first: {problems[0][:120]}"
-                                                          if problems else "its checks pass here") + ")")
-                elif problems:
+                if problems:
                     failed += 1
                     print(f"MISMATCH {label}")
                     for p in problems[:8]:
@@ -136,7 +129,7 @@ def main(argv=None):
                           + (f", {unreached} not delivered" if unreached else "")
                           + f"; peak orders {mbo['peak_orders']} ({mbo['peak_orders_per_instrument']} on one "
                           f"instrument)" + (f"; while STALE: {stale_note}" if stale_note else ""))
-    print(f"{checked - failed - xfail}/{checked} files pass in {len(sets)} sets, {xfail} expected failures; "
+    print(f"{checked - failed}/{checked} files pass in {len(sets)} sets; "
           f"{key_total} CLEAN book-key checkpoints checked; MBO state {state_bytes} bytes, peak resting orders "
           f"{peak_total} in total and {peak_instrument} on one instrument; {stale_faults} faults while STALE")
     if checked == 0:
