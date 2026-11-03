@@ -52,6 +52,7 @@ import expected_book      # noqa: E402
 import gen_instruments    # noqa: E402
 
 KEY_DEPTH = 5   # levels per side in book_key.jsonl
+TIMED_OUT = ("max_depth", "sides")   # book statistics a timed build does not keep
 
 
 def describe(rec):
@@ -192,7 +193,12 @@ def main(argv=None):
                     want = expected_book.book_bytes(port2)
                     if want != got:
                         problems.append(first_difference(want, got))
-                    for key, v in expected_counts(port2).items():
+                    want = expected_counts(port2)
+                    if got_counts.get("timed"):
+                        # A timed build (B3_TIMED) compiles out these statistics (book_params.hpp).
+                        for key in TIMED_OUT:
+                            want.pop(key, None)
+                    for key, v in want.items():
                         if got_counts.get(key) != v:
                             problems.append(f"{key}: keys {v}, c++ {got_counts.get(key)}")
                     *_, key_py = check_key(plan, snapshots, n)

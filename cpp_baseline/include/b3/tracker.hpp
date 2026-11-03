@@ -170,8 +170,10 @@ public:
         }
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), time);
-        field_audit::count<TemplateId>(m, counters_.fields);
-        count_version(m);
+        if constexpr (!kTimed) {   // diagnostics, compiled out of timed builds
+            field_audit::count<TemplateId>(m, counters_.fields);
+            count_version(m);
+        }
         if constexpr (TemplateId == L::Sequence_2::template_id) {
             if (m.packet.seq_num == 0) {
                 const auto next = decode::get<fields::Sequence_2::nextSeqNo>(m);
@@ -222,7 +224,7 @@ public:
     void on_unknown(const walker::MessageView& m) noexcept {
         begin_call({m.packet.channel, m.packet.seq_version, m.packet.seq_num},
                    static_cast<std::uint8_t>(m.msg_index), 0);
-        count_version(m);
+        if constexpr (!kTimed) count_version(m);
     }
 
     // True when the last call's message is unappliable (DESIGN.md 3.6.4): the

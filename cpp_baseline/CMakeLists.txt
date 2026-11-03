@@ -96,10 +96,19 @@ option(B3_PUBLISH_STALE "Port 2 also publishes STALE books (marked STALE)" OFF)
 if(B3_PUBLISH_STALE)
   list(APPEND B3_PARAM_DEFINES B3_PUBLISH_STALE=1)
 endif()
+# Timed builds (the benchmark, brief section 8): diagnostic counters and checks
+# that are not part of the output contract compile out. Outputs are unchanged.
+option(B3_TIMED "Compile out diagnostic counters for timing" OFF)
+if(B3_TIMED)
+  list(APPEND B3_PARAM_DEFINES B3_TIMED=1)
+endif()
+# What the benchmark records about its own build.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" B3_BUILD_TYPE_UPPER)
+set(B3_BUILD_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${B3_BUILD_TYPE_UPPER}} ${B3_NATIVE_FLAG}")
 
 message(STATUS "b3: ${CMAKE_BUILD_TYPE}, N=${B3_PUBLISHED_DEPTH_EFFECTIVE} "
                "K=${B3_TRACKED_DEPTH_EFFECTIVE} instruments=${B3_MAX_INSTRUMENTS_EFFECTIVE} "
-               "book=${B3_BOOK} publish_stale=${B3_PUBLISH_STALE}")
+               "book=${B3_BOOK} publish_stale=${B3_PUBLISH_STALE} timed=${B3_TIMED}")
 
 # ---- 5. Library ----
 add_library(b3 STATIC src/pcap.cpp src/decode_writer.cpp src/instruments.cpp)
@@ -111,6 +120,11 @@ add_executable(b3_pcapinfo apps/b3_pcapinfo.cpp)
 target_link_libraries(b3_pcapinfo PRIVATE b3)
 add_executable(b3_decode apps/b3_decode.cpp)
 target_link_libraries(b3_decode PRIVATE b3)
+
+# The benchmark harness (make bench; timed builds, B3_TIMED=ON).
+add_executable(b3_bench apps/b3_bench.cpp)
+target_link_libraries(b3_bench PRIVATE b3)
+target_compile_definitions(b3_bench PRIVATE B3_BUILD_FLAGS="${B3_BUILD_FLAGS}" B3_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
 
 # Damaged packets through the whole pipeline (make fuzz, Debug: sanitizers).
 add_executable(b3_fuzz apps/b3_fuzz.cpp)

@@ -667,7 +667,8 @@ int main(int argc, char** argv) {
                         b3::kBookMode == b3::BookMode::Capped ? "capped" : "uncapped", b3::kPublishedDepth,
                         b3::kBookMode == b3::BookMode::Capped ? b3::kTrackedDepth : std::size_t{0},
                         levels->state_bytes());
-            std::printf(",\"consistency_faults\":%llu", static_cast<ull>(bc.consistency_faults));
+            std::printf(",\"consistency_faults\":%llu,\"timed\":%s", static_cast<ull>(bc.consistency_faults),
+                        b3::kTimed ? "true" : "false");
             print_book_shape(*levels);
             std::printf("}");
         }
