@@ -278,8 +278,13 @@ private:
         }
     }
 
-    // After a change to a side: depth-incomplete episodes.
+    // After a change to a side: depth-incomplete episodes (statistics only:
+    // compiled out of timed builds).
     void note(std::size_t slot, Side side) noexcept {
+        if constexpr (kTimed) {
+            (void)slot, (void)side;
+            return;
+        }
         const std::size_t i = index(slot, side);
         const bool now = depth_incomplete(slot, side);
         if (now && !incomplete_[i]) {

@@ -208,8 +208,10 @@ private:
         std::memmove(it + 1, it, static_cast<std::size_t>(end - it) * sizeof(BookLevel));
         *it = BookLevel{price, 0, 0, 0};
         ++n;
-        std::size_t& most = max_depth_[static_cast<std::size_t>(side)];
-        if (n > most) most = n;
+        if constexpr (!kTimed) {   // statistics, compiled out of timed builds
+            std::size_t& most = max_depth_[static_cast<std::size_t>(side)];
+            if (n > most) most = n;
+        }
         return it;
     }
     void erase(std::size_t slot, Side side, BookLevel* it) noexcept {

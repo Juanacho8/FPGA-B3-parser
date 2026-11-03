@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed bench goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -155,6 +155,23 @@ book-oracle: cpp-book-variants
 # checkpoint. Fails on any difference.
 mbo-check: cpp-uncapped
 	$(PYTHON) tools/mbo_check.py --cpp $(CPP_BUILD)/uncapped/b3_decode $(B3_DATA)
+
+# Timed builds (brief section 8, step 10): Release with B3_TIMED=ON, the
+# diagnostic counters compiled out; outputs unchanged.
+cpp-timed:
+	$(call cpp_build,timed-k16,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_TRACKED_DEPTH=16)
+	$(call cpp_build,timed-k32,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_TRACKED_DEPTH=32)
+	$(call cpp_build,timed-uncapped,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_BOOK=uncapped)
+
+# The benchmark (apps/b3_bench.cpp via tools/bench.py): each timed build on
+# large (throughput) and burst (tail latency), Feed A, after its golden check.
+# Run on AC power, lid open, nothing heavy running. BENCH_PASSES, BENCH_OUT.
+BENCH_PASSES ?= 30
+BENCH_OUT ?= docs/bench/results
+BENCH_BUILDS := $(foreach b,k16 k32 uncapped,--build $(b):$(CPP_BUILD)/timed-$(b)/b3_bench)
+
+bench: cpp-timed
+	$(PYTHON) tools/bench.py $(BENCH_BUILDS) --passes $(BENCH_PASSES) --out $(BENCH_OUT) $(B3_DATA)
 
 # The quick loop: every build, the unit tests (C++ under sanitizers, and the
 # tools'), and every compare target on the small set and the scenarios only:
