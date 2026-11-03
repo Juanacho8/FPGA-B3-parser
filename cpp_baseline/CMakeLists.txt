@@ -102,6 +102,12 @@ option(B3_TIMED "Compile out diagnostic counters for timing" OFF)
 if(B3_TIMED)
   list(APPEND B3_PARAM_DEFINES B3_TIMED=1)
 endif()
+# Profile builds: every stage's entry point noinline (b3/stage.hpp), for a
+# sampling profiler's per-stage split. Adds a call per stage; not for timing.
+option(B3_PROFILE "Keep stage entry points out of line, for profiling" OFF)
+if(B3_PROFILE)
+  list(APPEND B3_PARAM_DEFINES B3_PROFILE=1)
+endif()
 # What the benchmark records about its own build.
 string(TOUPPER "${CMAKE_BUILD_TYPE}" B3_BUILD_TYPE_UPPER)
 set(B3_BUILD_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${B3_BUILD_TYPE_UPPER}} ${B3_NATIVE_FLAG}")

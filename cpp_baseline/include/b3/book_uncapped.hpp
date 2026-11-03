@@ -27,6 +27,7 @@
 #include <limits>
 #include <vector>
 
+#include "b3/stage.hpp"
 #include "b3/records.hpp"
 
 namespace b3::book {
@@ -98,7 +99,7 @@ public:
     void finish(std::uint64_t) noexcept {}
     bool depth_incomplete(std::size_t, Side) const noexcept { return false; }
 
-    void add(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
+    B3_STAGE void add(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
             if (null_[index(slot, side)].add(qty)) error(stale);
@@ -111,7 +112,7 @@ public:
         check(*lv, stale);
     }
 
-    void change(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, std::int64_t prev,
+    B3_STAGE void change(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, std::int64_t prev,
                 bool stale) noexcept {
         if (prev == kNullPrice) return;   // unappliable: the tracker marks it STALE (DESIGN.md 4.5)
         if (price == kNullPrice) {
@@ -131,7 +132,7 @@ public:
     // A null price here is a present null (a market order's DELETE): the
     // bucket. An absent price (before v15) is unappliable and never gets here
     // (book_sink.hpp skips the message).
-    void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
+    B3_STAGE void remove(std::size_t slot, Side side, std::int64_t price, std::int64_t qty, bool stale) noexcept {
         if (price == kNullPrice) {
             ++counters_.null_price_orders;
             if (null_[index(slot, side)].remove(qty)) error(stale);

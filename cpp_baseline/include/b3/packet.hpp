@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "b3/stage.hpp"
 #include "b3/framing.hpp"
 #include "b3/layouts.hpp"
 #include "b3/wire.hpp"
@@ -220,7 +221,7 @@ public:
 
     // Parses one UDP payload. Returns true and fills out when the packet goes
     // on to the walker; false when it is discarded (short) or not accepted.
-    bool decode(const std::uint8_t* payload, std::size_t len, PacketHeader& out) noexcept {
+    B3_STAGE bool decode(const std::uint8_t* payload, std::size_t len, PacketHeader& out) noexcept {
         ++counters_.datagrams;
         if (len < ph::size) {
             ++counters_.short_datagrams;

@@ -1,0 +1,17 @@
+{
+  "valid": true,
+  "file": "data/large/feedA.pcap",
+  "packets": 323255, "messages": 1000005, "packets_with_port1": 323254, "packets_with_port2": 323248,
+  "passes": 30, "batch": 1024,
+  "pcap_load_index_ms": 38.052417,   "pcap_load_index_note": "once, before timing: the file read and indexed",
+  "golden_check": "port 1 and port 2 byte-identical to the goldens",
+  "environment": {"cpu": "Apple M1 Max", "cores": 10, "performance_cores": 8, "os": "macOS 15.7.4 (24G517)", "power": "Now drawing from 'AC Power'", "on_battery": false, "low_power_mode": false, "compiler": "Apple LLVM 17.0.0 (clang-1700.0.13.5)", "flags": " -O3 -DNDEBUG -mcpu=native", "build_type": "Release", "timed": true, "published_depth": 5, "tracked_depth": 32, "book": "capped", "max_instruments": 64, "clock": "mach_absolute_time", "tick_ns": 41.666667},
+  "ns_per_packet": {"median": 174.84, "min": 171.07, "max": 188.43},
+  "ns_per_message": {"median": 56.52, "min": 55.30, "max": 60.91},
+  "batch_ns_per_packet": {"median": 106.65, "min": 104.04, "max": 121.30},
+  "latency_pass_ns_per_message": {"median": 58.25, "min": 56.61, "max": 65.63},
+  "timing_note": "throughput from passes with no clock reads in the pipeline; latencies from separate passes that read the counter when a record is written (their cost: latency_pass_ns_per_message - ns_per_message)",
+  "packets_per_s": 5719585, "messages_per_s": 17693814,
+  "latency_ns": {"port1_p50": {"median": 41.67, "min": 41.67, "max": 41.67}, "port1_p90": {"median": 416.67, "min": 416.67, "max": 500.00}, "port1_p99": {"median": 958.33, "min": 916.67, "max": 1125.00}, "port1_p999": {"median": 1125.00, "min": 1083.33, "max": 2541.67}, "port1_max": {"median": 37625.00, "min": 5708.33, "max": 1192833.33}, "port2_p50": {"median": 83.33, "min": 83.33, "max": 83.33}, "port2_p90": {"median": 458.33, "min": 458.33, "max": 541.67}, "port2_p99": {"median": 1000.00, "min": 958.33, "max": 1166.67}, "port2_p999": {"median": 1125.00, "min": 1125.00, "max": 2583.33}, "port2_max": {"median": 37208.33, "min": 6541.67, "max": 1193000.00}},
+  "near_tick": ["port1_p50", "port2_p50"]
+}

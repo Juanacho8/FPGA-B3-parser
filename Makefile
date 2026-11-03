@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed bench goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed bench cpp-profile profile goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -172,6 +172,18 @@ BENCH_BUILDS := $(foreach b,k16 k32 uncapped,--build $(b):$(CPP_BUILD)/timed-$(b
 
 bench: cpp-timed
 	$(PYTHON) tools/bench.py $(BENCH_BUILDS) --passes $(BENCH_PASSES) --out $(BENCH_OUT) $(B3_DATA)
+
+# The profile (tools/profile.py): the capped K = 16 timed build with every
+# stage's entry point out of line (B3_PROFILE=ON), sampled by /usr/bin/sample
+# on large during timed passes; per-stage shares, not times.
+cpp-profile:
+	$(call cpp_build,profile-k16,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_PROFILE=ON -DB3_TRACKED_DEPTH=16)
+
+profile: cpp-profile
+	$(PYTHON) tools/profile.py --bench $(CPP_BUILD)/profile-k16/b3_bench \
+	  --golden-events $(B3_DATA)/golden/large/expected_feedA.bin \
+	  --golden-book $(B3_DATA)/golden/large/expected_book_n5_k16_feedA.bin --out docs/bench/profile_k16_large.md \
+	  $(B3_DATA)/large/feedA.pcap
 
 # The quick loop: every build, the unit tests (C++ under sanitizers, and the
 # tools'), and every compare target on the small set and the scenarios only:
