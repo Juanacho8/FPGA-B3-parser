@@ -57,7 +57,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import b3feed             # noqa: E402
+import b3books            # noqa: E402
 import b3intent           # noqa: E402
+import intent_to_events   # noqa: E402
 import decode_crosscheck  # noqa: E402
 import field_audit        # noqa: E402
 import gen_instruments    # noqa: E402
@@ -90,14 +92,24 @@ def expected_counters(folder, manifest, feed, table):
     counts, _ = decode_crosscheck.expected(folder / "intent.jsonl", manifest, feed)
     rows = [r for _, r in b3intent.feed_rows(folder / "intent.jsonl", manifest, feed)]
     replay = Replay(table, manifest, feed)
+    # The build's book beside the replay: a consistency fault while CLEAN
+    # marks its instrument stale (DESIGN.md 3.6.4, cause 8).
+    params = build_params()
+    book = b3books.BookFeed(table, replay, params["tracked_depth"] if params["book"] == "capped" else 0,
+                            params["published_depth"])
+    closer = intent_to_events.Closer()
+
+    def on_row(row):
+        book.feed(row, list(closer.process(row, replay)))
+
     if b3intent.expected_failure(manifest):
         # The key of a decoder feature not built yet (the reorder window): the
         # view's order (the window's release order), without capture times.
         for pkt in packets(rows):
-            replay.packet(pkt)
+            replay.packet(pkt, on_row=on_row)
     else:
         # The feed's own packet order and capture times: the silence rule.
-        b3feed.drive(folder / "intent.jsonl", manifest, feed, folder / f"feed{feed}.pcap", replay)
+        b3feed.drive(folder / "intent.jsonl", manifest, feed, folder / f"feed{feed}.pcap", replay, on_row=on_row)
     last_seen = {}
     for r in rows:
         if r["sequenceNumber"]:
@@ -112,7 +124,7 @@ def expected_counters(folder, manifest, feed, table):
                                   "empty_packets", "messages", "unknown_templates",
                                   "msg_index_overflow", "malformed_packets", "malformed", "templates")}
     exp.update(params=build_params(), duplicates=0, sequencing=replay.seq, losses=replay.losses,
-               silences=replay.silences, unappliable=replay.unappliable,
+               silences=replay.silences, unappliable=replay.unappliable, book_faults=replay.book_faults,
                fields=field_audit.counts(rows),
                unknown_instrument_messages=replay.unknown, msg_before_rebuild=replay.msg_before_rebuild,
                body_faults=dict.fromkeys(BODY_FAULTS, 0))

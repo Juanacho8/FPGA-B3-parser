@@ -214,15 +214,27 @@ def end_of_event_marker(row, mei):
                    exch_time=field(row, TIME_FIELD[t]) if t in TIME_FIELD else 0)
 
 
-def convert_feed(intent, manifest, feed, pcap, table, silence_ns=b3replay.DEFAULT_SILENCE_NS):
+def convert_feed(intent, manifest, feed, pcap, table, silence_ns=b3replay.DEFAULT_SILENCE_NS,
+                 tracked_depth=c.DEFAULT_TRACKED_DEPTH, published_depth=c.DEFAULT_PUBLISHED_DEPTH):
     """Port 1 records of one feed, in its pcap's order (tools/b3feed.py), with
-    the "book not clean" flag from the per-feed stale replay."""
+    the "book not clean" flag from the per-feed stale replay. A price-level
+    book runs beside it (tools/b3books.py: the capped book with K =
+    tracked_depth, or the uncapped book for 0), as in the C++ build with
+    those parameters: a consistency fault while CLEAN marks its instrument
+    STALE, which later records' bit 3 shows (DESIGN.md 3.6.4, cause 8)."""
+    import b3books
     import b3feed
     replay = b3replay.Replay(table, manifest, feed, silence_ns)
+    book = b3books.BookFeed(table, replay, tracked_depth, published_depth)
     closer = Closer()
     out = []
-    b3feed.drive(intent, manifest, feed, pcap, replay,
-                 on_row=lambda row: out.extend(closer.process(row, replay)))
+
+    def on_row(row):
+        events = list(closer.process(row, replay))
+        out.extend(events)
+        book.feed(row, events)      # after the records: the faulting message's own record is clean
+
+    b3feed.drive(intent, manifest, feed, pcap, replay, on_row=on_row)
     return out
 
 
@@ -250,7 +262,8 @@ def main(argv=None):
     ap.add_argument("--feed", default="A", choices=("A", "B"))
     ap.add_argument("--published-depth", type=int, default=c.DEFAULT_PUBLISHED_DEPTH)
     ap.add_argument("--tracked-depth", type=int, default=c.DEFAULT_TRACKED_DEPTH,
-                    help="K recorded in the file header (0 = uncapped)")
+                    help="K: recorded in the file header, and the book whose consistency faults bit 3 "
+                         "follows (0 = uncapped)")
     ap.add_argument("--max-instruments", type=int, default=c.DEFAULT_MAX_INSTRUMENTS)
     ap.add_argument("--instruments", help="instrument table (default: the generator config's, as "
                                           "tools/gen_instruments.py writes it)")
@@ -262,7 +275,8 @@ def main(argv=None):
     table = b3replay.read_table(args.instruments) if args.instruments else b3replay.default_table()
     pcap = Path(args.pcap) if args.pcap else Path(args.intent).with_name(f"feed{args.feed}.pcap")
     try:
-        events = convert_feed(args.intent, manifest, args.feed, pcap, table, args.silence_ns)
+        events = convert_feed(args.intent, manifest, args.feed, pcap, table, args.silence_ns,
+                              args.tracked_depth, args.published_depth)
     except b3replay.Broken as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

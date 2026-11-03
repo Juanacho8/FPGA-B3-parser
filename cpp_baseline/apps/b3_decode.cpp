@@ -351,6 +351,7 @@ bool write_counters(const std::string& path, const std::string& pcap, const b3::
                      static_cast<ull>(tc.fields.invalid[i]));
     }
     std::fprintf(f, "},");
+    std::fprintf(f, "\"book_faults\":%llu,", static_cast<ull>(tc.book_faults));
     std::fprintf(f, "\"losses\":%llu,\"silences\":%llu,\"unknown_instrument_messages\":%llu,"
                  "\"msg_before_rebuild\":%llu,\"instruments\":{",
                  static_cast<ull>(tc.losses), static_cast<ull>(tc.silences),
@@ -483,7 +484,11 @@ int main(int argc, char** argv) {
         }
         // Port 1 buffer: at most one record per complete message (a record or
         // a marker, never both), counted once over the loaded capture.
-        const bool want_book = !book_path.empty() || !checkpoints_path.empty() || want_mbo;
+        // The book also runs for --events and --counters: a consistency fault
+        // marks its instrument STALE (DESIGN.md 3.6.4, cause 8), which port 1's
+        // bit 3 and the tracker's counters follow.
+        const bool want_book = !book_path.empty() || !checkpoints_path.empty() || want_mbo || !events_path.empty() ||
+                               !counters_path.empty();
         if (want_mbo && b3::kBookMode != b3::BookMode::Uncapped) {
             std::fprintf(stderr, "b3_decode: --mbo checks against the uncapped book: use the B3_BOOK=uncapped build\n");
             return 2;
