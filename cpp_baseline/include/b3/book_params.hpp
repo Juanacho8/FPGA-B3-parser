@@ -53,6 +53,15 @@
 #define B3_TIMED 0
 #endif
 
+// B3_IMPL_OPTIMISED: 1 = the optimised implementation (CMake B3_IMPL=optimised,
+// step 10b): the timing baseline, any software technique, outputs
+// byte-identical to the goldens. 0 (default) = the mirror, the RTL golden
+// model. Optimised code sits beside the mirror's (if constexpr (kOptimised),
+// or its own classes): a mirror build compiles exactly the mirror's code.
+#ifndef B3_IMPL_OPTIMISED
+#define B3_IMPL_OPTIMISED 0
+#endif
+
 namespace b3 {
 
 // ---- 2. Constants the rest of the code uses ----
@@ -64,6 +73,7 @@ inline constexpr std::size_t kMaxInstruments = B3_MAX_INSTRUMENTS;
 inline constexpr BookMode    kBookMode       = B3_BOOK_UNCAPPED ? BookMode::Uncapped : BookMode::Capped;
 inline constexpr bool        kPublishStale   = B3_PUBLISH_STALE != 0;
 inline constexpr bool        kTimed          = B3_TIMED != 0;
+inline constexpr bool        kOptimised      = B3_IMPL_OPTIMISED != 0;
 
 // ---- 3. Compile-time checks ----
 static_assert(kPublishedDepth > 0, "PUBLISHED_DEPTH must be at least 1");
@@ -73,5 +83,6 @@ static_assert(kPublishedDepth <= kTrackedDepth, "PUBLISHED_DEPTH (N) must not ex
 static_assert(B3_BOOK_UNCAPPED == 0 || B3_BOOK_UNCAPPED == 1, "B3_BOOK_UNCAPPED must be 0 or 1");
 static_assert(B3_PUBLISH_STALE == 0 || B3_PUBLISH_STALE == 1, "B3_PUBLISH_STALE must be 0 or 1");
 static_assert(B3_TIMED == 0 || B3_TIMED == 1, "B3_TIMED must be 0 or 1");
+static_assert(B3_IMPL_OPTIMISED == 0 || B3_IMPL_OPTIMISED == 1, "B3_IMPL_OPTIMISED must be 0 or 1");
 
 }  // namespace b3

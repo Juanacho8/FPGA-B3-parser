@@ -98,6 +98,17 @@ if(B3_PUBLISH_STALE)
 endif()
 # Timed builds (the benchmark, brief section 8): diagnostic counters and checks
 # that are not part of the output contract compile out. Outputs are unchanged.
+# The implementation (brief section 11, "two roles of the C++"): mirror, the
+# RTL golden model with the hardware's structure, or optimised, the timing
+# baseline, free in technique but byte-identical to the goldens. Optimised
+# code lives beside the mirror's; the mirror's code paths never change.
+set(B3_IMPL mirror CACHE STRING "Implementation: mirror or optimised")
+set_property(CACHE B3_IMPL PROPERTY STRINGS mirror optimised)
+if(B3_IMPL STREQUAL "optimised")
+  list(APPEND B3_PARAM_DEFINES B3_IMPL_OPTIMISED=1)
+elseif(NOT B3_IMPL STREQUAL "mirror")
+  message(FATAL_ERROR "B3_IMPL must be 'mirror' or 'optimised', got '${B3_IMPL}'")
+endif()
 option(B3_TIMED "Compile out diagnostic counters for timing" OFF)
 if(B3_TIMED)
   list(APPEND B3_PARAM_DEFINES B3_TIMED=1)
@@ -114,7 +125,7 @@ set(B3_BUILD_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${B3_BUILD_TYPE_UPPER}}
 
 message(STATUS "b3: ${CMAKE_BUILD_TYPE}, N=${B3_PUBLISHED_DEPTH_EFFECTIVE} "
                "K=${B3_TRACKED_DEPTH_EFFECTIVE} instruments=${B3_MAX_INSTRUMENTS_EFFECTIVE} "
-               "book=${B3_BOOK} publish_stale=${B3_PUBLISH_STALE} timed=${B3_TIMED}")
+               "book=${B3_BOOK} publish_stale=${B3_PUBLISH_STALE} timed=${B3_TIMED} impl=${B3_IMPL}")
 
 # ---- 5. Library ----
 add_library(b3 STATIC src/pcap.cpp src/decode_writer.cpp src/instruments.cpp)

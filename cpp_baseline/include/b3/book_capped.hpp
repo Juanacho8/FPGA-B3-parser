@@ -39,6 +39,7 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -46,6 +47,7 @@
 
 #include "b3/stage.hpp"
 #include "b3/book_params.hpp"
+#include "b3/opt_flags.hpp"
 #include "b3/book_uncapped.hpp"
 #include "b3/records.hpp"
 
@@ -218,6 +220,25 @@ private:
     // the better bits (they are contiguous from slot 0, the slots being
     // sorted).
     static Match match(const SideState& s, Side side, std::int64_t price) noexcept {
+        if constexpr (opt::kBookScan) {
+            // Optimised: the slots are sorted best first, so the better ones
+            // come first; scan from the best and stop at the first slot that
+            // is not better (most updates are near the top). Same result.
+            Match m;
+            const std::size_t v = s.valid;
+            std::size_t i = 0;
+            if (side == Side::bid) {
+                while (i < v && s.slot[i].price > price) ++i;
+            } else {
+                while (i < v && s.slot[i].price < price) ++i;
+            }
+            m.better = i;
+            if (i < v && s.slot[i].price == price) {
+                m.found = true;
+                m.index = i;
+            }
+            return m;
+        }
         Match m;
         for (std::size_t i = 0; i < K; ++i) {
             const bool valid = i < s.valid;
@@ -242,8 +263,14 @@ private:
             drop(s, st, s.slot[K - 1].price);
             return;
         }
-        for (std::size_t i = K; i-- > 1;) {
-            if (i > pos) s.slot[i] = s.slot[i - 1];
+        if constexpr (opt::kBookScan) {
+            // Optimised: move only the slots that hold levels (memmove).
+            const std::size_t last = full ? K - 1 : s.valid;   // the slots shifted end here
+            std::memmove(&s.slot[pos + 1], &s.slot[pos], (last - pos) * sizeof(BookLevel));
+        } else {
+            for (std::size_t i = K; i-- > 1;) {
+                if (i > pos) s.slot[i] = s.slot[i - 1];
+            }
         }
         s.slot[pos] = lv;
         if (full) {
@@ -264,8 +291,12 @@ private:
     // RTL: one multiplexer per slot. Slot i takes its right neighbour if
     // i >= pos; the last valid slot becomes don't-care.
     static void erase(SideState& s, std::size_t pos) noexcept {
-        for (std::size_t i = 0; i + 1 < K; ++i) {
-            if (i >= pos) s.slot[i] = s.slot[i + 1];
+        if constexpr (opt::kBookScan) {
+            std::memmove(&s.slot[pos], &s.slot[pos + 1], (s.valid - 1 - pos) * sizeof(BookLevel));   // valid slots only
+        } else {
+            for (std::size_t i = 0; i + 1 < K; ++i) {
+                if (i >= pos) s.slot[i] = s.slot[i + 1];
+            }
         }
         --s.valid;
     }
