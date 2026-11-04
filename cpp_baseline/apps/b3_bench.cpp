@@ -411,9 +411,11 @@ int main(int argc, char** argv) {
         v1.clear();
         v2.clear();
         std::uint64_t stamped = 0;
+        std::vector<double> bm;
+        for (auto b : batches) bm.push_back(static_cast<double>(b) * tns / static_cast<double>(batch));
         if (!latency) {
             res.push_back({{}, {}, static_cast<double>(total) * tns / pk.size(),
-                           static_cast<double>(total) * tns / static_cast<double>(messages), 0, 0, 0, 0});
+                           static_cast<double>(total) * tns / static_cast<double>(messages), median(bm), 0, 0, 0});
             continue;
         }
         auto [lp, st] = run.template operator()<true>(nullptr);
@@ -423,8 +425,6 @@ int main(int argc, char** argv) {
             if (l1[i] != kNone) v1.push_back(static_cast<double>(l1[i] - t0[i]) * tns);
             if (l2[i] != kNone) v2.push_back(static_cast<double>(l2[i] - t0[i]) * tns);
         }
-        std::vector<double> bm;
-        for (auto b : batches) bm.push_back(static_cast<double>(b) * tns / static_cast<double>(batch));
         res.push_back({percentiles(v1), percentiles(v2), static_cast<double>(total) * tns / pk.size(),
                        static_cast<double>(total) * tns / static_cast<double>(messages), median(bm),
                        static_cast<double>(stamped) * tns / static_cast<double>(messages), v1.size(), v2.size()});
@@ -522,7 +522,7 @@ int main(int argc, char** argv) {
           "\n\n";
     char hd[400];
     std::snprintf(hd, sizeof hd, "%zu packets, %zu messages; %d throughput and %d latency passes; clock tick %.2f ns. Throughput %.2f M msg/s, %.2f M pkt/s (%.1f ns/msg; median over 1024-packet batches %.1f ns/pkt). Latency passes: %.1f ns/msg with the stamps.\n\n",
-                  pk.size(), messages, passes, passes, tns, 1e3 / msg[0], 1e3 / pkt[0], msg[0], bat[0], stamped[0]);
+                  pk.size(), messages, passes, latency ? passes : 0, tns, 1e3 / msg[0], 1e3 / pkt[0], msg[0], bat[0], stamped[0]);
     md += hd;
     md += "| Latency (ns, median over passes, min–max) | p50 | p90 | p99 | p99.9 | max |\n|---|---|---|---|---|---|\n";
     md += "| Port 1 (" + std::to_string(res[0].n1) + " packets) | " + cell(lat[0].v) + " | " + cell(lat[1].v) + " | " +

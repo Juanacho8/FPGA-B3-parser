@@ -109,6 +109,18 @@ if(B3_IMPL STREQUAL "optimised")
 elseif(NOT B3_IMPL STREQUAL "mirror")
   message(FATAL_ERROR "B3_IMPL must be 'mirror' or 'optimised', got '${B3_IMPL}'")
 endif()
+# Profile-guided optimisation (clang; the optimised builds, make cpp-opt):
+# B3_PGO_GENERATE=ON builds the instrumented binary that is trained on the
+# small set; B3_PGO_USE=<file.profdata> builds with the merged profile.
+option(B3_PGO_GENERATE "Instrument for profile-guided optimisation" OFF)
+set(B3_PGO_USE "" CACHE FILEPATH "Merged profile for profile-guided optimisation")
+if(B3_PGO_GENERATE)
+  add_compile_options(-fprofile-instr-generate)
+  add_link_options(-fprofile-instr-generate)
+elseif(B3_PGO_USE)
+  add_compile_options(-fprofile-instr-use=${B3_PGO_USE} -Wno-profile-instr-unprofiled
+                      -Wno-profile-instr-out-of-date -Wno-profile-instr-missing)
+endif()
 option(B3_TIMED "Compile out diagnostic counters for timing" OFF)
 if(B3_TIMED)
   list(APPEND B3_PARAM_DEFINES B3_TIMED=1)

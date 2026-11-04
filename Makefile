@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed cpp-opt bench cpp-profile profile goldens cpp-release cpp-debug cpp-debug-k4 cpp-debug-opt cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed cpp-opt cpp-opt-train bench cpp-profile profile cpp-profile-opt profile-opt goldens cpp-release cpp-debug cpp-debug-k4 cpp-debug-opt cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -169,16 +169,47 @@ cpp-timed:
 	$(call cpp_build,timed-k32,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_TRACKED_DEPTH=32)
 	$(call cpp_build,timed-uncapped,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_BOOK=uncapped)
 
-# Optimised builds (step 10b, B3_IMPL=optimised, docs/bench/optimise.md): the
-# timing baseline, timed, byte-identical to the goldens (events-compare,
-# book-compare and book-oracle run them).
+# Optimised builds (step 10b, B3_IMPL=optimised): the timing baseline, timed,
+# byte-identical to the goldens (events-compare and book-compare run them),
+# with profile-guided optimisation (docs/bench/optimise.md). Each build's
+# profile (build/pgo/<name>.profdata) is trained once, on the small set, by
+# an instrumented build of the same parameters checked against the Python
+# answer keys; make cpp-opt-train retrains them all (after code changes: a
+# stale profile changes speed, never output). Needs clang (xcrun llvm-profdata).
+PGO_DIR := $(CPP_BUILD)/pgo
 OPT_BASE := -DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_IMPL=optimised
+OPT_BUILDS := opt-k16 opt-k32 opt-uncapped opt-n2k3
+OPT_PARAMS_opt-k16 := -DB3_TRACKED_DEPTH=16
+OPT_PARAMS_opt-k32 := -DB3_TRACKED_DEPTH=32
+OPT_PARAMS_opt-uncapped := -DB3_BOOK=uncapped
+OPT_PARAMS_opt-n2k3 := -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=3
+OPT_KEY_opt-k16 := --published-depth 5 --tracked-depth 16
+OPT_KEY_opt-k32 := --published-depth 5 --tracked-depth 32
+OPT_KEY_opt-uncapped := --published-depth 5 --tracked-depth 0
+OPT_KEY_opt-n2k3 := --published-depth 2 --tracked-depth 3
 
-cpp-opt:
-	$(call cpp_build,opt-k16,$(OPT_BASE) -DB3_TRACKED_DEPTH=16)
-	$(call cpp_build,opt-k32,$(OPT_BASE) -DB3_TRACKED_DEPTH=32)
-	$(call cpp_build,opt-uncapped,$(OPT_BASE) -DB3_BOOK=uncapped)
-	$(call cpp_build,opt-n2k3,$(OPT_BASE) -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=3)
+$(PGO_DIR)/%.profdata:
+	mkdir -p $(PGO_DIR)
+	$(PYTHON) tools/gen_instruments.py -o $(PGO_DIR)/instruments.txt
+	$(PYTHON) tools/intent_to_events.py $(B3_DATA)/small/intent.jsonl -o $(PGO_DIR)/small_events.bin > /dev/null
+	$(PYTHON) tools/expected_book.py $(B3_DATA)/small --feed A $(OPT_KEY_$*) -o $(PGO_DIR)/small_book_$*.bin > /dev/null
+	$(call cpp_build,$*-pgogen,$(OPT_BASE) $(OPT_PARAMS_$*) -DB3_PGO_GENERATE=ON)
+	rm -f $(PGO_DIR)/$*-*.profraw
+	LLVM_PROFILE_FILE=$(abspath $(PGO_DIR))/$*-%p.profraw $(CPP_BUILD)/$*-pgogen/b3_bench \
+	  --instruments $(PGO_DIR)/instruments.txt --golden-events $(PGO_DIR)/small_events.bin \
+	  --golden-book $(PGO_DIR)/small_book_$*.bin --passes 10 --no-latency --allow-battery \
+	  $(B3_DATA)/small/feedA.pcap > /dev/null
+	xcrun llvm-profdata merge -o $@ $(PGO_DIR)/$*-*.profraw
+
+cpp-opt: $(foreach b,$(OPT_BUILDS),$(PGO_DIR)/$(b).profdata)
+	$(call cpp_build,opt-k16,$(OPT_BASE) $(OPT_PARAMS_opt-k16) -DB3_PGO_USE=$(abspath $(PGO_DIR))/opt-k16.profdata)
+	$(call cpp_build,opt-k32,$(OPT_BASE) $(OPT_PARAMS_opt-k32) -DB3_PGO_USE=$(abspath $(PGO_DIR))/opt-k32.profdata)
+	$(call cpp_build,opt-uncapped,$(OPT_BASE) $(OPT_PARAMS_opt-uncapped) -DB3_PGO_USE=$(abspath $(PGO_DIR))/opt-uncapped.profdata)
+	$(call cpp_build,opt-n2k3,$(OPT_BASE) $(OPT_PARAMS_opt-n2k3) -DB3_PGO_USE=$(abspath $(PGO_DIR))/opt-n2k3.profdata)
+
+cpp-opt-train:
+	rm -f $(foreach b,$(OPT_BUILDS),$(PGO_DIR)/$(b).profdata)
+	$(MAKE) --no-print-directory cpp-opt
 
 # The benchmark (apps/b3_bench.cpp via tools/bench.py): each timed build on
 # large (throughput) and burst (tail latency), Feed A, after its golden check.
@@ -201,6 +232,17 @@ profile: cpp-profile
 	$(PYTHON) tools/profile.py --bench $(CPP_BUILD)/profile-k16/b3_bench \
 	  --golden-events $(B3_DATA)/golden/large/expected_feedA.bin \
 	  --golden-book $(B3_DATA)/golden/large/expected_book_n5_k16_feedA.bin --out docs/bench/profile_k16_large.md \
+	  $(B3_DATA)/large/feedA.pcap
+
+# The optimised K = 16 build's profile (step 10b): the same build with the
+# stage entry points out of line, and the same PGO profile.
+cpp-profile-opt: $(PGO_DIR)/opt-k16.profdata
+	$(call cpp_build,profile-opt-k16,$(OPT_BASE) $(OPT_PARAMS_opt-k16) -DB3_PROFILE=ON -DB3_PGO_USE=$(abspath $(PGO_DIR))/opt-k16.profdata)
+
+profile-opt: cpp-profile-opt
+	$(PYTHON) tools/profile.py --bench $(CPP_BUILD)/profile-opt-k16/b3_bench \
+	  --golden-events $(B3_DATA)/golden/large/expected_feedA.bin \
+	  --golden-book $(B3_DATA)/golden/large/expected_book_n5_k16_feedA.bin --out docs/bench/profile_opt_k16_large.md \
 	  $(B3_DATA)/large/feedA.pcap
 
 # The quick loop: every build, the unit tests (C++ under sanitizers, and the
