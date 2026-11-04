@@ -54,6 +54,7 @@
 #include "b3/field_audit.hpp"
 #include "b3/fields.hpp"
 #include "b3/instruments.hpp"
+#include "b3/opt_flags.hpp"
 #include "b3/packet.hpp"
 #include "b3/records.hpp"
 #include "b3/walker.hpp"
@@ -132,12 +133,25 @@ public:
         }
         last_seen_[ch] = t;
         silent_[ch] = false;
+        if constexpr (opt::kDeadlines) {
+            // Keep the cached bounds safe: the earliest deadline never later,
+            // the latest datagram never earlier, than the truth.
+            if (t + silence_ns_ < next_deadline_) next_deadline_ = t + silence_ns_;
+            if (t > latest_seen_) latest_seen_ = t;
+        }
     }
 
     // Time reaches t: the silence rule, before t's datagram is looked at.
     void on_time(std::uint64_t t) noexcept {
         begin_call({}, 0, 0);
         if (silence_ns_ == 0) return;
+        if constexpr (opt::kDeadlines) {
+            // Optimised: nothing can be silent before the earliest deadline,
+            // unless time went back past a channel's last datagram (the
+            // mirror's unsigned difference then counts it silent): scan only
+            // then, and recompute the deadline after the scan.
+            if (t <= next_deadline_ && t >= latest_seen_) return;
+        }
         for (std::size_t i = 0; i < n_seen_; ++i) {   // RTL: one timer per channel
             const std::uint8_t ch = seen_list_[i];
             if (silent_[ch] || t - last_seen_[ch] <= silence_ns_) continue;
@@ -147,6 +161,13 @@ public:
             call_at_ = point;
             for (std::size_t slot = 0; slot < table_.size(); ++slot) {
                 if (table_[slot].channel == ch) mark_stale(slot, point, records::cause::SILENCE);
+            }
+        }
+        if constexpr (opt::kDeadlines) {
+            next_deadline_ = ~std::uint64_t{0};
+            for (std::size_t i = 0; i < n_seen_; ++i) {
+                const std::uint8_t ch = seen_list_[i];
+                if (!silent_[ch] && last_seen_[ch] + silence_ns_ < next_deadline_) next_deadline_ = last_seen_[ch] + silence_ns_;
             }
         }
     }
@@ -194,7 +215,7 @@ public:
             const auto root = decode::root(m);
             const auto sid = get_named<kSecurityID>(typename T::fields{}, root);
             if (sid.present()) {
-                const std::size_t slot = table_.find(sid.value);
+                const std::size_t slot = table_.lookup(sid.value);
                 if (slot == instruments::Table::kNotFound) {
                     ++counters_.unknown_instrument_messages;
                 } else if constexpr (TemplateId == L::EmptyBook_9::template_id) {
@@ -351,6 +372,8 @@ private:
     std::array<bool, 256> silent_{};
     std::array<std::uint8_t, 256> seen_list_{};
     std::size_t n_seen_ = 0;
+    std::uint64_t next_deadline_ = 0;   // optimised: the earliest a non-silent channel can go silent
+    std::uint64_t latest_seen_ = 0;     // optimised: the latest datagram seen
     std::array<InstrumentState, kMaxInstruments> state_{};
     TrackerCounters counters_;
     // One call changes each instrument at most once.

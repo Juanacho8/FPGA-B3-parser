@@ -291,7 +291,7 @@ private:
     // END_OF_EVENT) have instrument_id 0 and get 0.
     std::uint8_t not_clean(std::uint64_t instrument_id) const noexcept {
         if (tracker_ == nullptr || instrument_id == 0) return 0;
-        const std::size_t slot = tracker_->table().find(instrument_id);
+        const std::size_t slot = tracker_->table().lookup(instrument_id);
         return slot != instruments::Table::kNotFound && tracker_->state(slot).stale ? R::flag::FEED_NOT_CLEAN : 0;
     }
 

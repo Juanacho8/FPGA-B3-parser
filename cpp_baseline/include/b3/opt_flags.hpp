@@ -22,9 +22,17 @@
 #ifndef B3_OPT_UNCAPPED_SCAN
 #define B3_OPT_UNCAPPED_SCAN 1  // uncapped book: best-first scan from the best end before the binary search
 #endif
+#ifndef B3_OPT_DEADLINES
+#define B3_OPT_DEADLINES 1      // silence check only when capture time crosses its next deadline
+#endif
+#ifndef B3_OPT_LOOKUP
+#define B3_OPT_LOOKUP 1         // instrument lookup: last hit per channel cached
+#endif
 
 namespace b3::opt {
 inline constexpr bool kSinkInPlace = kOptimised && B3_OPT_SINK_INPLACE;
 inline constexpr bool kBookScan = kOptimised && B3_OPT_BOOK_SCAN;
 inline constexpr bool kUncappedScan = kOptimised && B3_OPT_UNCAPPED_SCAN;
+inline constexpr bool kDeadlines = kOptimised && B3_OPT_DEADLINES;
+inline constexpr bool kLookup = kOptimised && B3_OPT_LOOKUP;
 }  // namespace b3::opt

@@ -170,7 +170,7 @@ private:
                                   r.kind == R::kind::DELETE || r.kind == R::kind::CLEAR_SIDE ||
                                   r.kind == R::kind::CLEAR_BOOK;
         if (changes_book) {
-            const std::size_t slot = table_.find(r.instrument_id);
+            const std::size_t slot = table_.lookup(r.instrument_id);
             if (slot == instruments::Table::kNotFound) {
                 ++counters_.untracked_records;
             } else if (r.kind != R::kind::CLEAR_BOOK && r.side == R::side::NONE) {
