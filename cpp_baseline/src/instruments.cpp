@@ -72,6 +72,7 @@ Table Table::parse(const std::string& text, const std::string& where) {
         }
         t.entries_[t.count_++] = Entry{sid, static_cast<std::uint8_t>(channel)};
     }
+    t.build_index();
     return t;
 }
 

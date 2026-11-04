@@ -22,6 +22,7 @@
 #include <string>
 
 #include "b3/book_params.hpp"
+#include "b3/opt_flags.hpp"
 
 namespace b3::instruments {
 
@@ -50,12 +51,47 @@ public:
         }
         return kNotFound;
     }
+    // The lookup the pipeline uses: find() in a mirror build; in an optimised
+    // build (opt::kLookup) an open-addressing hash index built at load, one
+    // probe for most securityIDs. The same slot either way.
+    std::size_t lookup(std::uint64_t security_id) const noexcept {
+        if constexpr (opt::kLookup) {
+            for (std::size_t i = hash(security_id);; i = (i + 1) & (kIndexSize - 1)) {
+                const std::uint8_t at = index_[i];
+                if (at == kEmpty) return kNotFound;
+                if (entries_[at].security_id == security_id) return at;
+            }
+        } else {
+            return find(security_id);
+        }
+    }
+    void build_index() noexcept {
+        index_.fill(kEmpty);
+        for (std::size_t slot = 0; slot < count_; ++slot) {
+            std::size_t i = hash(entries_[slot].security_id);
+            while (index_[i] != kEmpty) i = (i + 1) & (kIndexSize - 1);
+            index_[i] = static_cast<std::uint8_t>(slot);
+        }
+    }
+
     std::size_t size() const noexcept { return count_; }
     const Entry& operator[](std::size_t slot) const noexcept { return entries_[slot]; }
 
 private:
+    static constexpr std::size_t kIndexSize = [] {
+        std::size_t n = 8;
+        while (n < 4 * kMaxInstruments) n *= 2;
+        return n;
+    }();
+    static constexpr std::uint8_t kEmpty = 0xff;
+    static_assert(kMaxInstruments < 0xff, "index entries are one byte");
+    static std::size_t hash(std::uint64_t id) noexcept {
+        return static_cast<std::size_t>((id * 0x9e3779b97f4a7c15ULL) >> 40) & (kIndexSize - 1);
+    }
+
     std::array<Entry, kMaxInstruments> entries_{};
     std::size_t count_ = 0;
+    std::array<std::uint8_t, kIndexSize> index_{};   // optimised lookup only
 };
 
 }  // namespace b3::instruments
