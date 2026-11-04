@@ -35,10 +35,11 @@ From the repo root:
 | `make book-oracle` | Capped against uncapped with the same N (k16 and k32 against uncapped, n2k3 against uncapped-n2): identical records except K, the depth-incomplete flags and flagged sides' levels; truncation and depth-incomplete statistics | `cpp_baseline/build/*` |
 | `make check-fast` | The quick loop: every build, the unit tests (C++ under sanitizers, and the tools'), and every compare target on the small set and the scenarios only (no large, burst, goldens or fuzz). The full run stays the gate before every commit | `cpp_baseline/build/*`, sets cloned into `build/fast_data` |
 | `make cpp-timed` | Release with `B3_TIMED=ON` (diagnostic counters compiled out; outputs unchanged), K = 16, K = 32 and uncapped | `cpp_baseline/build/timed-k16`, `timed-k32`, `timed-uncapped` |
-| `make cpp-opt` | The optimised builds (`B3_IMPL=optimised`, step 10b, `docs/bench/optimise.md`): timed, capped K = 16, K = 32, uncapped and N = 2 K = 3. Byte-identical to the goldens | `cpp_baseline/build/opt-*` |
+| `make cpp-opt` | The optimised builds (`B3_IMPL=optimised`, step 10b, `docs/bench/optimise.md`): timed, profile-guided (each build's profile trained once on the small set; `make cpp-opt-train` retrains), capped K = 16, K = 32, uncapped and N = 2 K = 3. Byte-identical to the goldens | `cpp_baseline/build/opt-*`, `build/pgo` |
 | `make cpp-debug-opt` | Debug (sanitizers) of the optimised implementation; `make cpp-test` runs every unit test on it too | `cpp_baseline/build/debug-opt` |
 | `make bench` | The timed builds, then `b3_bench` (via `tools/bench.py`) on large and burst, Feed A: golden check first, then per-packet latencies to port 1 and port 2, throughput, environment; JSON and markdown under `docs/bench/results` (`BENCH_PASSES`, `BENCH_OUT`). On AC power only | `cpp_baseline/build/timed-*` |
 | `make profile` | The capped K = 16 timed build with stage entry points out of line (`B3_PROFILE=ON`), sampled by `/usr/bin/sample` on large; per-stage shares into `docs/bench/profile_k16_large.md` | `cpp_baseline/build/profile-k16` |
+| `make profile-opt` | The same profile of the optimised K = 16 build, into `docs/bench/profile_opt_k16_large.md` | `cpp_baseline/build/profile-opt-k16` |
 | `make mbo-check` | Uncapped build, then `b3_decode --mbo` on every set and feed: 0 per-order faults while CLEAN, 0 level mismatches against the uncapped book at every close, the book key from the MBO book | `cpp_baseline/build/uncapped` |
 | `make goldens` | Port 1 goldens, and port 2 capped goldens for K = 16 and K = 32, for the RTL under `data/golden/<set>/`, with provenance | `cpp_baseline/build/release`, `k16`, `k32` |
 | `make counters-compare` | Release build, then `b3_decode --counters` (sequencing, rptSeq, stale flags, every counter) against values derived from manifest.json and intent.jsonl, both feeds of every set | `cpp_baseline/build/release` |
@@ -158,6 +159,7 @@ Set in exactly one place, `include/b3/book_params.hpp`. Override them from CMake
 | `-DB3_TIMED=ON` | OFF | Timed build: diagnostic counters and checks outside the output contract compile out (field audit counts, version counts, the capped book's K statistics, the uncapped book's most levels); the STALE rules stay |
 | `-DB3_PROFILE=ON` | OFF | Profile build: stage entry points kept out of line (`include/b3/stage.hpp`); adds a call per stage, not for timing |
 | `-DB3_IMPL=mirror\|optimised` | mirror | Mirror: the RTL golden model, the hardware's structure. Optimised: the timing baseline, any technique, byte-identical outputs; each change behind a switch in `include/b3/opt_flags.hpp` |
+| `-DB3_PGO_GENERATE=ON`, `-DB3_PGO_USE=FILE` | off | Profile-guided optimisation (clang): instrument, or build with a merged profile |
 
 Code reads them as `b3::kPublishedDepth`, `b3::kTrackedDepth`,
 `b3::kMaxInstruments` and `b3::kBookMode`. N > K fails to compile.

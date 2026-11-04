@@ -1,0 +1,17 @@
+{
+  "valid": true,
+  "file": "data/burst/feedA.pcap",
+  "packets": 22131, "messages": 200007, "packets_with_port1": 22131, "packets_with_port2": 22128,
+  "passes": 30, "batch": 1024,
+  "pcap_load_index_ms": 6.171500,   "pcap_load_index_note": "once, before timing: the file read and indexed",
+  "golden_check": "port 1 and port 2 byte-identical to the goldens",
+  "environment": {"cpu": "Apple M1 Max", "cores": 10, "performance_cores": 8, "os": "macOS 15.7.4 (24G517)", "power": "Now drawing from 'AC Power'", "on_battery": false, "low_power_mode": false, "compiler": "Apple LLVM 17.0.0 (clang-1700.0.13.5)", "flags": " -O3 -DNDEBUG -mcpu=native", "build_type": "Release", "timed": true, "published_depth": 5, "tracked_depth": 32, "book": "capped", "max_instruments": 64, "clock": "mach_absolute_time", "tick_ns": 41.666667},
+  "ns_per_packet": {"median": 491.27, "min": 481.16, "max": 506.90},
+  "ns_per_message": {"median": 54.36, "min": 53.24, "max": 56.09},
+  "batch_ns_per_packet": {"median": 462.00, "min": 439.49, "max": 488.24},
+  "latency_pass_ns_per_message": {"median": 55.82, "min": 54.61, "max": 57.17},
+  "timing_note": "throughput from passes with no clock reads in the pipeline; latencies from separate passes that read the counter when a record is written (their cost: latency_pass_ns_per_message - ns_per_message)",
+  "packets_per_s": 2035557, "messages_per_s": 18396171,
+  "latency_ns": {"port1_p50": {"median": 500.00, "min": 500.00, "max": 500.00}, "port1_p90": {"median": 916.67, "min": 875.00, "max": 916.67}, "port1_p99": {"median": 1083.33, "min": 1083.33, "max": 1125.00}, "port1_p999": {"median": 1291.67, "min": 1208.33, "max": 4125.00}, "port1_max": {"median": 27375.00, "min": 6708.33, "max": 51250.00}, "port2_p50": {"median": 541.67, "min": 500.00, "max": 541.67}, "port2_p90": {"median": 916.67, "min": 916.67, "max": 958.33}, "port2_p99": {"median": 1125.00, "min": 1083.33, "max": 1166.67}, "port2_p999": {"median": 1333.33, "min": 1250.00, "max": 4166.67}, "port2_max": {"median": 27500.00, "min": 6791.67, "max": 51333.33}},
+  "near_tick": []
+}
