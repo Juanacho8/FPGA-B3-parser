@@ -7,7 +7,7 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed bench cpp-profile profile goldens cpp-release cpp-debug cpp-debug-k4 cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
+.PHONY: sim-all clean data layouts layouts-check field-audit field-audit-check pcap-crosscheck decode-crosscheck decode-compare counters-compare events-compare book-compare book-oracle mbo-check fuzz check-fast cpp-timed cpp-opt bench cpp-profile profile goldens cpp-release cpp-debug cpp-debug-k4 cpp-debug-opt cpp-test cpp-k16 cpp-k32 cpp-uncapped cpp-n2k3 cpp-uncapped-n2 cpp-variants cpp-book-variants cpp-clean
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
@@ -65,9 +65,15 @@ field-audit:
 field-audit-check:
 	$(PYTHON) tools/field_audit.py --check
 
-cpp-test: layouts-check field-audit-check cpp-debug cpp-debug-k4
+# Debug (sanitizers) of the optimised implementation: every unit test, the
+# capped book's K = 4 truncation tests included, runs on its code paths too.
+cpp-debug-opt:
+	$(call cpp_build,debug-opt,-DCMAKE_BUILD_TYPE=Debug -DB3_IMPL=optimised)
+
+cpp-test: layouts-check field-audit-check cpp-debug cpp-debug-k4 cpp-debug-opt
 	ctest --test-dir $(CPP_BUILD)/debug --output-on-failure
 	ctest --test-dir $(CPP_BUILD)/debug-k4 --output-on-failure
+	ctest --test-dir $(CPP_BUILD)/debug-opt --output-on-failure
 
 cpp-k16:
 	$(call cpp_build,k16,-DCMAKE_BUILD_TYPE=Release -DB3_TRACKED_DEPTH=16)
@@ -117,9 +123,9 @@ counters-compare: cpp-release
 # Port 1: b3_decode --events against tools/intent_to_events.py (Feed A byte
 # for byte, Feed B per channel) in the release and variant builds; records
 # must be identical across builds. Fails on any difference.
-EVENT_BUILDS := $(foreach b,release k16 k32 uncapped,--build $(b):$(CPP_BUILD)/$(b)/b3_decode)
+EVENT_BUILDS := $(foreach b,release k16 k32 uncapped opt-k16 opt-k32 opt-uncapped,--build $(b):$(CPP_BUILD)/$(b)/b3_decode)
 
-events-compare: cpp-release cpp-variants
+events-compare: cpp-release cpp-variants cpp-opt
 	$(PYTHON) tools/events_compare.py $(B3_DATA) $(EVENT_BUILDS)
 
 # Port 2: b3_decode --book of each book build (uncapped, capped K = 16 and
@@ -127,9 +133,9 @@ events-compare: cpp-release cpp-variants
 # same N and K (byte for byte, both feeds), the book key at every checkpoint
 # for CLEAN instruments (sides not depth incomplete), and the book counters.
 # Fails on any difference.
-BOOK_BUILDS := uncapped k16 k32 n2k3 uncapped-n2
+BOOK_BUILDS := uncapped k16 k32 n2k3 uncapped-n2 opt-k16 opt-k32 opt-uncapped opt-n2k3
 
-book-compare: cpp-book-variants
+book-compare: cpp-book-variants cpp-opt
 	set -e; for b in $(BOOK_BUILDS); do \
 	  echo "== book-compare: $$b"; \
 	  $(PYTHON) tools/book_compare.py --cpp $(CPP_BUILD)/$$b/b3_decode $(B3_DATA); \
@@ -139,9 +145,9 @@ book-compare: cpp-book-variants
 # feed: identical records except K, the depth-incomplete flags and the levels
 # of flagged sides; reports truncation and depth-incomplete statistics per
 # (N, K). Fails on any other difference.
-BOOK_ORACLE_PAIRS := k16:uncapped k32:uncapped n2k3:uncapped-n2
+BOOK_ORACLE_PAIRS := k16:uncapped k32:uncapped n2k3:uncapped-n2 opt-n2k3:uncapped-n2
 
-book-oracle: cpp-book-variants
+book-oracle: cpp-book-variants cpp-opt
 	set -e; for pair in $(BOOK_ORACLE_PAIRS); do \
 	  capped=$${pair%%:*}; uncapped=$${pair##*:}; \
 	  echo "== book-oracle: $$capped against $$uncapped"; \
@@ -163,14 +169,26 @@ cpp-timed:
 	$(call cpp_build,timed-k32,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_TRACKED_DEPTH=32)
 	$(call cpp_build,timed-uncapped,-DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_BOOK=uncapped)
 
+# Optimised builds (step 10b, B3_IMPL=optimised, docs/bench/optimise.md): the
+# timing baseline, timed, byte-identical to the goldens (events-compare,
+# book-compare and book-oracle run them).
+OPT_BASE := -DCMAKE_BUILD_TYPE=Release -DB3_TIMED=ON -DB3_IMPL=optimised
+
+cpp-opt:
+	$(call cpp_build,opt-k16,$(OPT_BASE) -DB3_TRACKED_DEPTH=16)
+	$(call cpp_build,opt-k32,$(OPT_BASE) -DB3_TRACKED_DEPTH=32)
+	$(call cpp_build,opt-uncapped,$(OPT_BASE) -DB3_BOOK=uncapped)
+	$(call cpp_build,opt-n2k3,$(OPT_BASE) -DB3_PUBLISHED_DEPTH=2 -DB3_TRACKED_DEPTH=3)
+
 # The benchmark (apps/b3_bench.cpp via tools/bench.py): each timed build on
 # large (throughput) and burst (tail latency), Feed A, after its golden check.
 # Run on AC power, lid open, nothing heavy running. BENCH_PASSES, BENCH_OUT.
 BENCH_PASSES ?= 30
 BENCH_OUT ?= docs/bench/results
-BENCH_BUILDS := $(foreach b,k16 k32 uncapped,--build $(b):$(CPP_BUILD)/timed-$(b)/b3_bench)
+BENCH_BUILDS := $(foreach b,k16 k32 uncapped,--build $(b):$(CPP_BUILD)/timed-$(b)/b3_bench) \
+                $(foreach b,k16 k32 uncapped,--build opt-$(b):$(CPP_BUILD)/opt-$(b)/b3_bench)
 
-bench: cpp-timed
+bench: cpp-timed cpp-opt
 	$(PYTHON) tools/bench.py $(BENCH_BUILDS) --passes $(BENCH_PASSES) --out $(BENCH_OUT) $(B3_DATA)
 
 # The profile (tools/profile.py): the capped K = 16 timed build with every

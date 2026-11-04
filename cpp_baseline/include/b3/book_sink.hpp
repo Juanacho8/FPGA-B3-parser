@@ -40,6 +40,7 @@
 #include "b3/stage.hpp"
 #include "b3/book_capped.hpp"
 #include "b3/book_params.hpp"
+#include "b3/opt_flags.hpp"
 #include "b3/book_uncapped.hpp"
 #include "b3/instruments.hpp"
 #include "b3/records.hpp"
@@ -206,6 +207,10 @@ private:
             const std::size_t slot = touched.slots[i];
             const bool stale = this->stale(slot);
             if (stale && !PublishStale) continue;
+            if constexpr (opt::kSinkInPlace) {
+                write_update(closer, slot, stale, touched.recovery[slot]);
+                continue;
+            }
             R::BookRecord r{};
             identity(r, closer.seq_num, closer.seq_version, closer.channel, closer.msg_index, closer.exch_time);
             r.header.instrument_id = table_[slot].security_id;
@@ -294,6 +299,42 @@ private:
         if (book_.depth_incomplete(slot, Side::offer)) r.header.flags |= R::book_flag::DEPTH_INCOMPLETE_OFFER;
     }
 
+    // Optimised (opt::kSinkInPlace): a BOOK_UPDATE built in its place in the
+    // output buffer: the header written whole, the book's levels copied in,
+    // only the unused levels and the padding zeroed. No temporary record, no
+    // copy. The same bytes as close()'s mirror path.
+    void write_update(const R::EventRecord& closer, std::size_t slot, bool stale, bool recovery) noexcept {
+        R::BookRecord* out = count_ < cap_ ? &buf_[count_] : &spare_;
+        R::BookHeader& h = out->header;
+        h = R::BookHeader{};
+        h.out_seq = ++out_seq_;
+        h.seq_num = closer.seq_num;
+        h.seq_version = closer.seq_version;
+        h.channel = closer.channel;
+        h.msg_index = closer.msg_index;
+        h.instrument_id = table_[slot].security_id;
+        h.exch_time = closer.exch_time;
+        h.capture_time = capture_time_;
+        h.record_type = R::record_type::BOOK_UPDATE;
+        h.state = stale ? R::book_state::STALE : R::book_state::CLEAN;
+        h.flags = recovery ? R::book_flag::RECOVERY : 0;
+        const std::size_t nb = book_.top(slot, Side::bid, out->bids, kPublishedDepth);
+        const std::size_t no = book_.top(slot, Side::offer, out->offers, kPublishedDepth);
+        h.bid_count = static_cast<std::uint8_t>(nb);
+        h.offer_count = static_cast<std::uint8_t>(no);
+        for (std::size_t i = nb; i < kPublishedDepth; ++i) out->bids[i] = BookLevel{};
+        for (std::size_t i = no; i < kPublishedDepth; ++i) out->offers[i] = BookLevel{};
+        out->pad = {};
+        if (book_.depth_incomplete(slot, Side::bid)) h.flags |= R::book_flag::DEPTH_INCOMPLETE_BID;
+        if (book_.depth_incomplete(slot, Side::offer)) h.flags |= R::book_flag::DEPTH_INCOMPLETE_OFFER;
+        ++counters_.book_updates;
+        if (count_ < cap_) {
+            ++count_;
+        } else {
+            ++counters_.overflow;
+        }
+    }
+
     void emit(R::BookRecord& r) noexcept {
         r.header.out_seq = ++out_seq_;
         if (count_ < cap_) {
@@ -315,6 +356,7 @@ private:
     std::uint64_t capture_time_ = 0;
     bool started_ = false;
     std::array<Touched, 256> touched_{};
+    R::BookRecord spare_{};   // write_update's target past the buffer's capacity (counted, never stored)
     // Book state (DESIGN.md 3.6.4): faulted since the last clear, the state
     // port 2 last wrote, and this message's other changes.
     std::array<bool, kMaxInstruments> faulted_{};

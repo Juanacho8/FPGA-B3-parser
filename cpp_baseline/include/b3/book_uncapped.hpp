@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "b3/stage.hpp"
+#include "b3/opt_flags.hpp"
 #include "b3/records.hpp"
 
 namespace b3::book {
@@ -188,6 +189,14 @@ private:
     BookLevel* lower_bound(std::size_t slot, Side side, std::int64_t price) noexcept {
         BookLevel* base = &levels_[index(slot, side) * cap_];
         BookLevel* end = base + size_[index(slot, side)];
+        if constexpr (opt::kUncappedScan) {
+            // Optimised: the best level is last and most updates are near it:
+            // walk down from the end while the level is not before the price.
+            // The same position std::lower_bound finds.
+            BookLevel* it = end;
+            while (it != base && !before(side, (it - 1)->price, price)) --it;
+            return it;
+        }
         return std::lower_bound(base, end, price,
                                 [side](const BookLevel& l, std::int64_t p) { return before(side, l.price, p); });
     }
