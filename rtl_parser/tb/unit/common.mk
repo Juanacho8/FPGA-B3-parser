@@ -3,6 +3,10 @@
 
 # ---- 1. Paths ----
 RTL_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../rtl)
+TB_LIB  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../lib)
+
+# Test helpers in tb/lib (e.g. record.py) are importable from every test
+export PYTHONPATH := $(TB_LIB):$(PYTHONPATH)
 
 # ---- 2. Simulator ----
 SIM           ?= verilator

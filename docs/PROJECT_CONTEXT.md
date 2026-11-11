@@ -213,7 +213,7 @@ Recovery is faithful because the generator's engine always knows the true book. 
 
 | # | Item | Status |
 |---|---|---|
-| A | **Parser output contract**: what a decoded message looks like when handed to the next stage (fixed-width record vs per-type records, which fields). Leaning fixed-width for FPGA friendliness | Deferred to the C++/RTL phase. Will live in `docs/DESIGN.md` |
+| A | **Parser output contract**: what a decoded message looks like when handed to the next stage (fixed-width record vs per-type records, which fields). Leaning fixed-width for FPGA friendliness | **Decided** for the RTL: one fixed-width 644-bit superset record for templates 50/51/52 (context, absent mask, raw fields). See `docs/DESIGN.md` |
 | B | `layouts.py`: generated from the XML, or hand-written with a test checking it against the XML | Decided: generated at build time by `feed_generator/tools/gen_layouts.py`, output checked in, guarded by tests. See `docs/FEED_GENERATOR_CONTEXT.md` section 12 |
 | C | Diff Guidelines v2.3.1.2 against v2.3.1 | Open |
 

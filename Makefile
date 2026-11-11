@@ -7,7 +7,11 @@ export PATH := $(CURDIR)/.venv/bin:$(PATH)
 UNIT_DIR   := rtl_parser/tb/unit
 UNIT_TESTS := $(notdir $(patsubst %/,%,$(dir $(wildcard $(UNIT_DIR)/*/Makefile))))
 
-.PHONY: sim-all clean
+.PHONY: sim-all clean gen-data
+
+# ---- 2a. Generated feeds for the tests (data/ is gitignored) ----
+gen-data:
+	cd feed_generator && python -m b3gen build --out ../data --sets small,scenarios
 
 sim-%:
 	$(MAKE) -C $(UNIT_DIR)/$*
