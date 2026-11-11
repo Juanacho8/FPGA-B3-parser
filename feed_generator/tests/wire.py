@@ -56,6 +56,23 @@ def read_packets(pcap_path):
     return out
 
 
+def in_sequence_order(packets):
+    """packets with each channel's sequenced packets put back in
+    (version, seq) order in the slots that channel's sequenced packets
+    used: what a client with a reorder buffer applies. Heartbeats, stray
+    datagrams and the interleaving of channels stay where they are."""
+    slots = {}
+    for i, p in enumerate(packets):
+        if p["seq"]:
+            slots.setdefault(p["channel"], []).append(i)
+    out = list(packets)
+    for indices in slots.values():
+        ordered = sorted((packets[i] for i in indices), key=lambda p: (p["version"], p["seq"]))
+        for i, p in zip(indices, ordered):
+            out[i] = p
+    return out
+
+
 def decode_wire(pcap_path):
     """Every message in the pcap, in wire order:
     [((channel, version, seq, index, sendingTime), message bytes)]."""
